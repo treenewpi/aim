@@ -144,6 +144,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aim-elf-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "aim-emulated-storage"
 version = "0.1.0"
 dependencies = [
