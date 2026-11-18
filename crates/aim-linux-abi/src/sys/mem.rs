@@ -568,6 +568,15 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
             Ok(_) => false,
             Err(error) => return -(error as i64),
         }
+    } else if flags & MAP_ANONYMOUS != 0 {
+        // MAP_ANONYMOUS ignores the offset and the descriptor. A `.bss`
+        // fixed map passes fd -1 and offset 0; a whole page inside an
+        // unaligned range is also anonymous zeros, not a file at the
+        // displacement from the guest address.
+        if len == 0 {
+            return -(EINVAL as i64);
+        }
+        false
     } else {
         if len == 0 || off & (PAGE - 1) != 0 {
             return -(EINVAL as i64);
@@ -1202,7 +1211,7 @@ fn mmap_partial_fixed(
         }
     }
     if split.full_hi > split.full_lo {
-        let file_off = aim_guest_page::file_offset_at(addr, off, split.full_lo);
+        let file_off = aim_guest_page::partial_page_offset(anon, addr, off, split.full_lo);
         let result = mmap_kernel([
             split.full_lo,
             split.full_hi - split.full_lo,

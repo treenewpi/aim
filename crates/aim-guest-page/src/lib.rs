@@ -144,6 +144,21 @@ pub fn file_offset_at(map_addr: u64, map_off: u64, at: u64) -> u64 {
     map_off + (at - map_addr)
 }
 
+/// Offset a whole host page inside a partial `MAP_FIXED` is created with.
+///
+/// A file page keeps the file position of its first byte. An anonymous page
+/// is zeros: the guest offset and the distance from the unaligned start are
+/// not a file offset. `.bss` is `mmap(addr, 0x8000, PROT_READ|PROT_WRITE,
+/// MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)` with `addr` only 4 KiB-aligned,
+/// so the page in the middle would otherwise be asked for at offset `0x1000`.
+pub fn partial_page_offset(anonymous: bool, map_addr: u64, map_off: u64, page: u64) -> u64 {
+    if anonymous {
+        0
+    } else {
+        file_offset_at(map_addr, map_off, page)
+    }
+}
+
 fn cover_mask(lo: u64, hi: u64, host: u64) -> u8 {
     let mut mask = 0u8;
     for slot in 0..4 {
@@ -503,5 +518,39 @@ mod tests {
         assert!(other.is_partial());
         assert!(covers(other, 0x8005db2000));
         assert!(!covers(other, 0x8005db1000));
+    }
+
+    #[test]
+    fn guest4k_anonymous_bss_zeros_its_slices_and_keeps_the_file_neighbor() {
+        // toybox: the data slice at 0x800619e000 stays; .bss is the next
+        // 0x8000 bytes, anonymous, and stops where the tail trim began.
+        let bss = split_guest_range(0x800619f000, 0x8000).unwrap();
+        assert!(covers(bss, 0x800619f000));
+        assert!(!covers(bss, 0x800619e000));
+        assert_eq!(bss.head.unwrap().cover, 0b1000);
+        assert_eq!(bss.full_lo, 0x80061a0000);
+        assert_eq!(bss.full_hi, 0x80061a4000);
+        assert!(covers(bss, 0x80061a6000));
+        assert!(!covers(bss, 0x80061a7000));
+        assert_eq!(bss.tail.unwrap().cover, 0b0111);
+        assert_eq!(partial_page_offset(true, 0x800619f000, 0, bss.full_lo), 0);
+        assert_eq!(
+            partial_page_offset(false, 0x800619f000, 0, bss.full_lo),
+            0x1000
+        );
+        let trimmed = split_guest_range(0x80061a7000, 0x59000).unwrap();
+        assert!(covers(trimmed, 0x80061a7000));
+        assert!(!covers(trimmed, 0x80061a6000));
+
+        // Formal smoke, libc++.so: same length, different address.
+        let other = split_guest_range(0x8005de7000, 0x8000).unwrap();
+        assert!(covers(other, 0x8005de7000));
+        assert!(!covers(other, 0x8005de6000));
+        assert_eq!(other.full_lo, 0x8005de8000);
+        assert!(!covers(other, 0x8005def000));
+        assert_eq!(
+            partial_page_offset(true, 0x8005de7000, 0x1000, other.full_lo),
+            0
+        );
     }
 }

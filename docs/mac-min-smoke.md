@@ -206,6 +206,15 @@ covered slices. The page's protection is the union of the slices that are
 still present, and a punched slice stays readable until the whole page is
 unmapped. A shared `MAP_FIXED` of a partial page is `EINVAL`.
 
+`8a46cb5` placed those file segments. toybox then stopped on
+`mmap(0x800619f000, 0x8000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0)`,
+`libcrypto.so`'s `.bss`. The formal smoke was the same call at
+`0x8005de7000` for `libc++.so`. The whole pages inside that range are
+anonymous zeros, so the offset passed for them is 0, not the distance from
+the unaligned start. The 4 KiB file slice just before the `.bss` is not
+part of the call and keeps its bytes. `MAP_ANONYMOUS` ignores the guest
+offset and the descriptor.
+
 The layer is already in `_build/downloads`. Do not pass `--fetch` again.
 Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary
 can call it. The `guest4k_` tests are the regression and do not need the
