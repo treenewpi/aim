@@ -215,6 +215,16 @@ the unaligned start. The 4 KiB file slice just before the `.bss` is not
 part of the call and keeps its bytes. `MAP_ANONYMOUS` ignores the guest
 offset and the descriptor.
 
+`34418cb` mapped those `.bss` ranges. Two later `mprotect` calls are
+different. Direct toybox: `mprotect(0x8005fb3000, 0x1000, PROT_READ)` is
+`libz.so` GNU RELRO, one 4 KiB data slice beside the text. Formal smoke:
+`mprotect(0x8005ee2000, 0x80000, PROT_READ|PROT_EXEC|PROT_BTI)` is
+`libc++.so`'s text, already rewritten. Both starts are 4 KiB-aligned.
+Execute is part of the host-page union, and `PROT_BTI` is not a host bit.
+The RELRO slice is recorded read-only; the text beside it keeps the page
+executable, so that data is not a private read-only page. A 16 KiB-aligned
+`mprotect` is unchanged.
+
 The layer is already in `_build/downloads`. Do not pass `--fetch` again.
 Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary
 can call it. The `guest4k_` tests are the regression and do not need the

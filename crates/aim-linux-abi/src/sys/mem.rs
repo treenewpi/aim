@@ -1240,6 +1240,14 @@ fn slice_prot(page: u64) -> Result<u32, i64> {
     if let Some(prot) = GUEST_SLICES.lock().unwrap().get(&page).copied() {
         return Ok(prot);
     }
+    let host = page & !(PAGE - 1);
+    let slot = ((page - host) / GUEST_PAGE) as u32;
+    if let Some(pieces) = PAGE_PIECES.lock().unwrap().get(&host).copied() {
+        if pieces.present & (1 << slot) == 0 {
+            return Ok(0);
+        }
+        return Ok(pieces.prot[slot as usize]);
+    }
     match vmmap::info_at(page) {
         Some(info) if page >= info.start && page < info.end => {
             Ok(aim_guest_page::prot_bits(info.prot))
@@ -1294,7 +1302,11 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
         Err(error) => return -(error as i64),
     };
     for (done, op) in host_ops.iter().enumerate() {
-        let result = host_mprotect(op.addr, PAGE, op.prot as i32);
+        let mut result = host_mprotect(op.addr, PAGE, op.prot as i32);
+        if result == -(errno::EACCES as i64) {
+            // A page that was made RWX is MAP_JIT and rejects mprotect.
+            result = super::jit::protect_around(op.addr, PAGE, op.prot as i32);
+        }
         if result != 0 {
             for undo in &host_ops[..done] {
                 host_mprotect(undo.addr, PAGE, undo.old as i32);
@@ -1305,6 +1317,21 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
     {
         let mut recorded = GUEST_SLICES.lock().unwrap();
         for (page, prot) in slices {
+            let host = page & !(PAGE - 1);
+            let slot = ((page - host) / GUEST_PAGE) as usize;
+            {
+                let mut pages = PAGE_PIECES.lock().unwrap();
+                if let Some(entry) = pages.get_mut(&host)
+                    && entry.present & (1 << slot) != 0
+                {
+                    entry.prot[slot] = prot;
+                    if entry.present == 0b1111
+                        && entry.prot.iter().all(|item| *item == entry.prot[0])
+                    {
+                        pages.remove(&host);
+                    }
+                }
+            }
             if prot == aim_guest_page::host_prot_at(&host_ops, &current, host_lo, page) {
                 recorded.remove(&page);
             } else {

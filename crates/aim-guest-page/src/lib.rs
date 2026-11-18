@@ -5,8 +5,8 @@
 //! `0x18e000`, length `0x1000`, `PROT_READ`). That slice sits inside a host
 //! page that also holds writable globals. The call succeeds and those
 //! globals stay writable. When every slice of a page asks for the same
-//! protection, the host page changes. A slice that asks for execute while a
-//! neighbor does not is rejected, so a data page is not marked executable.
+//! protection, the host page changes. Execute is part of that union: text
+//! and a read-only slice share the page, and the page stays executable.
 
 /// Host and guest granules. The guest value is Bionic's hardcoded length,
 /// not `AT_PAGESZ`.
@@ -187,9 +187,10 @@ pub fn guest_page_len(len: u64) -> Result<u64, i32> {
     Ok(rounded & !(GUEST_PAGE - 1))
 }
 
-/// Alignment, length and execute checks for a guest `mprotect` that is not
-/// aligned to [`PAGE`]. `Ok(0)` is a successful no-op. `Ok(len)` is the
-/// rounded length the caller maps and protects.
+/// Alignment and length checks for a guest `mprotect` that is not aligned
+/// to [`PAGE`]. `Ok(0)` is a successful no-op. `Ok(len)` is the rounded
+/// length the caller maps and protects. Execute is allowed; the host page
+/// uses the union.
 pub fn begin_subpage(addr: u64, len: u64, prot: u32) -> Result<u64, i32> {
     if addr & (GUEST_PAGE - 1) != 0 {
         return Err(EINVAL);
@@ -201,11 +202,7 @@ pub fn begin_subpage(addr: u64, len: u64, prot: u32) -> Result<u64, i32> {
     if addr.checked_add(len).is_none() {
         return Err(ENOMEM);
     }
-    // A partial host page cannot gain execute without making its other
-    // slices executable too.
-    if prot & PROT_EXEC != 0 {
-        return Err(EINVAL);
-    }
+    let _ = prot;
     Ok(len)
 }
 
@@ -213,8 +210,8 @@ pub fn begin_subpage(addr: u64, len: u64, prot: u32) -> Result<u64, i32> {
 ///
 /// `current` is every 4 KiB slice of each touched host page, in order. A
 /// length that is not a multiple of four slices is [`EINVAL`]: the caller
-/// walked the wrong range. A resulting host page that is executable in some
-/// slices and not in others is [`EINVAL`].
+/// walked the wrong range. The host protection is the union, including
+/// execute when any slice has it.
 pub fn plan_subpage(
     host_lo: u64,
     req_lo: u64,
@@ -244,11 +241,6 @@ pub fn plan_subpage(
             slices.push((guest, now));
         }
         let new_host = next.iter().fold(0, |bits, slice| bits | slice);
-        if next.iter().any(|slice| slice & PROT_EXEC != 0)
-            && next.iter().any(|slice| slice & PROT_EXEC == 0)
-        {
-            return Err(EINVAL);
-        }
         if new_host != old_host {
             host_ops.push(HostProtect {
                 addr: page,
@@ -397,17 +389,13 @@ mod tests {
     #[test]
     fn guest4k_partial_execute_unaligned_address_and_short_current_are_invalid() {
         assert_eq!(
-            plan_subpage(0x18c000, 0x18e000, 0x18f000, RX, &[RW, RW, RW, RW]),
-            Err(EINVAL)
-        );
-        assert_eq!(
             plan_subpage(0x18c000, 0x18e000, 0x18f000, RO, &[RW, RW, RW]),
             Err(EINVAL)
         );
         assert_eq!(begin_subpage(0x18e001, 0x1000, RO), Err(EINVAL));
         assert_eq!(begin_subpage(0x18e000, 0, RO), Ok(0));
         assert_eq!(begin_subpage(0x18e000, u64::MAX, RO), Err(ENOMEM));
-        assert_eq!(begin_subpage(0x18e000, 1, RX), Err(EINVAL));
+        assert_eq!(begin_subpage(0x18e000, 1, RX), Ok(0x1000));
         assert_eq!(begin_subpage(0x18e000, 1, RO), Ok(0x1000));
         // A 16 KiB-aligned address is not this path. The caller keeps the
         // old rounding for it. Zero length is still a no-op here.
@@ -552,5 +540,37 @@ mod tests {
             partial_page_offset(true, 0x8005de7000, 0x1000, other.full_lo),
             0
         );
+    }
+
+    #[test]
+    fn guest4k_relro_beside_text_and_bti_mprotect_share_the_host_page() {
+        // libz.so: text occupies the first three slices of 0x8005fb0000
+        // (RX) and the data slice 0x8005fb3000 is RW. GNU RELRO asks for
+        // PROT_READ on that one slice. The host stays RWX because the text
+        // is still executable; the data slice is recorded read-only.
+        let current = [RX, RX, RX, RW];
+        let (host, slices) =
+            plan_subpage(0x8005fb0000, 0x8005fb3000, 0x8005fb4000, RO, &current).unwrap();
+        assert_eq!(
+            host,
+            vec![HostProtect {
+                addr: 0x8005fb0000,
+                old: RW | RX,
+                prot: RX,
+            }]
+        );
+        assert_eq!(
+            recorded(0x8005fb0000, &current, &host, &slices),
+            [(0x8005fb3000, RO)]
+        );
+        // libc++.so: mprotect(0x8005ee2000, 0x80000, PROT_READ|PROT_EXEC|PROT_BTI).
+        // BTI is not a host bit. The range is already executable, so the
+        // host page does not change.
+        assert_eq!(prot_bits(0x15), RX);
+        assert_eq!(begin_subpage(0x8005ee2000, 0x80000, RX), Ok(0x80000));
+        let current = [RX, RX, RX, RX];
+        let (host, _) =
+            plan_subpage(0x8005ee0000, 0x8005ee2000, 0x8005ee4000, RX, &current).unwrap();
+        assert!(host.is_empty());
     }
 }
