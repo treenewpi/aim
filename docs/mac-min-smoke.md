@@ -1,10 +1,10 @@
 # Minimum Mac checks
 
 These commands do not boot Android and do not run reDroid. They exercise
-the binder driver in one host process, then one synthetic Linux AArch64
-ELF under `linux-run`. Rust 1.88 or newer is required (`&& let`, edition
-2024). `cargo fetch -p` is not a Cargo command; fetch the lockfile with
-`cargo fetch --locked`.
+the binder driver in one host process, one synthetic Linux AArch64 ELF
+under `linux-run`, then the original reDroid `linker64` and toybox. Rust
+1.88 or newer is required (`&& let`, edition 2024). `cargo fetch -p` is
+not a Cargo command; fetch the lockfile with `cargo fetch --locked`.
 
 The binder tests need a compiler and the crates in `Cargo.lock` for
 `aim-binder-host` (`libc`, `sha2` and their default-feature dependencies).
@@ -94,9 +94,84 @@ The last command exits 0 only when all of these are true:
 - stderr contains `load-time rewrites:` with this file's `svc`, `mrs` and
   `msr tpidr_el0` counts
 
-Anything else exits nonzero. Later stages, not claimed here, are an
-NDK-built Android ELF (NDK `28.2.13676358`, its license accepted
-explicitly) and the pinned image's `linker64` after
-`image/original.lock`'s sha256 check. `cargo test -p aim-linux-abi` still
+Anything else exits nonzero. `cargo test -p aim-linux-abi` still
 compiles `aim-services` and the generated AIDL; do not use it for this
-smoke. Do not run `cargo aim`.
+smoke. Do not run `cargo aim`. The synthetic ELF is not linker64, bionic,
+or a reDroid boot.
+
+## Original linker64 and toybox
+
+`bionic-smoke` stages two original binaries from the reDroid Android 16
+64-bit image and runs them with `linux-run --no-cache --trace`. It does
+not use `image/original.lock` (the Play Store emulator image) and it does
+not accept an SDK license. The NDK is not required.
+
+The image is the arm64 manifest of `redroid/redroid:16.0.0_64only-latest`,
+pinned by digest so the tag is not resolved again:
+
+- index `sha256:7b1e389bd15f37af3bcd06138f5b2ffa7cfba4332bd5ef54c53e99c2f160a15b`
+- manifest `sha256:e194edc99aa364358d1f8c214acb18b6d006c74fa0561f39259a20173ec30b66`
+- layer `sha256:efbc1c6b9440932189927a386ba3fc991f8a6b88bb8f56f1fd9b26ee8d7475b6`,
+  exactly 733630886 bytes, gzip-compressed OCI layer
+- uncompressed diff id `sha256:a234387365bc615147261cd5c7dce4747c0b8a2ba678d88e34f2ccfbce69c379`
+
+`--fetch` downloads that one layer from `registry-1.docker.io` and checks
+the sha256 before renaming it into `_build/downloads/`. A CDN redirect is
+followed without the registry bearer token. Nothing is downloaded unless
+`--fetch` is present. The reDroid project sources are Apache-2.0. This
+layer is an AOSP userspace image published by that project, identified by
+the digest above; the registry config does not name an AOSP commit. It is
+not a GMS image and not the Play Store emulator archive in
+`image/original.lock`. The Early Access GSI zip is a different license and
+is not used. This is not a legal determination, and the tool does not
+accept an SDK license. The tool then keeps only the toybox closure and
+`system/apex/com.android.runtime.apex` (8110080 bytes,
+`ff43fdc2469f458a6fdf0e5184a34ebbb187a7ec26ab6d70b198d41f75e2921b`). The
+rest of the layer is not unpacked. `/apex` is empty in the image;
+`system/bin/linker64` is a symlink to
+`/apex/com.android.runtime/bin/linker64` inside that apex. The apex
+linker64 is 2213304 bytes,
+`5fb80c2306d63523bc4c4c5fcfd4e58eb1ea9df90efbdf4a5399be3793f5e20a`.
+toybox is 578392 bytes,
+`9c64305664c6acde487a4f815e668e3540e55123503076b7ef111a6c05924976`.
+Original bytes are copied. The guest root also gets a generated
+`linkerconfig/ld.config.txt` (reDroid ships that directory empty until
+init runs `linkerconfig`) and a mode `0755` non-ELF control. Neither is
+an image file.
+
+Disk for this step is the 733630886-byte layer plus a few tens of
+megabytes of extracted files, not the unpacked image.
+
+```sh
+cargo test --locked -p aim-bionic-smoke -- --nocapture
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
+./target/release/bionic-smoke --fetch
+./target/release/bionic-smoke --linux-run "$PWD/target/release/linux-run"
+```
+
+A missing layer, a hash mismatch, a missing `DT_NEEDED` library, or a
+guest that does not match the checks below exits nonzero. The tests do
+not skip when the layer is absent; they never download it. `cargo check`
+of this crate on aarch64-apple-darwin is a compile check, not a Mac run.
+
+Pass requires all of the following. A fatal signal is not a pass.
+
+- stderr of the two successful guests contains `from load-time rewrite`
+  and `load-time rewrites:`, and does not contain `pid namespace watcher`
+- `/apex/com.android.runtime/bin/linker64` exits 0 and stdout starts with
+  `Usage: /apex/com.android.runtime/bin/linker64`
+- `/system/bin/toybox echo bionic-ok` exits 0 and stdout is exactly
+  `bionic-ok` plus a newline
+- `/system/bin/not-elf` is rejected with `cannot execute (errno 8)`
+- `/system/bin/does-not-exist` is rejected with `cannot execute (errno 2)`
+- neither negative prints `bionic-ok`
+- the printed audit lines show `machine 183` and no `PT_LOAD` align below
+  16384
+
+The program prints `bionic-smoke: original linker64 and toybox ran; this is not a reDroid boot`.
+That line is the tool, not the guest. ART, zygote, system services, and
+cross-process binder are later milestones. Whether this Android 16 linker
+accepts the generated `ld.config.txt`, and whether `libselinux` or
+`liblog` constructors abort without policy or logd, is decided by the
+Mac run's stderr. Do not treat a Linux compile as that result.
