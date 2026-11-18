@@ -10,7 +10,9 @@
 //! `aim-binder-proc guest LINUX_RUN GUEST` is the guest-syscall check. Two
 //! `linux-run` processes execute a synthetic AArch64 PIE (not an Android
 //! library) that reaches the same daemon through `openat`, `mmap` and
-//! `ioctl`. The host-only subcommands stay as they are.
+//! `ioctl`. The trace gate is the completed leave line
+//! `openat(-100, "/dev/binder", ...) = fd`, not the path string. The
+//! host-only subcommands stay as they are.
 //!
 //! An ioctl that is still blocked after 15s exits 101. This process raises
 //! only its own soft `NOFILE` when the hard limit allows 4096.
@@ -479,14 +481,23 @@ fn guest_orchestrate(linux_run: Option<String>, guest_elf: Option<String>) -> Ex
         let _ = std::fs::remove_dir_all(&root);
         return ExitCode::from(2);
     }
+    let bytes = match std::fs::read(&guest_elf) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("aim-binder-proc guest: {error}");
+            let _ = std::fs::remove_dir_all(&root);
+            return ExitCode::from(2);
+        }
+    };
+    let rewrites = aim_elf_smoke::count_rewrites(&bytes);
     let mut failed = false;
     for round in 1..=GUEST_ROUNDS {
-        if !guest_round(&exe, &linux_run, &root, round) {
+        if !guest_round(&exe, &linux_run, &root, round, rewrites) {
             failed = true;
             break;
         }
     }
-    if !failed && !guest_dead(&exe, &linux_run, &root) {
+    if !failed && !guest_dead(&exe, &linux_run, &root, rewrites) {
         failed = true;
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -511,7 +522,13 @@ fn identity_text(uid: u32, label: &str) -> String {
     format!("uid\t{uid}\nseclabel\t{label}\n")
 }
 
-fn guest_round(exe: &Path, linux_run: &Path, root: &Path, round: u32) -> bool {
+fn guest_round(
+    exe: &Path,
+    linux_run: &Path,
+    root: &Path,
+    round: u32,
+    rewrites: aim_elf_smoke::Rewrites,
+) -> bool {
     let name = format!("dev.aim.binder-guest.{}.{round}", std::process::id());
     let mut kids = Kids::default();
     kids.push(spawn(exe, &["daemon", &name]));
@@ -556,19 +573,43 @@ fn guest_round(exe: &Path, linux_run: &Path, root: &Path, round: u32) -> bool {
     }
     let serve_line = format!("txn pid={call_pid} euid=10001 code=7 marker=11223344 fd=hello");
     let call_line = format!("reply=00000042 pid={call_pid}");
+    // `ready` was consumed so the caller could start. The original stdout
+    // is that line plus whatever the guest wrote afterwards.
+    let serve_stdout = format!("ready\n{serve_out}");
     if !serve_out.lines().any(|line| line == serve_line) || call_out.trim() != call_line {
         eprintln!(
             "aim-binder-proc guest: round {round}\nserve {serve_out:?}\ncall {call_out:?}\nexpected {serve_line:?} and {call_line:?}"
         );
         return false;
     }
-    if !traced(&serve_err) || !traced(&call_err) {
-        eprintln!(
-            "aim-binder-proc guest: round {round} trace missing openat(/dev/binder) or ioctl\n{}",
-            tail(&serve_err)
+    if let Err(error) = aim_elf_smoke::accept_binder_trace(
+        &serve_err,
+        aim_elf_smoke::GuestRole::Serve,
+        serve_pid,
+        rewrites,
+    ) {
+        eprintln!("aim-binder-proc guest: round {round} serve trace: {error}");
+        eprint!(
+            "{}",
+            guest_audit("serve", serve_pid, &serve_stdout, &serve_err)
         );
         return false;
     }
+    if let Err(error) = aim_elf_smoke::accept_binder_trace(
+        &call_err,
+        aim_elf_smoke::GuestRole::Call,
+        call_pid,
+        rewrites,
+    ) {
+        eprintln!("aim-binder-proc guest: round {round} call trace: {error}");
+        eprint!("{}", guest_audit("call", call_pid, &call_out, &call_err));
+        return false;
+    }
+    print!(
+        "{}",
+        guest_audit("serve", serve_pid, &serve_stdout, &serve_err)
+    );
+    print!("{}", guest_audit("call", call_pid, &call_out, &call_err));
     if daemon_pid == serve_pid || daemon_pid == call_pid || serve_pid == call_pid {
         eprintln!(
             "aim-binder-proc guest: round {round} pids are not distinct daemon={daemon_pid} serve={serve_pid} call={call_pid}"
@@ -585,12 +626,17 @@ fn guest_round(exe: &Path, linux_run: &Path, root: &Path, round: u32) -> bool {
         return false;
     }
     println!(
-        "guest round {round} daemon={daemon_pid} serve={serve_pid} call={call_pid} sender_pid={call_pid} euid=10001 marker=11223344 fd=hello reply=00000042 trace=openat(/dev/binder),ioctl"
+        "guest round {round} daemon={daemon_pid} serve={serve_pid} call={call_pid} sender_pid={call_pid} euid=10001 marker=11223344 fd=hello reply=00000042 trace=openat(-100,\"/dev/binder\")=fd,mmap,ioctl=0"
     );
     true
 }
 
-fn guest_dead(exe: &Path, linux_run: &Path, root: &Path) -> bool {
+fn guest_dead(
+    exe: &Path,
+    linux_run: &Path,
+    root: &Path,
+    rewrites: aim_elf_smoke::Rewrites,
+) -> bool {
     let name = format!("dev.aim.binder-guest.dead.{}", std::process::id());
     let mut kids = Kids::default();
     kids.push(spawn(exe, &["daemon", &name]));
@@ -605,15 +651,24 @@ fn guest_dead(exe: &Path, linux_run: &Path, root: &Path) -> bool {
         &identity_text(10001, "u:r:shell:s0"),
         "dead",
     );
+    let dead_pid = dead.child.id();
     let (code, out, err) = finish_guest(&mut dead, WATCHDOG + Duration::from_secs(2));
     let expected = format!("dead code={:08x}", BR_DEAD_REPLY);
-    if code != Some(0) || out.trim() != expected || !traced(&err) {
+    if code != Some(0) || out.trim() != expected {
         eprintln!(
             "aim-binder-proc guest: dead check failed code {code:?} out {out:?}\n{}",
             tail(&err)
         );
         return false;
     }
+    if let Err(error) =
+        aim_elf_smoke::accept_binder_trace(&err, aim_elf_smoke::GuestRole::Dead, dead_pid, rewrites)
+    {
+        eprintln!("aim-binder-proc guest: dead trace: {error}");
+        eprint!("{}", guest_audit("dead", dead_pid, &out, &err));
+        return false;
+    }
+    print!("{}", guest_audit("dead", dead_pid, &out, &err));
     let daemon_pid = kids.pids[0];
     kids.pids.clear();
     if !kids.stop_first(daemon_pid) {
@@ -628,8 +683,21 @@ fn guest_dead(exe: &Path, linux_run: &Path, root: &Path) -> bool {
     true
 }
 
-fn traced(stderr: &str) -> bool {
-    stderr.contains("openat(\"/dev/binder\"") && stderr.contains("[linux] ioctl(")
+/// The guest's original stdout and stderr, delimited so a later log can
+/// be checked without reconstructing them from the summary line.
+fn guest_audit(role: &str, pid: u32, stdout: &str, stderr: &str) -> String {
+    let mut out = format!("----- guest {role} pid={pid} stdout -----\n");
+    out.push_str(stdout);
+    if !stdout.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("----- guest {role} pid={pid} stderr -----\n"));
+    out.push_str(stderr);
+    if !stderr.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("----- end guest {role} pid={pid} -----\n"));
+    out
 }
 
 fn tail(text: &str) -> String {

@@ -20,4 +20,5 @@ path = "src/bin/aim-binder-proc.rs"
 [dependencies]
 aim-storage = { path = "../aim-storage" }
 aim-binder-driver = { path = "../aim-binder-driver" }
+aim-elf-smoke = { path = "../aim-elf-smoke" }
 libc.workspace = true

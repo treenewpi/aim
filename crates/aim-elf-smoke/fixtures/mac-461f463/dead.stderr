@@ -1,0 +1,12 @@
+[linux-abi] /bin/binder-guest loaded at bias 0x8000000000 from load-time rewrite; load-time rewrites: 15 svc, 0 mrs/0 msr tpidr_el0, 0 scs, 0 ctr_el0 (0 brk fallbacks)
+[linux] openat(-100, "/dev/binder", 0x80002, 0x0) [pid=83992 tid=83992 call=0 enter]
+[linux] openat(-100, "/dev/binder", 0x80002, 0x0) = 3 [pid=83992 tid=83992 call=0 leave]
+[linux] mmap(0x0, 0x20000, 0x1, 0x2, 0x3, 0x0) [pid=83992 tid=83992 call=1 enter]
+[linux] mmap(0x0, 0x20000, 0x1, 0x2, 0x3, 0x0) = 0x800484c000 [pid=83992 tid=83992 call=1 leave]
+[linux] mmap(0x0, 0x4000, 0x3, 0x22, -1, 0x0) [pid=83992 tid=83992 call=2 enter]
+[linux] mmap(0x0, 0x4000, 0x3, 0x22, -1, 0x0) = 0x800486c000 [pid=83992 tid=83992 call=2 leave]
+[linux] ioctl(0x3, 0xc0306201, 0x800486c040) [pid=83992 tid=83992 call=3 enter]
+[linux] ioctl(0x3, 0xc0306201, 0x800486c040) = 0 [pid=83992 tid=83992 call=3 leave]
+[linux] write(0x1, 0x800486c700, 0x13) [pid=83992 tid=83992 call=4 enter]
+[linux] write(0x1, 0x800486c700, 0x13) = 19 [pid=83992 tid=83992 call=4 leave]
+[linux] exit_group(0x0) [pid=83992 tid=83992 call=5 enter]

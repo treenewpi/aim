@@ -91,14 +91,31 @@ cargo build --locked -p aim-linux-abi --release --bin linux-run
 ```
 
 Run the last command twice. Pass: `aim-binder-guest synthetic-pie
-not-android`, two `guest round` lines with three distinct pids,
+not-android`, then for each guest a block `----- guest serve|call|dead
+pid=N stdout -----` followed by that process's original stdout and
+stderr, then two `guest round` lines with three distinct pids,
 `sender_pid` equal to the call `linux-run` pid, `euid=10001`,
 `marker=11223344`, `fd=hello`, `reply=00000042`, and
-`trace=openat(/dev/binder),ioctl`. Then
-`guest no-context-manager dead code=00007205` and `aim-binder-guest ok`.
-The service name is gone after each daemon is killed. No leftover
-process. A guest still blocked after 15s is not a pass. This is not
-`servicemanager`, ART, or a reDroid boot.
+`trace=openat(-100,"/dev/binder")=fd,mmap,ioctl=0`. Then the dead
+guest's block, `guest no-context-manager dead code=00007205`, and
+`aim-binder-guest ok`. The service name is gone after each daemon is
+killed. No leftover process. A guest still blocked after 15s is not a
+pass. This is not `servicemanager`, ART, or a reDroid boot.
+
+The trace check reads leave lines, not a path substring. A successful
+open is `openat(-100, "/dev/binder", 0x80002, 0x0) = <fd>` (`-100` is
+`AT_FDCWD`). That fd is the binder `mmap` and the `ioctl`s, and those
+ioctls return 0. The server must `read` five bytes from the translated
+fd. The caller must `pipe2`, `write` five bytes, and close that end.
+An `openat` that returns an errno is not a pass. Commit `461f463`
+looked for `openat("/dev/binder"` and stopped on round 1 after the
+guests had already exchanged the payload.
+
+`TMPDIR` has to be short enough that the daemon's socket path fits in
+`sockaddr_un`. A longer directory fails in the daemon before a guest
+starts. That is an environment limit, not a result of this check. The
+guest root the harness creates has to be traversable; a root created
+mode `0700` returns errno 13 before the ELF is read.
 
 ## Synthetic ELF
 

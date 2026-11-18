@@ -27,7 +27,9 @@ pub const PAGE_LINE: &str = "elf-smoke page=16384\n";
 pub const TLS_LINE: &str = "tls=ok mmap=ok\n";
 
 mod binder_guest;
+mod guest_trace;
 pub use binder_guest::binder_program;
+pub use guest_trace::{accept_binder_trace, GuestRole};
 
 /// `svc #0`, `mrs Xt, tpidr_el0`, `msr tpidr_el0, Xt` as the translator matches them.
 const SVC0: u32 = 0xd400_0001;

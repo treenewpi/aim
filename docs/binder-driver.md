@@ -110,7 +110,10 @@ runs it alone. The `client` module is what the syscall layer calls
 A synthetic static PIE (`aim-elf-smoke`'s binder guest, not an Android
 library) is the current guest-syscall check: two `linux-run` processes
 open `/dev/binder`, mmap the receive buffer and `ioctl` through this
-path. `servicemanager` is the same path once that binary is the guest.
+path. The check parses leave lines. The open leave is
+`openat(-100, "/dev/binder", 0x80002, 0x0) = <fd>`, because the tracer
+prints the directory fd (`AT_FDCWD`) first; a path substring is not a
+pass. `servicemanager` is the same path once that binary is the guest.
 
 - **Open.** `openat("/dev/binder")` creates a Unix socket pair. The guest's
   fd is one end, and the other end goes to the daemon as a fileport. The
