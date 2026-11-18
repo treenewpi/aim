@@ -2954,16 +2954,19 @@ pub fn ioctl(a: [u64; 6]) -> i64 {
             FIONREAD => {
                 let n = match inotify::pending_bytes(fd) {
                     Some(n) => n as i32,
-                    None if let Some(r) = super::net::fionread(fd) => match r {
-                        Ok(n) => n,
-                        Err(error) => return error,
-                    },
                     None => {
-                        let mut n = 0i32;
-                        if libc::ioctl(fd, libc::FIONREAD, &mut n) < 0 {
-                            return -(errno::last() as i64);
+                        if let Some(r) = super::net::fionread(fd) {
+                            match r {
+                                Ok(n) => n,
+                                Err(error) => return error,
+                            }
+                        } else {
+                            let mut n = 0i32;
+                            if libc::ioctl(fd, libc::FIONREAD, &mut n) < 0 {
+                                return -(errno::last() as i64);
+                            }
+                            n
                         }
-                        n
                     }
                 };
                 super::user_memory::write_exact(arg, &n.to_le_bytes())

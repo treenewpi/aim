@@ -840,17 +840,20 @@ impl BinderFile {
                 // Numbers where dup2 has published the received file. A
                 // failed identity check must not close the number: it is
                 // another client's descriptor.
-                let mut replaced = Vec::new();
+                // Guest fd numbers travel as u32, matching `installs` and
+                // `closes`. Host calls take the same number as i32.
+                let mut replaced: Vec<u32> = Vec::new();
                 for (index, fd) in reply.installs.iter().enumerate() {
                     let p = ports.next().unwrap();
+                    let host_fd = *fd as i32;
                     // The number was reserved as a placeholder. If it no
                     // longer is, another client in this process owns it now;
                     // dup2 would replace their file.
                     let result = with_descriptors(|| {
-                        if !t.reserved.holds(*fd as i32) {
+                        if !t.reserved.holds(host_fd) {
                             return Err(errno::EBADF);
                         }
-                        mem.install_fileport(*fd as i32, p)
+                        mem.install_fileport(host_fd, p)
                     });
                     mach::release_send(p);
                     if let Err(error) = result {
@@ -858,17 +861,18 @@ impl BinderFile {
                             mach::release_send(port);
                         }
                         for fd in replaced.iter().chain(&reply.closes) {
-                            if let Err(secondary) = mem.close_file(*fd) {
+                            let host_fd = *fd as i32;
+                            if let Err(secondary) = mem.close_file(host_fd) {
                                 eprintln!(
-                                    "Binder import rollback close fd={fd}: errno {secondary}"
+                                    "Binder import rollback close fd={host_fd}: errno {secondary}"
                                 );
                             }
-                            t.reserved.take(*fd);
+                            t.reserved.take(host_fd);
                         }
                         reject_deliveries(t, port, &reply)?;
                         return Err(error);
                     }
-                    replaced.push(*fd as i32);
+                    replaced.push(*fd);
                     writers.push(
                         if reply.regular[index]
                             .as_ref()
