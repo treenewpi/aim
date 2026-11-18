@@ -527,9 +527,21 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
     if flags & MAP_ANONYMOUS == 0 && super::proxy_file::is_proxy(fd) {
         return -(crate::errno::ENODEV as i64);
     }
-    if len == 0 || off & (PAGE - 1) != 0 {
-        return -(EINVAL as i64);
-    }
+    // Private file maps consult `private_file_map`: a 16 KiB-aligned offset
+    // stays a host file mapping, and a 4 KiB offset is copied so the
+    // returned pointer starts at that file offset.
+    let copy_file = if flags & MAP_ANONYMOUS == 0 && flags & MAP_TYPE == MAP_PRIVATE {
+        match aim_guest_page::private_file_map(off, len) {
+            Ok(aim_guest_page::PrivateFileMap::Copy { .. }) => true,
+            Ok(_) => false,
+            Err(error) => return -(error as i64),
+        }
+    } else {
+        if len == 0 || off & (PAGE - 1) != 0 {
+            return -(EINVAL as i64);
+        }
+        false
+    };
     if flags & MAP_ANONYMOUS == 0
         && let Some(file) = super::fuse_client::get(fd)
     {
@@ -659,7 +671,9 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
         } else {
             None
         };
-        if let Some(ExecSource::Shared) = source {
+        if let Some(ExecSource::Shared) = source
+            && !copy_file
+        {
             // Translated (or nothing to rewrite): the file itself, shared.
             let b = match host_mmap(
                 addr,
@@ -674,8 +688,9 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
             };
             crate::diag::register_fd_module(b, len, fd, off);
             (b, Finish::Protect)
-        } else if !anon && !exec && maps_file(fd) {
-            // The file itself, copy-on-write.
+        } else if !anon && !exec && maps_file(fd) && !copy_file {
+            // The file itself, copy-on-write. A 4 KiB file offset falls
+            // through and is copied so the pointer starts at that offset.
             noted = true;
             match host_mmap(
                 addr,

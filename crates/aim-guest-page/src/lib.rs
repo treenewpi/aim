@@ -32,6 +32,50 @@ pub fn prot_bits(prot: u32) -> u32 {
     prot & (PROT_READ | PROT_WRITE | PROT_EXEC)
 }
 
+/// How a private file `mmap` is backed.
+///
+/// A 16 KiB-aligned offset is the file itself, copy-on-write. Bionic maps
+/// `libcrypto.so`'s dynamic section at file offset `0x17a000` (8 KiB into a
+/// 16 KiB page) with length `0x12c0` and `PROT_READ`. That offset is copied
+/// into a fresh host page: the returned pointer's first byte is file offset
+/// `0x17a000`, and the recorded offset stays `0x17a000`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateFileMap {
+    Direct { offset: u64, length: u64 },
+    Copy { offset: u64, length: u64 },
+}
+
+/// `length` and `offset` are the guest arguments. `Ok` lengths are rounded
+/// up to [`PAGE`]. A zero length, or an offset that is not a multiple of
+/// 4 KiB, is [`EINVAL`].
+pub fn private_file_map(offset: u64, length: u64) -> Result<PrivateFileMap, i32> {
+    if length == 0 || offset & (GUEST_PAGE - 1) != 0 {
+        return Err(EINVAL);
+    }
+    let length = host_span(length)?;
+    if offset & (PAGE - 1) == 0 {
+        Ok(PrivateFileMap::Direct { offset, length })
+    } else {
+        Ok(PrivateFileMap::Copy { offset, length })
+    }
+}
+
+/// Bytes of a copied mapping that come from the file, and bytes that stay
+/// zero because they are past EOF. `length` is the guest length.
+pub fn copied_file_bytes(offset: u64, length: u64, file_len: u64) -> Result<(u64, u64), i32> {
+    let length = host_span(length)?;
+    let copied = file_len.saturating_sub(offset).min(length);
+    Ok((copied, length - copied))
+}
+
+fn host_span(length: u64) -> Result<u64, i32> {
+    if length == 0 {
+        return Err(EINVAL);
+    }
+    let sum = length.checked_add(PAGE - 1).ok_or(ENOMEM)?;
+    Ok(sum & !(PAGE - 1))
+}
+
 /// Round `len` up to [`GUEST_PAGE`]. Zero stays zero. Overflow is [`ENOMEM`].
 pub fn guest_page_len(len: u64) -> Result<u64, i32> {
     if len == 0 {
@@ -266,5 +310,43 @@ mod tests {
         // A 16 KiB-aligned address is not this path. The caller keeps the
         // old rounding for it. Zero length is still a no-op here.
         assert_eq!(begin_subpage(0x18c000, 0, RO), Ok(0));
+    }
+
+    #[test]
+    fn guest4k_libcrypto_dynamic_section_is_copied_at_its_file_offset() {
+        // toybox: mmap(0, 0x12c0, PROT_READ, MAP_PRIVATE, fd, 0x17a000).
+        assert_eq!(
+            private_file_map(0x17a000, 0x12c0),
+            Ok(PrivateFileMap::Copy {
+                offset: 0x17a000,
+                length: 0x4000
+            })
+        );
+        assert_eq!(
+            private_file_map(0x178000, 0x12c0),
+            Ok(PrivateFileMap::Direct {
+                offset: 0x178000,
+                length: 0x4000
+            })
+        );
+    }
+
+    #[test]
+    fn guest4k_file_offset_alignment_eof_and_overflow() {
+        assert_eq!(private_file_map(0x17a001, 0x12c0), Err(EINVAL));
+        assert_eq!(private_file_map(0x17a000, 0), Err(EINVAL));
+        assert_eq!(private_file_map(0, u64::MAX), Err(ENOMEM));
+        assert_eq!(
+            copied_file_bytes(0x17a000, 0x12c0, 0x17a100),
+            Ok((0x100, 0x3f00))
+        );
+        assert_eq!(
+            copied_file_bytes(0x17a000, 0x12c0, 0x17a000),
+            Ok((0, 0x4000))
+        );
+        assert_eq!(
+            copied_file_bytes(0x17a000, 0x12c0, 0x17a000 + 0x5000),
+            Ok((0x4000, 0))
+        );
     }
 }

@@ -184,6 +184,14 @@ succeeds; the page's protection is the union of its 4 KiB slices, so the
 writable globals keep working. A request that gives every slice the same
 protection updates the whole page.
 
+`a1d5909` then ran linker64. toybox stopped in
+`mmap(0, 0x12c0, PROT_READ, MAP_PRIVATE, libcrypto.so, 0x17a000)`: the
+dynamic section's file offset is 8 KiB into a 16 KiB page. A 16 KiB-aligned
+private file offset stays a host file mapping. This offset is copied into a
+fresh host page, the returned pointer's first byte is file offset
+`0x17a000`, and munmap drops that whole host page. Bytes past EOF in the
+page are zero.
+
 The layer is already in `_build/downloads`. Do not pass `--fetch` again.
 Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary
 can call it. The `guest4k_` tests are the regression and do not need the
@@ -192,7 +200,7 @@ generated AIDL tree. A passing run of those tests is not a Mac guest run.
 ```sh
 git fetch origin cursor/binder-fd-elf-smoke-602d
 git checkout cursor/binder-fd-elf-smoke-602d
-cargo test --locked -p aim-guest-page --lib guest4k_ -- --nocapture
+cargo test --locked -p aim-guest-page --lib -- --nocapture
 cargo build --locked -p aim-linux-abi --release --bin linux-run
 ./target/release/linux-run --no-cache --trace --root "$PWD/_build/redroid-16-runtime/root" /apex/com.android.runtime/bin/linker64
 ./target/release/linux-run --no-cache --trace --root "$PWD/_build/redroid-16-runtime/root" /system/bin/toybox echo bionic-ok
