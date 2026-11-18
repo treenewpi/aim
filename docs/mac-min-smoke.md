@@ -222,8 +222,10 @@ different. Direct toybox: `mprotect(0x8005fb3000, 0x1000, PROT_READ)` is
 `libc++.so`'s text, already rewritten. Both starts are 4 KiB-aligned.
 Execute is part of the host-page union, and `PROT_BTI` is not a host bit.
 The RELRO slice is recorded read-only; the text beside it keeps the page
-executable, so that data is not a private read-only page. A 16 KiB-aligned
-`mprotect` is unchanged.
+executable, so that data is not a private read-only page. A `mprotect`
+whose start and end are both 16 KiB-aligned stays one host call. A 4 KiB
+length at a 16 KiB-aligned address does not: rounding it up write-protects
+the next three slices.
 
 The layer is already in `_build/downloads`. Do not pass `--fetch` again.
 Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary

@@ -1358,8 +1358,12 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
 ///   readable if needed, scanned and rewritten (a private file mapping
 ///   gets its own copy of each page written), then protected.
 pub fn mprotect(a: [u64; 6]) -> i64 {
-    if a[0] & (PAGE - 1) != 0 {
-        return mprotect_subpage(a);
+    // A 16 KiB-aligned start whose length is only a few 4 KiB slices must
+    // not be rounded up to the host page: the next slices stay as they are.
+    match aim_guest_page::whole_host_pages(a[0], a[1]) {
+        Ok(false) => return mprotect_subpage(a),
+        Ok(true) => {}
+        Err(error) => return -(error as i64),
     }
     let _epoch = super::verity_pager::exclusive_mutation();
     let (addr, len) = (a[0], page_up(a[1]));

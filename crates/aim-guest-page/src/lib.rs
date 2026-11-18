@@ -187,6 +187,22 @@ pub fn guest_page_len(len: u64) -> Result<u64, i32> {
     Ok(rounded & !(GUEST_PAGE - 1))
 }
 
+/// True when `[addr, addr+len)` is empty or covers only whole host pages.
+///
+/// A 4 KiB length at a 16 KiB-aligned address is false. Rounding that length
+/// up to the host page would change the next three slices.
+pub fn whole_host_pages(addr: u64, len: u64) -> Result<bool, i32> {
+    if addr & (GUEST_PAGE - 1) != 0 {
+        return Err(EINVAL);
+    }
+    let len = guest_page_len(len)?;
+    if len == 0 {
+        return Ok(addr & (PAGE - 1) == 0);
+    }
+    let end = addr.checked_add(len).ok_or(ENOMEM)?;
+    Ok(addr & (PAGE - 1) == 0 && end & (PAGE - 1) == 0)
+}
+
 /// Alignment and length checks for a guest `mprotect` that is not aligned
 /// to [`PAGE`]. `Ok(0)` is a successful no-op. `Ok(len)` is the rounded
 /// length the caller maps and protects. Execute is allowed; the host page
@@ -572,5 +588,32 @@ mod tests {
         let (host, _) =
             plan_subpage(0x8005ee0000, 0x8005ee2000, 0x8005ee4000, RX, &current).unwrap();
         assert!(host.is_empty());
+    }
+
+    #[test]
+    fn guest4k_aligned_short_mprotect_leaves_the_next_slice_writable() {
+        // toybox wrote 0x80061f5008 (the next slice, +8) after
+        // mprotect(0x80061f4000, 0x1000, PROT_READ). The start is 16 KiB
+        // aligned and the length is one guest page, so this is not a whole
+        // host page. The same shape at 0x8006190000 and 0x8006148000 faulted;
+        // 0x8005f17000 and 0x80061a3000 are not 16 KiB aligned and returned.
+        assert_eq!(whole_host_pages(0x80061f4000, 0x1000), Ok(false));
+        assert_eq!(whole_host_pages(0x8006190000, 0x1000), Ok(false));
+        assert_eq!(whole_host_pages(0x8006148000, 0x1000), Ok(false));
+        assert_eq!(whole_host_pages(0x8005f17000, 0x1000), Ok(false));
+        assert_eq!(whole_host_pages(0x80061f4000, 0x4000), Ok(true));
+        assert_eq!(whole_host_pages(0x80061f4001, 0x1000), Err(EINVAL));
+        let current = [RW, RW, RW, RW];
+        let (host, slices) =
+            plan_subpage(0x80061f4000, 0x80061f4000, 0x80061f5000, RO, &current).unwrap();
+        assert!(
+            host.is_empty(),
+            "the other three slices stay writable: {host:?}"
+        );
+        assert_eq!(slices[1], (0x80061f5000, RW));
+        assert_eq!(
+            recorded(0x80061f4000, &current, &host, &slices),
+            [(0x80061f4000, RO)]
+        );
     }
 }
