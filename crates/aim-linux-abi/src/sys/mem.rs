@@ -219,6 +219,28 @@ fn store_hash(addr: u64, original: &fips::Hash, new: &fips::Hash) -> bool {
 
 /// mmap, counted against RLIMIT_AS and RLIMIT_DATA (`mmap_region`).
 pub fn mmap(a: [u64; 6]) -> i64 {
+    if a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0
+        && let Ok(split) = aim_guest_page::split_guest_range(a[0], a[1])
+        && split.is_partial()
+    {
+        let len = match aim_guest_page::guest_page_len(a[1]) {
+            Ok(len) => len,
+            Err(error) => return -(error as i64),
+        };
+        let kind = vm_account::Kind {
+            shared: matches!(a[3] & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE),
+            writable: a[2] & PROT_WRITE != 0,
+            stack: a[3] & MAP_GROWSDOWN != 0,
+        };
+        let (limits, heap) = (super::cred::memory_limits(), brk_heap());
+        if !vm_account::with(|s| s.may_map(limits, heap, a[0], len, kind)) {
+            return -(ENOMEM as i64);
+        }
+        return mmap_guest(a, |lo| {
+            vm_account::with(|s| s.map(lo, lo + len, kind));
+            forget_guest_slices(lo, lo + len);
+        });
+    }
     let len = page_up(a[1]);
     let kind = vm_account::Kind {
         shared: matches!(a[3] & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE),
@@ -390,9 +412,19 @@ fn mmap_object(a: [u64; 6], pieces: &[(u64, u64)]) -> i64 {
 }
 fn mmap_pinned(a: [u64; 6], held: &super::fdtab::Pinned) -> i64 {
     use std::os::fd::AsRawFd;
+    // A 4 KiB-aligned MAP_FIXED range is filled by copying the covered
+    // slices. Verity registrations are 16 KiB, so this range is not one.
+    let partial = a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0
+        && matches!(
+            aim_guest_page::split_guest_range(a[0], a[1]),
+            Ok(split) if split.is_partial()
+        );
     if let Some(super::fdtab::Kind::Regular(description)) = held.kind() {
         if !matches!(description.flags & 3, 0 | 2) {
             return -(errno::EACCES as i64);
+        }
+        if partial {
+            return mmap_owned(a);
         }
         let proof = match description.store.lookup(description.identity) {
             Ok(proof) => proof,
@@ -580,13 +612,19 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
     {
         return e;
     }
-    let len = page_up(len);
-    let mut addr = addr;
     let mut fixed = flags & MAP_FIXED != 0;
     let noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    if (fixed || noreplace)
+        && let Ok(split) = aim_guest_page::split_guest_range(addr, len)
+        && split.is_partial()
+    {
+        return mmap_partial_fixed(addr, len, prot, flags, fd, off, split);
+    }
     if (fixed || noreplace) && addr & (PAGE - 1) != 0 {
         return -(EINVAL as i64);
     }
+    let len = page_up(len);
+    let mut addr = addr;
     // A hint in the heap reference window takes the reserved pages there
     // exactly; a hint that cannot be honoured there is dropped, as Linux
     // places the mapping elsewhere.
@@ -847,13 +885,41 @@ thread_local! {
 /// the calling thread's own stack and then calls `exit`, so an munmap that
 /// covers that frame is deferred to thread exit (ADR 0012, "Platform probes").
 pub fn munmap(ctx: &GuestContext, a: [u64; 6]) -> i64 {
+    if a[1] == 0 {
+        return 0;
+    }
+    let split = match aim_guest_page::split_guest_range(a[0], a[1]) {
+        Ok(split) => split,
+        Err(error) => return -(error as i64),
+    };
     let _epoch = super::verity_pager::mutation();
     let _mapping = super::memfd::mapping_change();
-    let (addr, len) = (a[0], page_up(a[1]));
-    super::verity_pager::wait_pending(addr, len);
-    if addr & (PAGE - 1) != 0 {
-        return -(EINVAL as i64);
+    if !split.is_partial() {
+        return munmap_aligned(ctx, split.full_lo, split.full_hi - split.full_lo);
     }
+    if let Some(head) = split.head {
+        let result = punch_page(head.host, head.cover);
+        if result < 0 {
+            return result;
+        }
+    }
+    if split.full_hi > split.full_lo {
+        let result = munmap_aligned(ctx, split.full_lo, split.full_hi - split.full_lo);
+        if result < 0 {
+            return result;
+        }
+    }
+    if let Some(tail) = split.tail {
+        let result = punch_page(tail.host, tail.cover);
+        if result < 0 {
+            return result;
+        }
+    }
+    0
+}
+
+fn munmap_aligned(ctx: &GuestContext, addr: u64, len: u64) -> i64 {
+    super::verity_pager::wait_pending(addr, len);
     let frame_lo = ctx.sp.saturating_sub(32);
     if len > 0 && frame_lo < addr.saturating_add(len) && ctx.sp > addr {
         DEFERRED_UNMAPS.with(|d| d.borrow_mut().push((addr, len)));
@@ -862,6 +928,10 @@ pub fn munmap(ctx: &GuestContext, a: [u64; 6]) -> i64 {
         forget_guest_slices(addr, addr + len);
         return 0;
     }
+    release_aligned(addr, len)
+}
+
+fn release_aligned(addr: u64, len: u64) -> i64 {
     if let Err(error) = super::verity_pager::forget(addr, len) {
         return -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64);
     }
@@ -967,6 +1037,194 @@ fn forget_guest_slices(lo: u64, hi: u64) {
     for page in keys {
         slices.remove(&page);
     }
+    drop(slices);
+    let mut pages = PAGE_PIECES.lock().unwrap();
+    let hosts: Vec<u64> = pages
+        .range(lo.saturating_sub(PAGE - 1)..hi)
+        .map(|(&host, _)| host)
+        .filter(|&host| host >= lo && host + PAGE <= hi)
+        .collect();
+    for host in hosts {
+        pages.remove(&host);
+    }
+}
+
+/// Slices of one host page after a 4 KiB `munmap` or `MAP_FIXED`.
+/// Absence of a page means every slice is present with the host protection.
+#[derive(Clone, Copy)]
+struct PagePieces {
+    present: u8,
+    prot: [u32; 4],
+}
+
+static PAGE_PIECES: Mutex<BTreeMap<u64, PagePieces>> = Mutex::new(BTreeMap::new());
+
+fn page_prot(host: u64) -> Option<u32> {
+    vmmap::info_at(host).and_then(|info| {
+        (host >= info.start && host < info.end).then_some(aim_guest_page::prot_bits(info.prot))
+    })
+}
+
+fn punch_page(host: u64, cover: u8) -> i64 {
+    if cover == 0 {
+        return 0;
+    }
+    if cover == 0b1111 {
+        return release_aligned(host, PAGE);
+    }
+    let Some(prot) = page_prot(host) else {
+        return 0;
+    };
+    let gone = {
+        let mut pages = PAGE_PIECES.lock().unwrap();
+        let entry = pages.entry(host).or_insert(PagePieces {
+            present: 0b1111,
+            prot: [prot; 4],
+        });
+        entry.present &= !cover;
+        entry.present == 0
+    };
+    if gone {
+        PAGE_PIECES.lock().unwrap().remove(&host);
+        release_aligned(host, PAGE)
+    } else {
+        0
+    }
+}
+
+fn map_covered_slices(
+    host: u64,
+    cover: u8,
+    prot: u32,
+    anon: bool,
+    fd: i32,
+    map_addr: u64,
+    map_off: u64,
+) -> i64 {
+    if cover == 0 {
+        return 0;
+    }
+    let existed = page_prot(host);
+    if existed.is_none() {
+        match host_mmap(
+            host,
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        ) {
+            Ok(mapped) if mapped == host => {}
+            Ok(mapped) => {
+                unsafe { libc::munmap(mapped as *mut _, PAGE as usize) };
+                return -(ENOMEM as i64);
+            }
+            Err(error) => return error,
+        }
+    } else if existed.unwrap() & libc::PROT_WRITE as u32 == 0 {
+        let result = host_mprotect(host, PAGE, libc::PROT_READ | libc::PROT_WRITE);
+        if result < 0 {
+            return result;
+        }
+    }
+    let prot = aim_guest_page::prot_bits(prot);
+    for slot in 0..4 {
+        if cover & (1 << slot) == 0 {
+            continue;
+        }
+        let at = host + slot * GUEST_PAGE;
+        // The host page was just created writable, or mprotect'd writable.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, GUEST_PAGE as usize) };
+        if !anon {
+            let file_off = aim_guest_page::file_offset_at(map_addr, map_off, at);
+            if let Err(error) = populate(at, GUEST_PAGE, fd, file_off) {
+                return error;
+            }
+            if prot & libc::PROT_EXEC as u32 != 0 {
+                let source = xrt::exec_source(fd, file_off);
+                if let Err(error) = rewrite_file_copy(at, GUEST_PAGE, fd, file_off, &source) {
+                    return error;
+                }
+            }
+        } else if prot & libc::PROT_EXEC as u32 != 0 {
+            patch::rewrite_region(at, GUEST_PAGE);
+        }
+    }
+    let union = {
+        let mut pages = PAGE_PIECES.lock().unwrap();
+        let entry = pages.entry(host).or_insert(PagePieces {
+            present: if existed.is_some() { 0b1111 } else { 0 },
+            prot: [existed.unwrap_or(0); 4],
+        });
+        for slot in 0..4 {
+            if cover & (1 << slot) != 0 {
+                entry.present |= 1 << slot;
+                entry.prot[slot] = prot;
+            }
+        }
+        let union = (0..4)
+            .filter(|slot| entry.present & (1 << slot) != 0)
+            .fold(0, |bits, slot| bits | entry.prot[slot]);
+        if entry.present == 0b1111 && entry.prot.iter().all(|item| *item == entry.prot[0]) {
+            pages.remove(&host);
+        }
+        union
+    };
+    if union & (PROT_WRITE | PROT_EXEC) as u32 == (PROT_WRITE | PROT_EXEC) as u32 {
+        super::jit::protect_rwx(host, PAGE)
+    } else {
+        host_mprotect(host, PAGE, host_prot(union as u64))
+    }
+}
+
+/// `MAP_FIXED` of a range whose address or end is only 4 KiB-aligned.
+/// Whole host pages use the ordinary path. An edge page keeps the slices
+/// the request does not cover, and the call returns the requested address.
+/// The host page's protection is the union of its present slices, and a
+/// slice that was unmapped stays readable until the whole page is gone.
+fn mmap_partial_fixed(
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+    off: u64,
+    split: aim_guest_page::RangeSplit,
+) -> i64 {
+    if matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE) {
+        return -(EINVAL as i64);
+    }
+    let anon = flags & MAP_ANONYMOUS != 0;
+    if let Some(head) = split.head {
+        let result = map_covered_slices(head.host, head.cover, prot as u32, anon, fd, addr, off);
+        if result < 0 {
+            return result;
+        }
+    }
+    if split.full_hi > split.full_lo {
+        let file_off = aim_guest_page::file_offset_at(addr, off, split.full_lo);
+        let result = mmap_kernel([
+            split.full_lo,
+            split.full_hi - split.full_lo,
+            prot,
+            flags,
+            fd as u64,
+            file_off,
+        ]);
+        if result < 0 {
+            return result;
+        }
+    }
+    if let Some(tail) = split.tail {
+        let result = map_covered_slices(tail.host, tail.cover, prot as u32, anon, fd, addr, off);
+        if result < 0 {
+            return result;
+        }
+    }
+    if !anon && let Ok(span) = aim_guest_page::guest_page_len(len) {
+        note_file_copy(addr, span, fd, off);
+    }
+    addr as i64
 }
 
 fn slice_prot(page: u64) -> Result<u32, i64> {

@@ -192,6 +192,20 @@ fresh host page, the returned pointer's first byte is file offset
 `0x17a000`, and munmap drops that whole host page. Bytes past EOF in the
 page are zero.
 
+`67dfb88` then parsed that section. toybox stopped while placing the next
+library: `munmap(0x8005d3d000, 0x1e000)` and
+`mmap(0x8005da5000, 0xdd0, PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, 0)`.
+The formal smoke hit the same shape in a different library
+(`mmap(0x8005d4b000, 0x4e44, ...)`). Bionic reserves one anonymous region,
+unmaps the padding off both ends, then `MAP_FIXED`s each segment. Those
+edges are 4 KiB-aligned. A range with both ends 16 KiB-aligned is unchanged.
+Otherwise only the 4 KiB slices inside the request are punched or replaced;
+a host page is really unmapped only when every slice is in the request.
+`MAP_FIXED` returns the requested address and copies the file into the
+covered slices. The page's protection is the union of the slices that are
+still present, and a punched slice stays readable until the whole page is
+unmapped. A shared `MAP_FIXED` of a partial page is `EINVAL`.
+
 The layer is already in `_build/downloads`. Do not pass `--fetch` again.
 Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary
 can call it. The `guest4k_` tests are the regression and do not need the

@@ -68,6 +68,93 @@ pub fn copied_file_bytes(offset: u64, length: u64, file_len: u64) -> Result<(u64
     Ok((copied, length - copied))
 }
 
+/// One host page and the 4 KiB slices of it that a guest range covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageCover {
+    pub host: u64,
+    /// Bit `i` is set when slice `i` of [`PageCover::host`] is in the range.
+    pub cover: u8,
+}
+
+/// A guest range split into whole host pages and the partial pages at its edges.
+///
+/// Bionic reserves one anonymous region, `munmap`s the padding off both ends
+/// (those ends are often only 4 KiB-aligned), then `MAP_FIXED`s each segment
+/// at the address that remains. A partial page's uncovered slices are the
+/// neighbor that must stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeSplit {
+    pub head: Option<PageCover>,
+    pub full_lo: u64,
+    pub full_hi: u64,
+    pub tail: Option<PageCover>,
+}
+
+impl RangeSplit {
+    pub fn is_partial(self) -> bool {
+        self.head.is_some() || self.tail.is_some()
+    }
+}
+
+/// Split `[start, start+length)` after rounding `length` up to 4 KiB.
+/// A zero length or a start that is not a multiple of 4 KiB is [`EINVAL`].
+pub fn split_guest_range(start: u64, length: u64) -> Result<RangeSplit, i32> {
+    if length == 0 || start & (GUEST_PAGE - 1) != 0 {
+        return Err(EINVAL);
+    }
+    let span = guest_page_len(length)?;
+    let end = start.checked_add(span).ok_or(ENOMEM)?;
+    let host_lo = start & !(PAGE - 1);
+    let host_hi = end.checked_add(PAGE - 1).ok_or(ENOMEM)? & !(PAGE - 1);
+    let mut full_lo = host_lo;
+    let mut full_hi = host_hi;
+    let mut head = None;
+    let mut tail = None;
+    if start > host_lo || end < host_lo + PAGE {
+        let hi = end.min(host_lo + PAGE);
+        head = Some(PageCover {
+            host: host_lo,
+            cover: cover_mask(start, hi, host_lo),
+        });
+        full_lo = host_lo + PAGE;
+    }
+    if host_hi > host_lo + PAGE && end < host_hi {
+        let tail_host = host_hi - PAGE;
+        tail = Some(PageCover {
+            host: tail_host,
+            cover: cover_mask(tail_host, end, tail_host),
+        });
+        full_hi = tail_host;
+    }
+    if full_lo >= full_hi {
+        full_lo = 0;
+        full_hi = 0;
+    }
+    Ok(RangeSplit {
+        head,
+        full_lo,
+        full_hi,
+        tail,
+    })
+}
+
+/// File offset of guest address `at` in a mapping that starts at `map_addr`
+/// with file offset `map_off`.
+pub fn file_offset_at(map_addr: u64, map_off: u64, at: u64) -> u64 {
+    map_off + (at - map_addr)
+}
+
+fn cover_mask(lo: u64, hi: u64, host: u64) -> u8 {
+    let mut mask = 0u8;
+    for slot in 0..4 {
+        let slice = host + slot * GUEST_PAGE;
+        if slice < hi && slice + GUEST_PAGE > lo {
+            mask |= 1 << slot;
+        }
+    }
+    mask
+}
+
 fn host_span(length: u64) -> Result<u64, i32> {
     if length == 0 {
         return Err(EINVAL);
@@ -348,5 +435,73 @@ mod tests {
             copied_file_bytes(0x17a000, 0x12c0, 0x17a000 + 0x5000),
             Ok((0x4000, 0))
         );
+    }
+
+    fn covers(split: RangeSplit, addr: u64) -> bool {
+        let host = addr & !(PAGE - 1);
+        let bit = 1u8 << ((addr - host) / GUEST_PAGE);
+        if let Some(head) = split.head
+            && head.host == host
+        {
+            return head.cover & bit != 0;
+        }
+        if let Some(tail) = split.tail
+            && tail.host == host
+        {
+            return tail.cover & bit != 0;
+        }
+        split.full_lo <= addr && addr < split.full_hi
+    }
+
+    #[test]
+    fn guest4k_reservation_trim_keeps_the_neighbor_slice() {
+        // munmap(0x8005d3d000, 0x1e000): tail of a reservation, 4 KiB into a page.
+        let tail = split_guest_range(0x8005d3d000, 0x1e000).unwrap();
+        assert!(covers(tail, 0x8005d3d000));
+        assert!(
+            !covers(tail, 0x8005d3c000),
+            "the live slice before the trim stays"
+        );
+        assert_eq!(tail.head.unwrap().cover, 0b1110);
+        assert_eq!(tail.full_lo, 0x8005d40000);
+        assert_eq!(tail.full_hi, 0x8005d58000);
+        assert_eq!(tail.tail.unwrap().cover, 0b0111);
+
+        // munmap(0x8005d5c000, 0x49000) ends at 0x8005da5000, the next segment.
+        let prefix = split_guest_range(0x8005d5c000, 0x49000).unwrap();
+        assert!(covers(prefix, 0x8005da4000));
+        assert!(!covers(prefix, 0x8005da5000));
+        assert!(!covers(prefix, 0x8005da6000));
+        assert_eq!(prefix.full_hi, 0x8005da4000);
+        assert!(prefix.head.is_none());
+
+        // MAP_FIXED mmap(0x8005da5000, 0xdd0) is only the next 4 KiB slice.
+        let fixed = split_guest_range(0x8005da5000, 0xdd0).unwrap();
+        assert!(fixed.is_partial());
+        assert_eq!(fixed.full_lo, 0);
+        assert!(covers(fixed, 0x8005da5000));
+        assert!(!covers(fixed, 0x8005da4000));
+        assert!(!covers(fixed, 0x8005da6000));
+        assert_eq!(file_offset_at(0x8005da5000, 0, 0x8005da5000), 0);
+    }
+
+    #[test]
+    fn guest4k_second_library_fixed_map_and_aligned_range() {
+        // Formal smoke: mmap(0x8005d4b000, 0x4e44) is a different library.
+        let mapped = split_guest_range(0x8005d4b000, 0x4e44).unwrap();
+        assert!(covers(mapped, 0x8005d4b000));
+        assert!(!covers(mapped, 0x8005d48000));
+        assert_eq!(mapped.full_lo, 0x8005d4c000);
+        assert_eq!(file_offset_at(0x8005d4b000, 0, 0x8005d4c000), 0x1000);
+        let aligned = split_guest_range(0x8005ce0000, 0x4000).unwrap();
+        assert!(!aligned.is_partial());
+        assert_eq!(aligned.full_lo, 0x8005ce0000);
+        assert_eq!(aligned.full_hi, 0x8005ce4000);
+        assert_eq!(split_guest_range(0x1001, 0x1000), Err(EINVAL));
+        assert_eq!(split_guest_range(0x8005da5000, 0), Err(EINVAL));
+        let other = split_guest_range(0x8005db2000, 0x29000).unwrap();
+        assert!(other.is_partial());
+        assert!(covers(other, 0x8005db2000));
+        assert!(!covers(other, 0x8005db1000));
     }
 }
