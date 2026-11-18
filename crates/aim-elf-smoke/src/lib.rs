@@ -65,6 +65,26 @@ pub fn count_rewrites(elf: &[u8]) -> Rewrites {
     rewrites
 }
 
+/// Write `bytes` at `path` and set mode `0755`.
+///
+/// `std::fs::write` creates `0666 & !umask` (`0644` with a normal umask).
+/// `linux-run` checks `X_OK` before the ELF header, so that mode is
+/// `EACCES` (13) and never reaches the loader. The non-ELF control has to
+/// be executable as well, or it fails the same check instead of `ENOEXEC`
+/// (8). `set_permissions` applies the mode after the umask.
+pub fn install(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// True when `text` is the loader's load-time line for this program.
 pub fn trace_matches(text: &str, rewrites: Rewrites) -> bool {
     text.contains(&format!(
@@ -93,8 +113,8 @@ fn link(code: &[u32]) -> Vec<u8> {
     put16(&mut elf, 52, 64); // e_ehsize
     put16(&mut elf, 54, 56); // e_phentsize
     put16(&mut elf, 56, 1); // e_phnum
-    // PT_LOAD at file offset 0, vaddr 0, so the headers are mapped and
-    // p_offset ≡ p_vaddr (mod 16 KiB). RX, not RWX.
+                            // PT_LOAD at file offset 0, vaddr 0, so the headers are mapped and
+                            // p_offset ≡ p_vaddr (mod 16 KiB). RX, not RWX.
     let ph = 64;
     put32(&mut elf, ph, 1); // PT_LOAD
     put32(&mut elf, ph + 4, 5); // PF_R | PF_X
@@ -175,7 +195,11 @@ fn encode_fix(kind: i64, off: i64) -> u32 {
         0x5400_0000 | ((off as u32 & 0x7_ffff) << 5) | (kind as u32)
     } else {
         let reg = (kind as u32) & 0x1f;
-        let base = if kind & 0x100 != 0 { 0xb500_0000 } else { 0xb400_0000 };
+        let base = if kind & 0x100 != 0 {
+            0xb500_0000
+        } else {
+            0xb400_0000
+        };
         base | ((off as u32 & 0x7_ffff) << 5) | reg
     }
 }
@@ -208,7 +232,15 @@ fn movn0(rd: u32) -> u32 {
     0x9280_0000 | rd
 }
 fn mov_reg(rd: u32, rm: u32) -> u32 {
+    // ORR (register) reads register 31 as XZR, never SP.
     0xaa00_03e0 | (rm << 16) | rd
+}
+
+/// `mov xd, sp`. The ARM ARM alias is `add xd, sp, #0`. `mov_reg` cannot
+/// encode it: the same register field 31 is XZR there, so `mov_reg(rd, SP)`
+/// is `mov xd, xzr`.
+fn mov_from_sp(rd: u32) -> u32 {
+    add_imm(rd, SP, 0)
 }
 fn cmp_imm(rn: u32, imm: u32) -> u32 {
     0xf100_001f | (imm << 10) | (rn << 5)
@@ -319,7 +351,11 @@ fn assemble() -> Vec<u32> {
     a.emit(mov_reg(16, 0));
 
     a.emit(sub_imm(SP, SP, 128));
-    a.emit(mov_reg(17, SP));
+    // Linux keeps every GPR except x0 across `svc #0` (the kernel restores
+    // pt_regs; `trampoline.S` does the same, and only scratches x16/x17/x30
+    // inside the stub). The length in x2 is still live after `write`. The
+    // buffer pointer has to be SP, not the XZR `mov_reg` would produce.
+    a.emit(mov_from_sp(17));
     store_bytes(&mut a, 17, PAGE_LINE.as_bytes());
     a.emit(movz(0, 1));
     a.emit(mov_reg(1, 17));
@@ -355,7 +391,7 @@ fn assemble() -> Vec<u32> {
     a.emit(cmp_reg(0, 2));
     a.cond("bad_write", 1);
 
-    a.emit(mov_reg(17, SP));
+    a.emit(mov_from_sp(17));
     store_bytes(&mut a, 17, TLS_LINE.as_bytes());
     a.emit(movz(0, 1));
     a.emit(mov_reg(1, 17));
@@ -437,5 +473,454 @@ mod tests {
         // pre-baked "test passed" string the runner can print on its own
         // without the guest storing them.
         assert!(!String::from_utf8_lossy(&elf).contains(PAGE_LINE));
+        assert_eq!(mov_from_sp(17), 0x9100_03f1);
+        assert_eq!(mov_reg(17, 31), 0xaa1f_03f1);
+        assert!(
+            elf.windows(4)
+                .filter(|w| w == &0x9100_03f1u32.to_le_bytes())
+                .count()
+                >= 2
+        );
+        assert!(!elf.windows(4).any(|w| w == &0xaa1f_03f1u32.to_le_bytes()));
+    }
+
+    #[test]
+    fn install_sets_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "aim-elf-smoke-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("bin/elf-smoke");
+        let (elf, _) = program();
+        install(&path, &elf).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "mode {mode:#o}");
+        install(&dir.join("bin/not-elf"), b"this is not an elf").unwrap();
+        let junk = std::fs::metadata(dir.join("bin/not-elf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(junk & 0o777, 0o755, "mode {junk:#o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Mac fault at file offset `0x160` was `str x20, [x17]` with x17
+    /// still 0. Under the Linux GPR contract (only x0 changes at `svc`),
+    /// that store is the first eight bytes of [`PAGE_LINE`] at the live
+    /// stack pointer, and the guest then exits 0.
+    #[test]
+    fn page_line_store_uses_the_stack_and_the_guest_exits_zero() {
+        let code = assemble();
+        let at = (0x160 - 0x80) / 4;
+        assert_eq!(
+            code[at],
+            str(20, 17, 0),
+            "insn at +0x160 is {:#x}",
+            code[at]
+        );
+        let (writes, store_at) = super::simulate(&code);
+        assert_eq!(store_at, 0x8004_8400_00 - 128);
+        assert_eq!(writes[0], PAGE_LINE.as_bytes());
+        assert_eq!(writes[1], b"81168\n");
+        assert_eq!(writes[2], TLS_LINE.as_bytes());
+    }
+}
+
+/// `svc` result in x0 only. Other GPRs, including the arguments and x8,
+/// stay as Linux's `arch/arm64` restore and `trampoline.S` leave them.
+#[cfg(test)]
+fn simulate(code: &[u32]) -> (Vec<Vec<u8>>, u64) {
+    use std::collections::HashMap;
+
+    let mut x = [0u64; 31];
+    let mut sp: u64 = 0x8004_8400_00;
+    let mut mem = HashMap::<u64, u8>::new();
+    let mut tp = 0u64;
+    let mut n = false;
+    let mut z = false;
+    let mut c = false;
+    let mut v = false;
+    let mut pc: i64 = 0;
+    let mut writes = Vec::new();
+    let mut page_store = None;
+    // argc, argv[0], argv NULL, empty env, AT_PAGESZ = 16384, AT_NULL.
+    for (i, word) in [1u64, 0x1, 0, 0, 6, 16384, 0, 0].into_iter().enumerate() {
+        store64(&mut mem, sp + i as u64 * 8, word);
+    }
+    for _ in 0..5000 {
+        let here = pc;
+        let w = code[here as usize];
+        pc = here + 1;
+        match decode(w) {
+            Op::AddImm { rd, rn, imm, sub } => {
+                let base = gsp(&x, sp, rn);
+                let value = if sub {
+                    base.wrapping_sub(imm)
+                } else {
+                    base.wrapping_add(imm)
+                };
+                ssp(&mut x, &mut sp, rd, value);
+            }
+            Op::AddReg { rd, rn, rm } => {
+                x[rd as usize] = x[rn as usize].wrapping_add(xzr(&x, rm));
+            }
+            Op::Ldr { rt, rn, off } => {
+                let addr = gsp(&x, sp, rn).wrapping_add(off);
+                ssp(&mut x, &mut sp, rt, load64(&mem, addr));
+            }
+            Op::Str { rt, rn, off } => {
+                let addr = gsp(&x, sp, rn).wrapping_add(off);
+                let value = xzr(&x, rt);
+                if value == 0x6b6f_6d73_2d66_6c65 {
+                    assert_eq!(page_store, None);
+                    assert_ne!(addr, 0, "page line stored through a null base");
+                    page_store = Some(addr);
+                }
+                store64(&mut mem, addr, value);
+            }
+            Op::Strb { rt, rn } => {
+                let addr = gsp(&x, sp, rn);
+                assert_ne!(addr, 0);
+                mem.insert(addr, x[rt as usize] as u8);
+            }
+            Op::MovZ { rd, imm } => x[rd as usize] = imm,
+            Op::MovK { rd, imm, shift } => {
+                let clear = !(0xffffu64 << shift);
+                x[rd as usize] = (x[rd as usize] & clear) | (imm << shift);
+            }
+            Op::MovN { rd, imm } => x[rd as usize] = !imm,
+            Op::Orr { rd, rm } => x[rd as usize] = xzr(&x, rm),
+            Op::CmpImm { rn, imm } => flags(gsp(&x, sp, rn), imm, &mut n, &mut z, &mut c, &mut v),
+            Op::CmpReg { rn, rm } => {
+                flags(xzr(&x, rn), xzr(&x, rm), &mut n, &mut z, &mut c, &mut v)
+            }
+            Op::Udiv { rd, rn, rm } => {
+                let d = x[rm as usize];
+                assert_ne!(d, 0);
+                x[rd as usize] = x[rn as usize] / d;
+            }
+            Op::Msub { rd, rn, rm, ra } => {
+                x[rd as usize] =
+                    x[ra as usize].wrapping_sub(x[rn as usize].wrapping_mul(x[rm as usize]));
+            }
+            Op::Svc => {
+                let kept = x;
+                match x[8] {
+                    222 => {
+                        assert_eq!(
+                            (x[1], x[2], x[3], x[4], x[5]),
+                            (16384, 3, 0x22, u64::MAX, 0)
+                        );
+                        x[0] = 0x8004_84c0_00;
+                    }
+                    215 => x[0] = 0,
+                    172 => x[0] = 81168,
+                    64 => {
+                        let ptr = x[1];
+                        let len = x[2] as usize;
+                        assert_ne!(ptr, 0);
+                        let bytes = (0..len).map(|i| mem[&(ptr + i as u64)]).collect();
+                        writes.push(bytes);
+                        x[0] = len as u64;
+                    }
+                    94 => {
+                        assert_eq!(x[0], 0);
+                        assert_eq!(writes.len(), 3, "{writes:?}");
+                        return (writes, page_store.expect("page line was not stored"));
+                    }
+                    other => panic!("unexpected syscall {other} at {here}"),
+                }
+                assert_eq!(&x[1..], &kept[1..], "syscall clobbered a GPR other than x0");
+            }
+            Op::MsrTp { rn } => tp = xzr(&x, rn),
+            Op::MrsTp { rt } => x[rt as usize] = tp,
+            Op::B { off } => pc = here + off,
+            Op::BCond { off, cond } => {
+                if takes(cond, n, z, c, v) {
+                    pc = here + off;
+                }
+            }
+            Op::Cb { off, rt, nonzero } => {
+                let zero = xzr(&x, rt) == 0;
+                if zero != nonzero {
+                    pc = here + off;
+                }
+            }
+        }
+    }
+    panic!("exit_group was not reached");
+}
+
+#[cfg(test)]
+enum Op {
+    AddImm {
+        rd: u32,
+        rn: u32,
+        imm: u64,
+        sub: bool,
+    },
+    AddReg {
+        rd: u32,
+        rn: u32,
+        rm: u32,
+    },
+    Ldr {
+        rt: u32,
+        rn: u32,
+        off: u64,
+    },
+    Str {
+        rt: u32,
+        rn: u32,
+        off: u64,
+    },
+    Strb {
+        rt: u32,
+        rn: u32,
+    },
+    MovZ {
+        rd: u32,
+        imm: u64,
+    },
+    MovK {
+        rd: u32,
+        imm: u64,
+        shift: u32,
+    },
+    MovN {
+        rd: u32,
+        imm: u64,
+    },
+    Orr {
+        rd: u32,
+        rm: u32,
+    },
+    CmpImm {
+        rn: u32,
+        imm: u64,
+    },
+    CmpReg {
+        rn: u32,
+        rm: u32,
+    },
+    Udiv {
+        rd: u32,
+        rn: u32,
+        rm: u32,
+    },
+    Msub {
+        rd: u32,
+        rn: u32,
+        rm: u32,
+        ra: u32,
+    },
+    Svc,
+    MsrTp {
+        rn: u32,
+    },
+    MrsTp {
+        rt: u32,
+    },
+    B {
+        off: i64,
+    },
+    BCond {
+        off: i64,
+        cond: u32,
+    },
+    Cb {
+        off: i64,
+        rt: u32,
+        nonzero: bool,
+    },
+}
+
+#[cfg(test)]
+fn decode(w: u32) -> Op {
+    let rd = w & 0x1f;
+    let rn = (w >> 5) & 0x1f;
+    let rm = (w >> 16) & 0x1f;
+    let imm12 = ((w >> 10) & 0xfff) as u64;
+    let imm = if w & (1 << 22) == 0 {
+        imm12
+    } else {
+        imm12 << 12
+    };
+    if w & 0xff00_0000 == 0x9100_0000 {
+        return Op::AddImm {
+            rd,
+            rn,
+            imm,
+            sub: false,
+        };
+    }
+    if w & 0xff00_0000 == 0xd100_0000 {
+        return Op::AddImm {
+            rd,
+            rn,
+            imm,
+            sub: true,
+        };
+    }
+    if w & 0xffe0_fc00 == 0x8b00_0000 {
+        return Op::AddReg { rd, rn, rm };
+    }
+    if w & 0xffc0_0000 == 0xf940_0000 {
+        return Op::Ldr {
+            rt: rd,
+            rn,
+            off: imm12 * 8,
+        };
+    }
+    if w & 0xffc0_0000 == 0xf900_0000 {
+        return Op::Str {
+            rt: rd,
+            rn,
+            off: imm12 * 8,
+        };
+    }
+    if w & 0xffc0_0000 == 0x3900_0000 {
+        return Op::Strb { rt: rd, rn };
+    }
+    if w & 0xff80_0000 == 0xd280_0000 {
+        return Op::MovZ { rd, imm: imm16(w) };
+    }
+    if w & 0xff80_0000 == 0xf280_0000 {
+        return Op::MovK {
+            rd,
+            imm: ((w >> 5) & 0xffff) as u64,
+            shift: ((w >> 21) & 3) * 16,
+        };
+    }
+    if w & 0xff80_0000 == 0x9280_0000 {
+        return Op::MovN { rd, imm: imm16(w) };
+    }
+    if w & 0xffe0_fc00 == 0xaa00_0000 && rn == 31 {
+        return Op::Orr { rd, rm };
+    }
+    if w & 0xff00_001f == 0xf100_001f && rd == 31 {
+        return Op::CmpImm { rn, imm };
+    }
+    if w & 0xffe0_fc1f == 0xeb00_001f && rd == 31 {
+        return Op::CmpReg { rn, rm };
+    }
+    if w & 0xffe0_fc00 == 0x9ac0_0800 {
+        return Op::Udiv { rd, rn, rm };
+    }
+    if w & 0xffe0_8000 == 0x9b00_8000 {
+        return Op::Msub {
+            rd,
+            rn,
+            rm,
+            ra: (w >> 10) & 0x1f,
+        };
+    }
+    if w == SVC0 {
+        return Op::Svc;
+    }
+    if w & !0x1f == MSR_TPIDR {
+        return Op::MsrTp { rn: rd };
+    }
+    if w & !0x1f == MRS_TPIDR {
+        return Op::MrsTp { rt: rd };
+    }
+    if w & 0xfc00_0000 == 0x1400_0000 {
+        return Op::B {
+            off: sign(w & 0x03ff_ffff, 26),
+        };
+    }
+    if w & 0xff00_0010 == 0x5400_0000 {
+        return Op::BCond {
+            off: sign((w >> 5) & 0x7_ffff, 19),
+            cond: rd,
+        };
+    }
+    // 64-bit CBZ is 0xb4...... and CBNZ is 0xb5......; bit 24 selects CBNZ.
+    if w & 0xfe00_0000 == 0xb400_0000 {
+        return Op::Cb {
+            off: sign((w >> 5) & 0x7_ffff, 19),
+            rt: rd,
+            nonzero: w & 0x0100_0000 != 0,
+        };
+    }
+    panic!("unknown instruction {w:#x}");
+}
+
+#[cfg(test)]
+fn imm16(w: u32) -> u64 {
+    (((w >> 5) & 0xffff) as u64) << (((w >> 21) & 3) * 16)
+}
+
+#[cfg(test)]
+fn sign(value: u32, bits: u32) -> i64 {
+    let shift = 32 - bits;
+    ((value << shift) as i32 >> shift) as i64
+}
+
+#[cfg(test)]
+fn xzr(x: &[u64; 31], r: u32) -> u64 {
+    if r == 31 {
+        0
+    } else {
+        x[r as usize]
+    }
+}
+
+#[cfg(test)]
+fn gsp(x: &[u64; 31], sp: u64, r: u32) -> u64 {
+    if r == 31 {
+        sp
+    } else {
+        x[r as usize]
+    }
+}
+
+#[cfg(test)]
+fn ssp(x: &mut [u64; 31], sp: &mut u64, r: u32, value: u64) {
+    if r == 31 {
+        *sp = value;
+    } else {
+        x[r as usize] = value;
+    }
+}
+
+#[cfg(test)]
+fn store64(mem: &mut std::collections::HashMap<u64, u8>, addr: u64, value: u64) {
+    for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+        mem.insert(addr + i as u64, byte);
+    }
+}
+
+#[cfg(test)]
+fn load64(mem: &std::collections::HashMap<u64, u8>, addr: u64) -> u64 {
+    let mut buf = [0u8; 8];
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = mem.get(&(addr + i as u64)).copied().unwrap_or(0);
+    }
+    u64::from_le_bytes(buf)
+}
+
+#[cfg(test)]
+fn flags(a: u64, b: u64, n: &mut bool, z: &mut bool, c: &mut bool, v: &mut bool) {
+    let (result, borrow) = a.overflowing_sub(b);
+    *n = (result as i64) < 0;
+    *z = result == 0;
+    *c = !borrow;
+    let (sa, sb, sr) = ((a as i64) < 0, (b as i64) < 0, (result as i64) < 0);
+    *v = (sa != sb) && (sa != sr);
+}
+
+#[cfg(test)]
+fn takes(cond: u32, n: bool, z: bool, _c: bool, v: bool) -> bool {
+    match cond {
+        0 => z,
+        1 => !z,
+        13 => z || n != v,
+        other => panic!("unhandled condition {other}"),
     }
 }

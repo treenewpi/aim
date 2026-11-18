@@ -63,20 +63,32 @@ cargo run --locked -p aim-elf-smoke --release --bin elf-smoke -- --linux-run tar
 ```
 
 `--self-check` exits 0 without running the ELF. Pass `--linux-run` the
-absolute path of the release `linux-run` just built. A standalone
-`linux-run` is its own POSIX lock holder when `aim-lock-holder` is not
-beside it; the pid-namespace watcher still starts and must write its
-ready byte. Stderr that contains `pid namespace watcher` or
-`stage=watcher-startup` means the guest ELF was not loaded. A missing
-path or a non-ELF file is not a negative control until that line is
-absent.
+absolute path of the release `linux-run` just built. Do not `chmod` the
+fixture. The runner writes it, and the non-ELF control, as mode `0755`.
+`0644` stops in `cannot execute (errno 13)` (`EACCES`) before the ELF
+header is read, which is not a loader result. A standalone `linux-run`
+is its own POSIX lock holder when `aim-lock-holder` is not beside it;
+the pid-namespace watcher still starts and must write its ready byte.
+Stderr that contains `pid namespace watcher` or `stage=watcher-startup`
+means the guest ELF was not loaded. A missing path or a non-ELF file is
+not a negative control until that line is absent.
+
+The syscall bridge follows the Linux AArch64 rule: a normal `svc` returns
+in x0 and preserves the other general registers (`trampoline.S` saves
+them on the full path, and the per-site stub restores the x16/x17/x30 it
+uses as scratch). A fault at `/bin/elf-smoke+0x160` with `x17 == 0` and
+`x20` holding the bytes of `elf-smok` was the fixture encoding `mov x17,
+sp` as `orr x17, xzr, xzr` (register 31 is XZR in `ORR`, and SP only in
+`ADD`/`SUB` immediate). That run had already completed mmap, munmap and
+getpid, with guest `TPIDR_EL0` set. It is not a pass.
 
 The last command exits 0 only when all of these are true:
 
 - stderr does not contain `pid namespace watcher` or `stage=watcher-startup`
-- a non-ELF file and a missing guest path make `linux-run` fail, and do
-  not print `elf-smoke page=16384`
-- the guest exits 0
+- the non-ELF file is rejected with `cannot execute (errno 8)` and the
+  missing path with `cannot execute (errno 2)`, and neither prints
+  `elf-smoke page=16384`
+- the guest exits 0, with no fatal signal
 - stdout contains `elf-smoke page=16384` and `tls=ok mmap=ok`
 - the digit line is the `linux-run` process id (`getpid`)
 - stderr contains `load-time rewrites:` with this file's `svc`, `mrs` and

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aim_elf_smoke::{PAGE_LINE, TLS_LINE, program, trace_matches};
+use aim_elf_smoke::{install, program, trace_matches, PAGE_LINE, TLS_LINE};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -26,9 +26,7 @@ fn main() {
                 })));
             }
             "--help" | "-h" => {
-                println!(
-                    "usage: elf-smoke --self-check\n       elf-smoke --linux-run PATH"
-                );
+                println!("usage: elf-smoke --self-check\n       elf-smoke --linux-run PATH");
                 return;
             }
             other => fail(2, &format!("unknown argument {other}")),
@@ -49,7 +47,10 @@ fn main() {
         return;
     }
     let Some(linux_run) = linux_run else {
-        fail(2, "pass --linux-run PATH, or --self-check to audit the fixture only");
+        fail(
+            2,
+            "pass --linux-run PATH, or --self-check to audit the fixture only",
+        );
     };
     if !linux_run.is_file() {
         fail(
@@ -67,8 +68,8 @@ fn main() {
         fail(2, &format!("cannot create {}: {error}", root.display()));
     });
     let guest = root.join("bin/elf-smoke");
-    std::fs::write(&guest, &elf).unwrap_or_else(|error| {
-        fail(2, &format!("cannot write {}: {error}", guest.display()));
+    install(&guest, &elf).unwrap_or_else(|error| {
+        fail(2, &format!("cannot install {}: {error}", guest.display()));
     });
 
     reject_non_elf(&linux_run, &root);
@@ -117,7 +118,10 @@ fn main() {
         );
     }
     println!("{}", output.stdout.trim_end());
-    println!("elf-smoke: linux-run pid {} matched getpid; trace has the rewrite counts", output.pid);
+    println!(
+        "elf-smoke: linux-run pid {} matched getpid; trace has the rewrite counts",
+        output.pid
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -163,20 +167,30 @@ fn run(linux_run: &Path, root: &Path, guest_args: &[&str]) -> Output {
 
 fn reject_non_elf(linux_run: &Path, root: &Path) {
     let junk = root.join("bin/not-elf");
-    std::fs::write(&junk, b"this is not an elf").unwrap();
+    // Executable, so the failure is ENOEXEC from the ELF check. Mode 0644
+    // stops at EACCES before that check and does not cover it.
+    install(&junk, b"this is not an elf").unwrap_or_else(|error| {
+        fail(2, &format!("cannot install {}: {error}", junk.display()));
+    });
     let output = run(linux_run, root, &["/bin/not-elf"]);
-    if output.status.success() || output.stdout.contains(PAGE_LINE) {
+    expect_exec_errno(&output, 8, "non-ELF");
+    let missing = run(linux_run, root, &["/bin/does-not-exist"]);
+    expect_exec_errno(&missing, 2, "missing path");
+}
+
+fn expect_exec_errno(output: &Output, errno: i32, what: &str) {
+    let marker = format!("cannot execute (errno {errno})");
+    if output.status.success()
+        || output.stdout.contains(PAGE_LINE)
+        || !output.stderr.contains(&marker)
+    {
         fail(
             1,
             &format!(
-                "non-ELF guest was treated as success\nstdout:\n{}\nstderr:\n{}",
+                "{what} was not rejected with {marker}\nstdout:\n{}\nstderr:\n{}",
                 output.stdout, output.stderr
             ),
         );
-    }
-    let missing = run(linux_run, root, &["/bin/does-not-exist"]);
-    if missing.status.success() || missing.stdout.contains(PAGE_LINE) {
-        fail(1, "missing guest path was treated as success");
     }
 }
 
