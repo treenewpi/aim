@@ -49,6 +49,25 @@ exits 101.
 suite. It is still one process per test binary. It is not cross-process
 IPC and not an Android boot.
 
+`aim-binder-proc` is the independent-process check. It starts a daemon,
+a context-manager process and a caller as three host pids, repeats that
+three times, passes one pipe fd, refuses a missing service name, and
+expects `BR_DEAD_REPLY` when no context manager is registered. One
+in-process `transport` pass is not this check. It is not servicemanager,
+not a system service, and not a full binder.
+
+```sh
+cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+./target/release/aim-binder-proc
+./target/release/aim-binder-proc
+```
+
+Run it twice. Every line `round N` must show three different pids, the
+caller's pid as `sender_pid`, `fd=hello` and `reply=0x42`. Then
+`absent refused`, `no-context-manager BR_DEAD_REPLY`, and
+`aim-binder-proc ok`. An ioctl still blocked after 15s exits 101. A
+fatal signal or a leftover process is not a pass.
+
 ## Synthetic ELF
 
 Stage 1 only: a PIE with no interpreter, built from the encodings in
