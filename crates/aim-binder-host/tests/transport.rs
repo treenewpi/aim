@@ -103,6 +103,9 @@ fn transaction_with_fd_readiness_reply_and_release() {
         // As IPCThreadState::waitForResponse: read until the reply.
         let mut read = write_read(&caller, caller_tid, &write, true).unwrap();
         let reply = loop {
+            if returns(&read).iter().any(|(c, _)| *c == BR_FAILED_REPLY) {
+                panic!("sender got BR_FAILED_REPLY instead of the file transaction");
+            }
             if let Some((_, tr)) = returns(&read).into_iter().find(|(c, _)| *c == BR_REPLY) {
                 break tr.unwrap();
             }
@@ -306,6 +309,10 @@ fn a_transaction_with_many_fds_reaches_the_reader() {
     let mut write = Vec::new();
     cmd(&mut write, BC_TRANSACTION, &tr.encode());
     let read = write_read(&caller, caller_tid, &write, true).unwrap();
+    assert!(
+        !returns(&read).iter().any(|(c, _)| *c == BR_FAILED_REPLY),
+        "one-way file transaction failed before the reader installed the fds"
+    );
     assert!(
         returns(&read)
             .iter()
@@ -623,4 +630,117 @@ fn typed_fd_import_failure_rolls_back_delivery_before_copyout_and_unblocks_sende
     write_read(&mgr, 100, &reply, false).unwrap();
     calling.join().unwrap();
     unsafe { libc::close(mgr.fd) };
+}
+
+/// One file through one server. Several of these run at once in this
+/// process: that is the `cargo test` default for this file, which is where
+/// the fd tests hung and the typed-import ioctl returned success.
+fn one_fd_round_trip(id: u32) {
+    let name = format!(
+        "dev.aim.test.binder-host.concurrent.{}.{}",
+        std::process::id(),
+        id
+    );
+    let _server = Server::start(&name).unwrap();
+    let client = Client::connect(&name).unwrap();
+    let mgr = open(&client, 1000, "u:r:servicemanager:s0");
+    let mut fbo = FlatBinderObject {
+        kind: BINDER_TYPE_BINDER,
+        flags: FLAT_BINDER_FLAG_ACCEPTS_FDS,
+        binder: 0x1234,
+        cookie: 0x5678,
+    }
+    .encode();
+    mgr.ioctl(
+        100,
+        BINDER_SET_CONTEXT_MGR_EXT,
+        fbo.as_mut_ptr() as u64,
+        &mut Own,
+    )
+    .unwrap();
+    let mut enter = Vec::new();
+    cmd(&mut enter, BC_ENTER_LOOPER, &[]);
+    write_read(&mgr, 100, &enter, false).unwrap();
+    let caller = open(&client, 10_001, "u:r:shell:s0");
+    let mut pipe = [0i32; 2];
+    unsafe {
+        assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+        assert_eq!(libc::write(pipe[1], [id as u8].as_ptr().cast(), 1), 1);
+        libc::close(pipe[1]);
+    }
+    let caller_tid = 200;
+    let call = std::thread::spawn(move || {
+        let mut data = [0u8; 24];
+        data[0..4].copy_from_slice(&BINDER_TYPE_FD.to_le_bytes());
+        data[8..12].copy_from_slice(&(pipe[0] as u32).to_le_bytes());
+        let offsets = 0u64.to_le_bytes();
+        let tr = TransactionData {
+            code: 9,
+            flags: TF_ACCEPT_FDS,
+            data_size: data.len() as u64,
+            offsets_size: 8,
+            buffer: data.as_ptr() as u64,
+            offsets: offsets.as_ptr() as u64,
+            ..Default::default()
+        };
+        let mut write = Vec::new();
+        cmd(&mut write, BC_TRANSACTION, &tr.encode());
+        let mut read = write_read(&caller, caller_tid, &write, true).unwrap();
+        loop {
+            if returns(&read).iter().any(|(c, _)| *c == BR_FAILED_REPLY) {
+                panic!("concurrent sender {id} got BR_FAILED_REPLY");
+            }
+            if let Some((_, Some(reply))) = returns(&read).into_iter().find(|(c, _)| *c == BR_REPLY)
+            {
+                let mut free = Vec::new();
+                cmd(&mut free, BC_FREE_BUFFER, &reply.buffer.to_le_bytes());
+                write_read(&caller, caller_tid, &free, false).unwrap();
+                break;
+            }
+            read = write_read(&caller, caller_tid, &[], true).unwrap();
+        }
+        unsafe { libc::close(caller.fd) };
+        unsafe { libc::close(pipe[0]) };
+    });
+    let read = write_read(&mgr, 100, &[], true).unwrap();
+    let tr = returns(&read)
+        .into_iter()
+        .find_map(|(c, tr)| (c == BR_TRANSACTION).then(|| tr.unwrap()))
+        .unwrap_or_else(|| panic!("concurrent reader {id} got no transaction: {read:?}"));
+    unsafe {
+        let fd = ((tr.buffer + 8) as *const u32).read() as i32;
+        let mut got = [0u8; 1];
+        assert_eq!(libc::read(fd, got.as_mut_ptr().cast(), 1), 1, "reader {id}");
+        assert_eq!(got[0], id as u8);
+        libc::close(fd);
+    }
+    let mut reply = Vec::new();
+    cmd(&mut reply, BC_FREE_BUFFER, &tr.buffer.to_le_bytes());
+    cmd(&mut reply, BC_REPLY, &TransactionData::default().encode());
+    write_read(&mgr, 100, &reply, false).unwrap();
+    call.join().unwrap();
+    unsafe { libc::close(mgr.fd) };
+}
+
+#[test]
+fn concurrent_servers_pass_fds_without_crossing_descriptors() {
+    let churn = std::thread::spawn(|| {
+        for _ in 0..2000 {
+            let mut pipe = [0i32; 2];
+            unsafe {
+                if libc::pipe(pipe.as_mut_ptr()) == 0 {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+            }
+        }
+    });
+    let mut threads = Vec::new();
+    for i in 0..4u32 {
+        threads.push(std::thread::spawn(move || one_fd_round_trip(i)));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    churn.join().unwrap();
 }

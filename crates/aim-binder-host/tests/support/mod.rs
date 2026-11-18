@@ -43,6 +43,11 @@ pub fn open(client: &Client, euid: u32, context: &str) -> BinderFile {
 }
 
 /// One BINDER_WRITE_READ; returns the read bytes.
+///
+/// A read that never returns used to wedge the whole `transport` binary
+/// under `cargo test`'s default threads. The limit fails that ioctl instead
+/// of waiting for an external SIGTERM. It is not a pass: the process exits
+/// nonzero while the blocked call is still outstanding.
 pub fn write_read(file: &BinderFile, tid: i32, write: &[u8], read: bool) -> Result<Vec<u8>, Errno> {
     let mut buf = vec![0u8; if read { 512 } else { 0 }];
     let bwr = WriteRead {
@@ -53,7 +58,17 @@ pub fn write_read(file: &BinderFile, tid: i32, write: &[u8], read: bool) -> Resu
         ..Default::default()
     };
     let mut arg = bwr.encode();
-    file.ioctl(tid, BINDER_WRITE_READ, arg.as_mut_ptr() as u64, &mut Own)?;
+    let (send, recv) = std::sync::mpsc::channel();
+    let watch = std::thread::spawn(move || {
+        if recv.recv_timeout(std::time::Duration::from_secs(15)).is_err() {
+            eprintln!("binder transport ioctl still blocked after 15s");
+            std::process::exit(101);
+        }
+    });
+    let result = file.ioctl(tid, BINDER_WRITE_READ, arg.as_mut_ptr() as u64, &mut Own);
+    let _ = send.send(());
+    let _ = watch.join();
+    result?;
     let done = WriteRead::decode(&arg);
     assert_eq!(done.write_consumed, write.len() as u64);
     buf.truncate(done.read_consumed as usize);

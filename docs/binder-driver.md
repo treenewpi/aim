@@ -341,7 +341,13 @@ Across processes:
   data, an fd and a security context, readiness and its drain, the reply,
   and release on the last close, seen as `BR_DEAD_BINDER`.
   `tests/latency.rs` times a small call and reply through the daemon and
-  the caller's CPU time per call.
+  the caller's CPU time per call. The file's tests share the process fd
+  table. A received file is installed with `dup2` only while that number
+  still holds the caller's placeholder, and a read that cannot place the
+  transaction's files returns `EMFILE` instead of success. That is the
+  in-process client, not a second process and not Android. A blocking
+  ioctl in this file exits 101 after 15s rather than waiting forever.
+  Commands for a Mac retest are in [mac-min-smoke.md](mac-min-smoke.md).
 - **`cargo test -p aim-linux-abi --release --test servicemanager --
   --nocapture`** runs the pinned image and is skipped when it is absent. The
   test plays the minimum of init: property areas and the property service

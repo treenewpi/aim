@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use aim_binder_driver::uapi::*;
 use aim_binder_driver::{Device, Errno, MAX_MAPPING, errno};
@@ -85,6 +86,21 @@ const EIO: Errno = 5;
 
 /// Placeholder fds kept per thread for files a read may deliver.
 const RESERVED_FDS: usize = 8;
+
+/// One host descriptor table for every binder client in the process.
+/// Cargo runs the transport tests as threads of one process, and each
+/// thread installs received files with `dup2` onto numbers it reserved.
+/// The check that a number still holds this thread's placeholder and the
+/// `dup2` that replaces it have to be atomic against every other client's
+/// close and allocation: otherwise the number is reused (a binder socket,
+/// a pipe) and `dup2` replaces that file. One client in production has the
+/// same table; the lock is the table, not a serialization of transactions.
+static DESCRIPTORS: Mutex<()> = Mutex::new(());
+
+fn with_descriptors<T>(body: impl FnOnce() -> T) -> T {
+    let _table = DESCRIPTORS.lock().unwrap_or_else(|poison| poison.into_inner());
+    body()
+}
 /// Placeholders are dup'ed at or above this number, away from the low fds
 /// programs reuse.
 const RESERVED_FD_BASE: i32 = 64;
@@ -138,39 +154,45 @@ impl Placeholders {
     /// a file over it (dup2) closes a socket, where closing a vnode such as
     /// /dev/null costs microseconds of host kernel time. New ones are
     /// duplicates of one already held.
-    fn refill(&mut self, count: usize) {
-        while self.fds.len() < count {
-            // A number the guest closed, or reused for a file of its own,
-            // holds nothing of ours.
-            if let Some(&held) = self.fds.first()
-                && !self.holds(held)
-            {
-                self.fds.remove(0);
-                continue;
-            }
-            // SAFETY: duplicating a placeholder, or a new socket, upward.
-            let fd = unsafe {
-                match self.fds.first() {
-                    Some(&held) => libc::fcntl(held, libc::F_DUPFD_CLOEXEC, RESERVED_FD_BASE),
-                    None => {
-                        let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                        if s < 0 {
-                            return;
-                        }
-                        let fd = libc::fcntl(s, libc::F_DUPFD_CLOEXEC, RESERVED_FD_BASE);
-                        libc::close(s);
-                        fd
-                    }
-                }
-            };
-            if fd < 0 {
-                return;
-            }
+    ///
+    /// Returns how many placeholders still belong to this pool. A short
+    /// count is EMFILE, not a silent empty pool: the caller must not send
+    /// a read that claims it can install files it has no slot for.
+    fn refill(&mut self, count: usize) -> usize {
+        with_descriptors(|| {
+            let socket = self.socket;
+            self.fds
+                .retain(|fd| socket.is_some() && identity(*fd) == socket);
             if self.fds.is_empty() {
-                self.socket = identity(fd);
+                self.socket = None;
             }
-            self.fds.push(fd);
-        }
+            while self.fds.len() < count {
+                // SAFETY: duplicating a placeholder, or a new socket, upward.
+                let fd = unsafe {
+                    match self.fds.first() {
+                        Some(&held) => libc::fcntl(held, libc::F_DUPFD_CLOEXEC, RESERVED_FD_BASE),
+                        None => {
+                            let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                            if s < 0 {
+                                -1
+                            } else {
+                                let fd = libc::fcntl(s, libc::F_DUPFD_CLOEXEC, RESERVED_FD_BASE);
+                                libc::close(s);
+                                fd
+                            }
+                        }
+                    }
+                };
+                if fd < 0 {
+                    break;
+                }
+                if self.fds.is_empty() {
+                    self.socket = identity(fd);
+                }
+                self.fds.push(fd);
+            }
+            self.fds.len()
+        })
     }
 
     /// `fd` became a delivered file.
@@ -180,12 +202,16 @@ impl Placeholders {
 
     /// Close the placeholders that still hold the pool's socket.
     fn close(&mut self) {
-        for fd in self.fds.drain(..) {
-            if identity(fd) == self.socket {
-                // SAFETY: our placeholder, checked by its identity.
-                unsafe { libc::close(fd) };
+        with_descriptors(|| {
+            let socket = self.socket;
+            for fd in self.fds.drain(..) {
+                if socket.is_some() && identity(fd) == socket {
+                    // SAFETY: our placeholder, checked by its identity.
+                    unsafe { libc::close(fd) };
+                }
             }
-        }
+            self.socket = None;
+        });
     }
 }
 
@@ -773,8 +799,10 @@ impl BinderFile {
         let (reply, writers) = with_thread(
             |t| -> Result<(IoctlReply, Vec<Option<crate::regular_file::WriterPort>>), Errno> {
                 if reads {
-                    t.reserved.refill(reserve);
-                    io.grow = t.reserved.fds.len() >= reserve;
+                    let filled = t.reserved.refill(reserve);
+                    // A short pool must not claim it can grow: the server
+                    // would keep the transaction queued and ask again.
+                    io.grow = filled >= reserve;
                 }
                 io.reserved = t.reserved.fds.iter().map(|fd| *fd as u32).collect();
                 let port = self.thread_port(t, tid)?;
@@ -809,25 +837,38 @@ impl BinderFile {
                 }
                 let mut ports = r.ports.into_iter();
                 let mut writers = Vec::with_capacity(reply.installs.len());
+                // Numbers where dup2 has published the received file. A
+                // failed identity check must not close the number: it is
+                // another client's descriptor.
+                let mut replaced = Vec::new();
                 for (index, fd) in reply.installs.iter().enumerate() {
                     let p = ports.next().unwrap();
-                    let result = mem.install_fileport(*fd as i32, p);
+                    // The number was reserved as a placeholder. If it no
+                    // longer is, another client in this process owns it now;
+                    // dup2 would replace their file.
+                    let result = with_descriptors(|| {
+                        if !t.reserved.holds(*fd as i32) {
+                            return Err(errno::EBADF);
+                        }
+                        mem.install_fileport(*fd as i32, p)
+                    });
                     mach::release_send(p);
                     if let Err(error) = result {
                         for port in ports {
                             mach::release_send(port);
                         }
-                        for fd in reply.installs.iter().chain(&reply.closes) {
-                            if let Err(secondary) = mem.close_file(*fd as i32) {
+                        for fd in replaced.iter().chain(&reply.closes) {
+                            if let Err(secondary) = mem.close_file(*fd) {
                                 eprintln!(
                                     "Binder import rollback close fd={fd}: errno {secondary}"
                                 );
                             }
-                            t.reserved.take(*fd as i32);
+                            t.reserved.take(*fd);
                         }
                         reject_deliveries(t, port, &reply)?;
                         return Err(error);
                     }
+                    replaced.push(*fd as i32);
                     writers.push(
                         if reply.regular[index]
                             .as_ref()
@@ -888,7 +929,11 @@ impl BinderFile {
         }
         if reply.status == 0 && reply.want_fds > 0 {
             // The read stopped before a transaction with more files than we
-            // had placeholders for; the updated arg continues it.
+            // had placeholders for; the updated arg continues it. Asking
+            // again for no more slots than this attempt would loop.
+            if reply.want_fds as usize <= reserve {
+                return Err(errno::EMFILE);
+            }
             return self.ioctl_reserving(tid, cmd, arg, mem, reply.want_fds as usize);
         }
         match reply.status {

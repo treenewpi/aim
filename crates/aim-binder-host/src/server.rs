@@ -1092,7 +1092,15 @@ impl Call {
 
     fn finish(self, result: Result<(), Errno>) -> Answer {
         let mut reply = self.guest.reply;
-        reply.status = result.err().unwrap_or(0);
+        // A file install that failed inside the driver still completes the
+        // ioctl as Ok (the sender is told with BR_FAILED_REPLY). Keep that
+        // errno: reporting success lets the reader proceed as if the
+        // transaction had no files.
+        reply.status = match result {
+            Err(error) => error,
+            Ok(()) if reply.status != 0 => reply.status,
+            Ok(()) => 0,
+        };
         reply.arg = self.arg;
         reply.drain = self.file.refresh(&self.driver);
         let exit = reply.status == 0 && self.cmd == aim_binder_driver::uapi::BINDER_THREAD_EXIT;
@@ -1204,13 +1212,17 @@ impl GuestProcess for Gathered {
 
     fn install_file(&mut self, file: File) -> Result<u32, Errno> {
         if !file.is::<FilePort>() || self.reserved.is_empty() {
-            // EMFILE: the reader has no fd for it.
-            return Err(24);
+            // EMFILE: the reader has no fd for it. Record it on the ioctl:
+            // the sender still gets BR_FAILED_REPLY, and the reader must
+            // not see a successful empty read.
+            self.reply.status = errno::EMFILE;
+            return Err(errno::EMFILE);
         }
         let next = file.downcast_ref::<FilePort>().unwrap();
         if (next.1 == crate::regular_file::CLASS) != next.2.is_some()
             || (next.1 == crate::socket_scm::CLASS) != next.3.is_some()
         {
+            self.reply.status = wire::EPROTO;
             return Err(wire::EPROTO);
         }
         let ports: usize = self
@@ -1234,7 +1246,8 @@ impl GuestProcess for Gathered {
                 .is_some_and(|regular| regular.writer.is_some()) as usize
             > mach::MAX_PORTS
         {
-            return Err(24);
+            self.reply.status = errno::EMFILE;
+            return Err(errno::EMFILE);
         }
         let fd = self.reserved.remove(0);
         self.reply.installs.push(fd);
@@ -1261,11 +1274,19 @@ impl GuestProcess for Gathered {
 
     fn can_install(&mut self, count: usize) -> bool {
         // The installed files ride back as the reply's ports.
-        if count <= self.reserved.len() || !self.grow || count > mach::MAX_PORTS {
+        if count <= self.reserved.len() {
             return true;
         }
-        self.reply.want_fds = count as u32;
-        false
+        // Prepared fewer slots than the transaction needs, and the client
+        // can read again with more placeholders. `!grow` used to fall
+        // through to "yes", so a short pool installed nothing, failed the
+        // sender, and still returned success to the reader.
+        if self.grow && count <= mach::MAX_PORTS {
+            self.reply.want_fds = count as u32;
+            return false;
+        }
+        self.reply.status = errno::EMFILE;
+        true
     }
 
     fn close_fd(&mut self, fd: u32) {
