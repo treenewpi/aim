@@ -82,6 +82,58 @@ const USAGE: &str = "usage: linux-run [OPTIONS] PROGRAM [ARGS...]
                          the parent, which hands it its memory and state;
                          FDS are the parent's kqueue fd numbers";
 
+/// The POSIX lock holder is a separate process. `cargo aim` builds it as
+/// `aim-lock-holder`. A plain `linux-run` binary serves the same protocol
+/// so the pid-namespace watcher can start without that sibling.
+fn serve_lock_holder() -> bool {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) != Some("--service-name") {
+        return false;
+    }
+    aim_storage::inherited::close_above_stdio();
+    let result = (|| {
+        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if raw != libc::STDIN_FILENO
+            && unsafe { libc::dup2(raw, libc::STDIN_FILENO) } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(raw) };
+            return Err(error);
+        }
+        if raw != libc::STDIN_FILENO {
+            unsafe { libc::close(raw) };
+        }
+        if args.len() != 8
+            || args[2] != "--controller-pid"
+            || args[4] != "--controller-seconds"
+            || args[6] != "--controller-microseconds"
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let number = |value: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+        };
+        let pid = number(&args[3])?;
+        let controller = aim_storage::process_namespace::ProcessIdentity {
+            host_pid: i32::try_from(pid)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?,
+            start_seconds: number(&args[5])?,
+            start_microseconds: number(&args[7])?,
+        };
+        aim_storage::posix_control::serve(&args[1], controller)
+    })();
+    if let Err(error) = result {
+        eprintln!("linux-run: POSIX lock holder: {error}");
+        std::process::exit(1);
+    }
+    true
+}
+
 fn usage() -> ! {
     eprintln!("{USAGE}");
     std::process::exit(2);
@@ -113,6 +165,9 @@ fn host_environment() -> Vec<Vec<u8>> {
 }
 
 fn main() {
+    if serve_lock_holder() {
+        return;
+    }
     // Before any runtime initialization or threads, own the macOS privacy request.
     let responsibility = aim_process::responsible_pid().and_then(|pid| {
         if pid != std::process::id() as libc::pid_t {

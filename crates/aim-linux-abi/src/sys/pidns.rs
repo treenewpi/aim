@@ -118,31 +118,85 @@ fn sweep_tables(tmp: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn context(exe: &Path) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("unreadable ({e})"));
+    let tmp = std::env::var_os("TMPDIR")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unset)".into());
+    format!("exe={} cwd={cwd} TMPDIR={tmp}", exe.display())
+}
+
+/// Sibling `aim-lock-holder` when `cargo aim` published it; otherwise this
+/// `linux-run`, which serves the same holder arguments.
+fn lock_holder(exe: &Path) -> Result<PathBuf, String> {
+    let sibling = exe.with_file_name("aim-lock-holder");
+    let sibling_exists = sibling.is_file();
+    let chosen = if sibling_exists {
+        sibling
+    } else {
+        exe.to_path_buf()
+    };
+    std::fs::canonicalize(&chosen).map_err(|e| {
+        format!(
+            "stage=lock-holder path={} (sibling aim-lock-holder exists: {sibling_exists}) {}: {e}",
+            chosen.display(),
+            context(exe)
+        )
+    })
+}
+
 fn start_watcher(init: ProcessIdentity) -> Result<(), String> {
-    let mut command =
-        std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    let exe = std::env::current_exe().map_err(|e| format!("stage=current-exe: {e}"))?;
+    let args = [
+        "--pidns-watch".to_string(),
+        init.host_pid.to_string(),
+        init.start_seconds.to_string(),
+        init.start_microseconds.to_string(),
+    ];
+    let mut command = std::process::Command::new(&exe);
     command
-        .arg("--pidns-watch")
-        .arg(init.host_pid.to_string())
-        .arg(init.start_seconds.to_string())
-        .arg(init.start_microseconds.to_string())
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
+    // Stderr stays inherited so the child's own diagnostic is visible.
     let mut child = aim_storage::inherited::stdio_only(&mut command)
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "stage=spawn-watcher {}: args={args:?}: {e}",
+                context(&exe)
+            )
+        })?;
     // Reap the intermediate helper before the guest can wait for children.
     // The watcher itself belongs to launchd, outside the guest namespace.
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let mut ready = [0];
+    let status = child.wait().map_err(|e| {
+        format!(
+            "stage=wait-watcher pid={} {}: {e}",
+            child.id(),
+            context(&exe)
+        )
+    })?;
+    let mut ready = Vec::new();
     child
         .stdout
         .take()
         .unwrap()
-        .read_exact(&mut ready)
-        .map_err(|e| e.to_string())?;
+        .read_to_end(&mut ready)
+        .map_err(|e| {
+            format!(
+                "stage=read-watcher-stdout pid={} status={status:?} {}: {e}",
+                child.id(),
+                context(&exe)
+            )
+        })?;
     if !status.success() || ready != [1] {
-        return Err("pid namespace watcher did not start".into());
+        return Err(format!(
+            "stage=watcher-startup pid={} status={status:?} ready_bytes={ready:?} (spawn succeeded; the child did not write the ready byte before exit) args={args:?} {}",
+            child.id(),
+            context(&exe)
+        ));
     }
     Ok(())
 }
@@ -154,16 +208,21 @@ pub fn watch(init: ProcessIdentity) -> io::Result<()> {
     let dir = std::env::temp_dir().join(format!("{PRIVATE}{}", init.host_pid));
     watch_table(&dir, init, || {
         let process = ProcessIdentity::running(me())?;
+        let exe = std::env::current_exe()?;
         let controller =
             aim_storage::posix_broker::Controller::start(aim_storage::posix_broker::Config {
                 endpoint: format!(
                     "dev.aim.posix.{}.{}.{}",
                     process.host_pid, process.start_seconds, process.start_microseconds
                 ),
-                holder: std::fs::canonicalize(
-                    std::env::current_exe()?.with_file_name("aim-lock-holder"),
-                )?,
+                holder: lock_holder(&exe).map_err(io::Error::other)?,
                 startup_timeout: Duration::from_secs(5),
+            })
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "stage=posix-controller {}: {e}",
+                    context(&exe)
+                ))
             })?;
         controller.bind_standalone(&dir, init)?;
         controller
