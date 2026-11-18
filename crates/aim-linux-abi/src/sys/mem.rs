@@ -20,6 +20,7 @@
 //!   recomputed in memory, as the translator does for cached files.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::context::GuestContext;
@@ -32,7 +33,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use super::{arena, copies, vm_account, vmmap, window};
 
-pub(super) const PAGE: u64 = 16384;
+pub(super) use aim_guest_page::PAGE;
 
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
@@ -238,6 +239,7 @@ pub fn mmap(a: [u64; 6]) -> i64 {
     mmap_guest(a, |lo| {
         vm_account::with(|s| s.map(lo, lo + len, kind));
         super::vma_names::forget(lo, lo + len);
+        forget_guest_slices(lo, lo + len);
     })
 }
 /// The mapping itself; `mapped` records a new one at its address, under the
@@ -794,6 +796,7 @@ pub fn exec_reset() {
     unsafe { mach_vm_deallocate(task(), arena::LO, arena::HI - arena::LO) };
     // Executable memfds force a fresh process at exec; only file views remain.
     super::memfd::unmapped(arena::LO, arena::HI - arena::LO);
+    forget_guest_slices(arena::LO, arena::HI);
     window::init();
     copies::forget(arena::LO, arena::HI);
     DEFERRED_UNMAPS.with(|d| d.borrow_mut().clear());
@@ -841,6 +844,7 @@ pub fn munmap(ctx: &GuestContext, a: [u64; 6]) -> i64 {
         DEFERRED_UNMAPS.with(|d| d.borrow_mut().push((addr, len)));
         vm_account::with(|s| s.unmap(addr, addr + len));
         super::vma_names::forget(addr, addr + len);
+        forget_guest_slices(addr, addr + len);
         return 0;
     }
     if let Err(error) = super::verity_pager::forget(addr, len) {
@@ -855,6 +859,7 @@ pub fn munmap(ctx: &GuestContext, a: [u64; 6]) -> i64 {
         vm_account::with(|s| s.unmap(addr, addr + len));
         super::vma_names::forget(addr, addr + len);
         super::fuse_cache::forget(addr, len);
+        forget_guest_slices(addr, addr + len);
         if let Err(error) = super::verity_pager::reconcile_memberships() {
             return -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64);
         }
@@ -926,6 +931,116 @@ fn file_backed(addr: u64) -> bool {
     }
 }
 
+/// Guest protection granule. See `aim_guest_page`: Bionic's `WriteProtected`
+/// hardcodes 4 KiB inside a 16 KiB page.
+const GUEST_PAGE: u64 = aim_guest_page::GUEST_PAGE;
+
+/// Recorded guest-page protections that the host page cannot express on
+/// their own. Absence means the slice has the host page's protection.
+static GUEST_SLICES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+
+fn forget_guest_slices(lo: u64, hi: u64) {
+    if lo >= hi {
+        return;
+    }
+    let mut slices = GUEST_SLICES.lock().unwrap();
+    let keys: Vec<u64> = slices
+        .range(lo.saturating_sub(GUEST_PAGE - 1)..hi)
+        .map(|(&page, _)| page)
+        .filter(|&page| page < hi && page + GUEST_PAGE > lo)
+        .collect();
+    for page in keys {
+        slices.remove(&page);
+    }
+}
+
+fn slice_prot(page: u64) -> Result<u32, i64> {
+    if let Some(prot) = GUEST_SLICES.lock().unwrap().get(&page).copied() {
+        return Ok(prot);
+    }
+    match vmmap::info_at(page) {
+        Some(info) if page >= info.start && page < info.end => {
+            Ok(aim_guest_page::prot_bits(info.prot))
+        }
+        _ => Err(-(ENOMEM as i64)),
+    }
+}
+
+/// `mprotect` of a 4 KiB-aligned range that is not 16 KiB-aligned.
+///
+/// The host page stays at the union of its slices (`aim_guest_page`).
+/// A stricter slice is recorded and is not enforced while a neighbor is
+/// more permissive. That is not a 4 KiB sandbox.
+fn mprotect_subpage(a: [u64; 6]) -> i64 {
+    let _epoch = super::verity_pager::exclusive_mutation();
+    let prot = aim_guest_page::prot_bits((a[2] & !(PROT_BTI | PROT_MTE)) as u32);
+    let len = match aim_guest_page::begin_subpage(a[0], a[1], prot) {
+        Ok(0) => return 0,
+        Ok(len) => len,
+        Err(error) => return -(error as i64),
+    };
+    let addr = a[0];
+    let end = addr + len;
+    if window::touches_reserved(addr, end) {
+        return -(ENOMEM as i64);
+    }
+    if prot & libc::PROT_WRITE as u32 != 0
+        && vmmap::regions(addr, end)
+            .any(|region| region.shared && region.usage.max_prot & libc::PROT_WRITE as u32 == 0)
+    {
+        return -(errno::EACCES as i64);
+    }
+    if !super::verity_pager::covered(addr, len).is_empty() {
+        return -(EINVAL as i64);
+    }
+    let host_lo = addr & !(PAGE - 1);
+    let Some(host_hi) = end.checked_add(PAGE - 1) else {
+        return -(ENOMEM as i64);
+    };
+    let host_hi = host_hi & !(PAGE - 1);
+    let mut current = Vec::new();
+    let mut page = host_lo;
+    while page < host_hi {
+        current.push(match slice_prot(page) {
+            Ok(prot) => prot,
+            Err(error) => return error,
+        });
+        page += GUEST_PAGE;
+    }
+    let (host_ops, slices) = match aim_guest_page::plan_subpage(host_lo, addr, end, prot, &current)
+    {
+        Ok(plan) => plan,
+        Err(error) => return -(error as i64),
+    };
+    for (done, op) in host_ops.iter().enumerate() {
+        let result = host_mprotect(op.addr, PAGE, op.prot as i32);
+        if result != 0 {
+            for undo in &host_ops[..done] {
+                host_mprotect(undo.addr, PAGE, undo.old as i32);
+            }
+            return result;
+        }
+    }
+    {
+        let mut recorded = GUEST_SLICES.lock().unwrap();
+        for (page, prot) in slices {
+            if prot == aim_guest_page::host_prot_at(&host_ops, &current, host_lo, page) {
+                recorded.remove(&page);
+            } else {
+                recorded.insert(page, prot);
+            }
+        }
+    }
+    for op in &host_ops {
+        let was = op.old & libc::PROT_WRITE as u32 != 0;
+        let now = op.prot & libc::PROT_WRITE as u32 != 0;
+        if was != now {
+            vm_account::with(|space| space.protect(op.addr, op.addr + PAGE, now));
+        }
+    }
+    0
+}
+
 /// mprotect with PROT_EXEC: code becoming executable is rewritten first.
 ///
 /// - Pieces that are already executable are not touched: they were rewritten
@@ -935,6 +1050,9 @@ fn file_backed(addr: u64) -> bool {
 ///   readable if needed, scanned and rewritten (a private file mapping
 ///   gets its own copy of each page written), then protected.
 pub fn mprotect(a: [u64; 6]) -> i64 {
+    if a[0] & (PAGE - 1) != 0 {
+        return mprotect_subpage(a);
+    }
     let _epoch = super::verity_pager::exclusive_mutation();
     let (addr, len) = (a[0], page_up(a[1]));
     if super::verity_pager::failed_range(addr, len) {
@@ -952,6 +1070,9 @@ pub fn mprotect(a: [u64; 6]) -> i64 {
     let result = mprotect_owned(a);
     if result == 0 {
         vm_account::with(|s| s.protect(addr, addr + len, writable));
+        // The length covered whole host pages, so every guest slice in it
+        // now has this protection.
+        forget_guest_slices(addr, addr + len);
     }
     result
 }
@@ -1667,6 +1788,10 @@ pub fn mremap(a: [u64; 6]) -> i64 {
     }
     let result = mremap_guest(a);
     if result >= 0 {
+        if flags & MREMAP_DONTUNMAP == 0 {
+            forget_guest_slices(old, old + old_len);
+        }
+        forget_guest_slices(result as u64, result as u64 + new_len);
         super::vma_names::remap(
             old,
             old_len,

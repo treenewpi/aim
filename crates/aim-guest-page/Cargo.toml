@@ -1,0 +1,7 @@
+[package]
+license.workspace = true
+name = "aim-guest-page"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Guest 4 KiB protection slices on a 16 KiB host page"

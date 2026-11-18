@@ -175,3 +175,33 @@ cross-process binder are later milestones. Whether this Android 16 linker
 accepts the generated `ld.config.txt`, and whether `libselinux` or
 `liblog` constructors abort without policy or logd, is decided by the
 Mac run's stderr. Do not treat a Linux compile as that result.
+
+`bc811359` reached both guests and then `mprotect(addr, 0x1000, PROT_READ)`
+returned `EINVAL`. The address is 4 KiB-aligned and 8 KiB into a 16 KiB
+page (`linker64` vaddr `0x18e000`, `__libc_globals`, and the same shape
+in toybox). Bionic's `WriteProtected` hardcodes the 4 KiB length. A
+16 KiB-aligned `mprotect` is unchanged: the length rounds up to 16 KiB,
+as a 16 KiB Linux kernel does. A 4 KiB-aligned address inside a host
+page is recorded per 4 KiB slice. The host page keeps the union of those
+slices. `__libc_globals` is therefore not actually read-only while a
+neighbor in the same 16 KiB page stays writable, and a writable slice
+makes the whole host page writable. That is not a 4 KiB sandbox. A
+slice that asks for execute while a neighbor is not executable is
+`EINVAL`. An address that is not 4 KiB-aligned is `EINVAL`. A 4 KiB
+request whose host page contains an unmapped 4 KiB slice is `ENOMEM`,
+because Darwin cannot change part of the host page.
+
+The layer is already in `_build/downloads`. Do not pass `--fetch` again.
+Rebuild `linux-run` from this commit; the existing `bionic-smoke` binary
+can call it. The `guest4k_` tests are the regression and do not need the
+generated AIDL tree. A passing run of those tests is not a Mac guest run.
+
+```sh
+git fetch origin cursor/binder-fd-elf-smoke-602d
+git checkout cursor/binder-fd-elf-smoke-602d
+cargo test --locked -p aim-guest-page --lib guest4k_ -- --nocapture
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+./target/release/linux-run --no-cache --trace --root "$PWD/_build/redroid-16-runtime/root" /apex/com.android.runtime/bin/linker64
+./target/release/linux-run --no-cache --trace --root "$PWD/_build/redroid-16-runtime/root" /system/bin/toybox echo bionic-ok
+./target/release/bionic-smoke --linux-run "$PWD/target/release/linux-run"
+```

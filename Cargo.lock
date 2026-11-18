@@ -212,6 +212,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aim-guest-page"
+version = "0.1.0"
+
+[[package]]
 name = "aim-host-audio"
 version = "0.1.0"
 dependencies = [
@@ -346,6 +350,7 @@ dependencies = [
  "aim-binder-host",
  "aim-emulated-storage",
  "aim-guest-init",
+ "aim-guest-page",
  "aim-host-audio",
  "aim-host-bluetooth",
  "aim-host-camera",
