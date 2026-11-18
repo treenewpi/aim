@@ -107,6 +107,10 @@ a library that any host process can embed; `aim-binderd --service NAME`
 runs it alone. The `client` module is what the syscall layer calls
 (`crates/aim-linux-abi/src/sys/binder.rs`, enabled by
 `linux-run --binder NAME`). The daemon is found by its bootstrap name.
+A synthetic static PIE (`aim-elf-smoke`'s binder guest, not an Android
+library) is the current guest-syscall check: two `linux-run` processes
+open `/dev/binder`, mmap the receive buffer and `ioctl` through this
+path. `servicemanager` is the same path once that binary is the guest.
 
 - **Open.** `openat("/dev/binder")` creates a Unix socket pair. The guest's
   fd is one end, and the other end goes to the daemon as a fileport. The

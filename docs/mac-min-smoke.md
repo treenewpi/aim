@@ -66,7 +66,39 @@ Run it twice. Every line `round N` must show three different pids, the
 caller's pid as `sender_pid`, `fd=hello` and `reply=0x42`. Then
 `absent refused`, `no-context-manager BR_DEAD_REPLY`, and
 `aim-binder-proc ok`. An ioctl still blocked after 15s exits 101. A
-fatal signal or a leftover process is not a pass.
+fatal signal or a leftover process is not a pass. This binary does not
+execute a guest instruction. A pass here is not the guest check below.
+
+## Guest syscall binder
+
+`aim-binder-proc guest` runs two `linux-run` processes against one
+`aim-binderd`. The program they execute is a synthetic static AArch64
+PIE from `crates/aim-elf-smoke` (`binder_guest`). It is not an Android
+library, not bionic and not `libbinder`. Each guest issues `openat` of
+`/dev/binder`, `mmap` of the receive buffer and `ioctl` of
+`BINDER_WRITE_READ`. The server reads a pipe fd the caller put in the
+transaction. A third guest, with no context manager, must load
+`BR_DEAD_REPLY` from the ioctl result. Nothing in the harness prints
+those values for the guest.
+
+```sh
+cargo build --locked -p aim-elf-smoke --release --bin elf-smoke
+cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+./target/release/elf-smoke --install-binder "$PWD/binder-guest"
+./target/release/aim-binder-proc guest ./target/release/linux-run "$PWD/binder-guest"
+./target/release/aim-binder-proc guest ./target/release/linux-run "$PWD/binder-guest"
+```
+
+Run the last command twice. Pass: `aim-binder-guest synthetic-pie
+not-android`, two `guest round` lines with three distinct pids,
+`sender_pid` equal to the call `linux-run` pid, `euid=10001`,
+`marker=11223344`, `fd=hello`, `reply=00000042`, and
+`trace=openat(/dev/binder),ioctl`. Then
+`guest no-context-manager dead code=00007205` and `aim-binder-guest ok`.
+The service name is gone after each daemon is killed. No leftover
+process. A guest still blocked after 15s is not a pass. This is not
+`servicemanager`, ART, or a reDroid boot.
 
 ## Synthetic ELF
 

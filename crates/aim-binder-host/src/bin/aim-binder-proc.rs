@@ -7,11 +7,18 @@
 //! `absent` looks up a name nobody checked in. `dead` transacts with no
 //! context manager and must observe `BR_DEAD_REPLY`.
 //!
+//! `aim-binder-proc guest LINUX_RUN GUEST` is the guest-syscall check. Two
+//! `linux-run` processes execute a synthetic AArch64 PIE (not an Android
+//! library) that reaches the same daemon through `openat`, `mmap` and
+//! `ioctl`. The host-only subcommands stay as they are.
+//!
 //! An ioctl that is still blocked after 15s exits 101. This process raises
 //! only its own soft `NOFILE` when the hard limit allows 4096.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -50,8 +57,11 @@ fn main() -> ExitCode {
         Some("call") => call(&need(&mut args)),
         Some("absent") => absent(&need(&mut args)),
         Some("dead") => dead(&need(&mut args)),
+        Some("guest") => guest_orchestrate(args.next(), args.next()),
         _ => {
-            eprintln!("usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]");
+            eprintln!(
+                "usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]\n       aim-binder-proc guest LINUX_RUN GUEST"
+            );
             ExitCode::from(2)
         }
     }
@@ -438,6 +448,262 @@ fn orchestrate() -> ExitCode {
     println!("no-context-manager BR_DEAD_REPLY");
     println!("aim-binder-proc ok");
     ExitCode::SUCCESS
+}
+
+const GUEST_ROUNDS: u32 = 2;
+
+fn guest_orchestrate(linux_run: Option<String>, guest_elf: Option<String>) -> ExitCode {
+    let (Some(linux_run), Some(guest_elf)) = (linux_run, guest_elf) else {
+        eprintln!("usage: aim-binder-proc guest LINUX_RUN GUEST");
+        return ExitCode::from(2);
+    };
+    let linux_run = PathBuf::from(linux_run);
+    let guest_elf = PathBuf::from(guest_elf);
+    if !linux_run.is_file() || !guest_elf.is_file() {
+        eprintln!(
+            "aim-binder-proc guest: missing {} or {}",
+            linux_run.display(),
+            guest_elf.display()
+        );
+        return ExitCode::from(2);
+    }
+    raise_nofile(true);
+    println!("aim-binder-guest synthetic-pie not-android");
+    let exe = std::env::current_exe().unwrap_or_else(|error| {
+        eprintln!("aim-binder-proc: current_exe: {error}");
+        std::process::exit(1);
+    });
+    let root = std::env::temp_dir().join(format!("aim-binder-guest-{}", std::process::id()));
+    if let Err(error) = place_guest(&root, &guest_elf) {
+        eprintln!("aim-binder-proc guest: {error}");
+        let _ = std::fs::remove_dir_all(&root);
+        return ExitCode::from(2);
+    }
+    let mut failed = false;
+    for round in 1..=GUEST_ROUNDS {
+        if !guest_round(&exe, &linux_run, &root, round) {
+            failed = true;
+            break;
+        }
+    }
+    if !failed && !guest_dead(&exe, &linux_run, &root) {
+        failed = true;
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    if failed {
+        return ExitCode::from(1);
+    }
+    println!("aim-binder-guest ok");
+    ExitCode::SUCCESS
+}
+
+fn place_guest(root: &Path, guest_elf: &Path) -> std::io::Result<()> {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let dest = bin.join("binder-guest");
+    std::fs::copy(guest_elf, &dest)?;
+    let mut mode = std::fs::metadata(&dest)?.permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&dest, mode)
+}
+
+fn identity_text(uid: u32, label: &str) -> String {
+    format!("uid\t{uid}\nseclabel\t{label}\n")
+}
+
+fn guest_round(exe: &Path, linux_run: &Path, root: &Path, round: u32) -> bool {
+    let name = format!("dev.aim.binder-guest.{}.{round}", std::process::id());
+    let mut kids = Kids::default();
+    kids.push(spawn(exe, &["daemon", &name]));
+    if !wait_until(Duration::from_secs(5), || Client::connect(&name).is_some()) {
+        eprintln!("aim-binder-proc guest: daemon did not check in {name}");
+        return false;
+    }
+    let daemon_pid = kids.pids[0];
+    let mut serve = spawn_guest(
+        linux_run,
+        root,
+        &name,
+        &identity_text(1000, "u:r:servicemanager:s0"),
+        "serve",
+    );
+    let serve_pid = serve.child.id();
+    let ready = read_line(&mut serve.child, Duration::from_secs(5));
+    if ready.as_deref() != Some("ready") {
+        eprintln!(
+            "aim-binder-proc guest: serve ready was {ready:?}\n{}",
+            serve.stderr_tail()
+        );
+        return false;
+    }
+    let mut call = spawn_guest(
+        linux_run,
+        root,
+        &name,
+        &identity_text(10001, "u:r:shell:s0"),
+        "call",
+    );
+    let call_pid = call.child.id();
+    let (call_code, call_out, call_err) =
+        finish_guest(&mut call, WATCHDOG + Duration::from_secs(2));
+    let (serve_code, serve_out, serve_err) = finish_guest(&mut serve, Duration::from_secs(2));
+    if serve_code != Some(0) || call_code != Some(0) {
+        eprintln!(
+            "aim-binder-proc guest: round {round} serve {serve_code:?} call {call_code:?}\nserve {serve_out}\ncall {call_out}\n{}",
+            tail(&serve_err)
+        );
+        return false;
+    }
+    let serve_line = format!("txn pid={call_pid} euid=10001 code=7 marker=11223344 fd=hello");
+    let call_line = format!("reply=00000042 pid={call_pid}");
+    if !serve_out.lines().any(|line| line == serve_line) || call_out.trim() != call_line {
+        eprintln!(
+            "aim-binder-proc guest: round {round}\nserve {serve_out:?}\ncall {call_out:?}\nexpected {serve_line:?} and {call_line:?}"
+        );
+        return false;
+    }
+    if !traced(&serve_err) || !traced(&call_err) {
+        eprintln!(
+            "aim-binder-proc guest: round {round} trace missing openat(/dev/binder) or ioctl\n{}",
+            tail(&serve_err)
+        );
+        return false;
+    }
+    if daemon_pid == serve_pid || daemon_pid == call_pid || serve_pid == call_pid {
+        eprintln!(
+            "aim-binder-proc guest: round {round} pids are not distinct daemon={daemon_pid} serve={serve_pid} call={call_pid}"
+        );
+        return false;
+    }
+    kids.pids.clear();
+    if !kids.stop_first(daemon_pid) {
+        eprintln!("aim-binder-proc guest: daemon {daemon_pid} did not exit");
+        return false;
+    }
+    if !wait_until(Duration::from_secs(2), || Client::connect(&name).is_none()) {
+        eprintln!("aim-binder-proc guest: {name} still registered after the daemon exited");
+        return false;
+    }
+    println!(
+        "guest round {round} daemon={daemon_pid} serve={serve_pid} call={call_pid} sender_pid={call_pid} euid=10001 marker=11223344 fd=hello reply=00000042 trace=openat(/dev/binder),ioctl"
+    );
+    true
+}
+
+fn guest_dead(exe: &Path, linux_run: &Path, root: &Path) -> bool {
+    let name = format!("dev.aim.binder-guest.dead.{}", std::process::id());
+    let mut kids = Kids::default();
+    kids.push(spawn(exe, &["daemon", &name]));
+    if !wait_until(Duration::from_secs(5), || Client::connect(&name).is_some()) {
+        eprintln!("aim-binder-proc guest: dead-check daemon did not check in");
+        return false;
+    }
+    let mut dead = spawn_guest(
+        linux_run,
+        root,
+        &name,
+        &identity_text(10001, "u:r:shell:s0"),
+        "dead",
+    );
+    let (code, out, err) = finish_guest(&mut dead, WATCHDOG + Duration::from_secs(2));
+    let expected = format!("dead code={:08x}", BR_DEAD_REPLY);
+    if code != Some(0) || out.trim() != expected || !traced(&err) {
+        eprintln!(
+            "aim-binder-proc guest: dead check failed code {code:?} out {out:?}\n{}",
+            tail(&err)
+        );
+        return false;
+    }
+    let daemon_pid = kids.pids[0];
+    kids.pids.clear();
+    if !kids.stop_first(daemon_pid) {
+        eprintln!("aim-binder-proc guest: dead-check daemon {daemon_pid} did not exit");
+        return false;
+    }
+    if !wait_until(Duration::from_secs(2), || Client::connect(&name).is_none()) {
+        eprintln!("aim-binder-proc guest: {name} still registered");
+        return false;
+    }
+    println!("guest no-context-manager {expected}");
+    true
+}
+
+fn traced(stderr: &str) -> bool {
+    stderr.contains("openat(\"/dev/binder\"") && stderr.contains("[linux] ioctl(")
+}
+
+fn tail(text: &str) -> String {
+    text.lines()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct GuestProc {
+    child: Child,
+    stderr: mpsc::Receiver<String>,
+}
+
+impl GuestProc {
+    fn stderr_tail(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for GuestProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_guest(linux_run: &Path, root: &Path, name: &str, identity: &str, role: &str) -> GuestProc {
+    let mut child = Command::new(linux_run);
+    child
+        .arg("--no-cache")
+        .arg("--trace")
+        .arg("--root")
+        .arg(root)
+        .arg("--binder")
+        .arg(name)
+        .arg("--identity-text")
+        .arg(identity)
+        .arg("/bin/binder-guest")
+        .arg(role)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn().unwrap_or_else(|error| {
+        eprintln!("aim-binder-proc guest: spawn linux-run: {error}");
+        std::process::exit(1);
+    });
+    let err = child.stderr.take().expect("stderr");
+    let (send, stderr) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut err = err;
+        let _ = err.read_to_string(&mut buf);
+        let _ = send.send(buf);
+    });
+    GuestProc { child, stderr }
+}
+
+fn finish_guest(guest: &mut GuestProc, limit: Duration) -> (Option<i32>, String, String) {
+    let stdout = read_to_end(&mut guest.child, limit);
+    let code = guest.child.wait().ok().and_then(|status| status.code());
+    let stderr = guest
+        .stderr
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
+    // `Drop` would kill a process that has already been waited.
+    (code, stdout, stderr)
 }
 
 struct Kids {

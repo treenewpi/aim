@@ -26,6 +26,9 @@ pub mod exit {
 pub const PAGE_LINE: &str = "elf-smoke page=16384\n";
 pub const TLS_LINE: &str = "tls=ok mmap=ok\n";
 
+mod binder_guest;
+pub use binder_guest::binder_program;
+
 /// `svc #0`, `mrs Xt, tpidr_el0`, `msr tpidr_el0, Xt` as the translator matches them.
 const SVC0: u32 = 0xd400_0001;
 const MRS_TPIDR: u32 = 0xd53b_d040;
@@ -93,7 +96,7 @@ pub fn trace_matches(text: &str, rewrites: Rewrites) -> bool {
     ))
 }
 
-fn link(code: &[u32]) -> Vec<u8> {
+pub(crate) fn link(code: &[u32]) -> Vec<u8> {
     let code_off = 0x80u64;
     let mut code_bytes = Vec::with_capacity(code.len() * 4);
     for word in code {
@@ -138,41 +141,48 @@ fn put64(buf: &mut [u8], at: usize, value: u64) {
     buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-struct Asm {
+pub(crate) struct Asm {
     words: Vec<u32>,
-    fixes: Vec<(usize, &'static str, i64)>,
-    labels: Vec<(&'static str, usize)>,
+    fixes: Vec<(usize, String, i64)>,
+    labels: Vec<(String, usize)>,
 }
 
 impl Asm {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             words: Vec::new(),
             fixes: Vec::new(),
             labels: Vec::new(),
         }
     }
-    fn label(&mut self, name: &'static str) {
-        self.labels.push((name, self.words.len()));
+    pub(crate) fn label(&mut self, name: impl Into<String>) {
+        self.labels.push((name.into(), self.words.len()));
     }
-    fn emit(&mut self, word: u32) {
+    pub(crate) fn emit(&mut self, word: u32) {
         self.words.push(word);
     }
-    fn b(&mut self, label: &'static str) {
-        self.fixes.push((self.words.len(), label, 0));
+    pub(crate) fn b(&mut self, label: impl Into<String>) {
+        // 0x100 is `B`. Kind 0 is `B.EQ`; the two cannot share a fix kind.
+        self.fixes.push((self.words.len(), label.into(), 0x100));
         self.emit(0);
     }
-    fn cond(&mut self, label: &'static str, cond: u32) {
-        self.fixes.push((self.words.len(), label, cond as i64));
+    pub(crate) fn bl(&mut self, label: impl Into<String>) {
+        // 0x400 is BL. B.cond stays in 1..=15 and CBZ/CBNZ in 0x200/0x300.
+        self.fixes.push((self.words.len(), label.into(), 0x400));
         self.emit(0);
     }
-    fn cb(&mut self, label: &'static str, nonzero: bool, reg: u32) {
+    pub(crate) fn cond(&mut self, label: impl Into<String>, cond: u32) {
+        self.fixes
+            .push((self.words.len(), label.into(), cond as i64));
+        self.emit(0);
+    }
+    pub(crate) fn cb(&mut self, label: impl Into<String>, nonzero: bool, reg: u32) {
         // 0x200/0x300 stay above the B.cond kinds 1..=15. Bit 8 selects CBNZ.
         let kind = (if nonzero { 0x300 } else { 0x200 }) + reg as i64;
-        self.fixes.push((self.words.len(), label, kind));
+        self.fixes.push((self.words.len(), label.into(), kind));
         self.emit(0);
     }
-    fn finish(mut self) -> Vec<u32> {
+    pub(crate) fn finish(mut self) -> Vec<u32> {
         for (at, label, kind) in &self.fixes {
             let to = self
                 .labels
@@ -186,11 +196,13 @@ impl Asm {
     }
 }
 
-/// `kind` 0 is an unconditional branch. 1..=15 are B.cond. 0x200+reg is CBZ
-/// and 0x300+reg is CBNZ.
+/// `kind` 0x100 is an unconditional branch. 0..=15 are B.cond (`0` is B.EQ).
+/// 0x200+reg is CBZ, 0x300+reg is CBNZ, and 0x400 is BL.
 fn encode_fix(kind: i64, off: i64) -> u32 {
-    if kind == 0 {
+    if kind == 0x100 {
         0x1400_0000 | (off as u32 & 0x03ff_ffff)
+    } else if kind == 0x400 {
+        0x9400_0000 | (off as u32 & 0x03ff_ffff)
     } else if kind < 0x20 {
         0x5400_0000 | ((off as u32 & 0x7_ffff) << 5) | (kind as u32)
     } else {
@@ -204,34 +216,68 @@ fn encode_fix(kind: i64, off: i64) -> u32 {
     }
 }
 
-fn add_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+pub(crate) fn add_imm(rd: u32, rn: u32, imm: u32) -> u32 {
     0x9100_0000 | (imm << 10) | (rn << 5) | rd
 }
-fn sub_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+pub(crate) fn sub_imm(rd: u32, rn: u32, imm: u32) -> u32 {
     0xd100_0000 | (imm << 10) | (rn << 5) | rd
 }
-fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+pub(crate) fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
     0x8b00_0000 | (rm << 16) | (rn << 5) | rd
 }
-fn ldr(rt: u32, rn: u32, byte_off: u32) -> u32 {
+pub(crate) fn ldr(rt: u32, rn: u32, byte_off: u32) -> u32 {
     0xf940_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt
 }
-fn str(rt: u32, rn: u32, byte_off: u32) -> u32 {
+pub(crate) fn str(rt: u32, rn: u32, byte_off: u32) -> u32 {
     0xf900_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt
 }
-fn strb(rt: u32, rn: u32) -> u32 {
+/// `LDR Wt, [Xn, #byte_off]`. Zero-extends into Xt.
+pub(crate) fn ldrw(rt: u32, rn: u32, byte_off: u32) -> u32 {
+    0xb940_0000 | ((byte_off / 4) << 10) | (rn << 5) | rt
+}
+/// `STR Wt, [Xn, #byte_off]`.
+pub(crate) fn strw(rt: u32, rn: u32, byte_off: u32) -> u32 {
+    0xb900_0000 | ((byte_off / 4) << 10) | (rn << 5) | rt
+}
+/// `STUR Xt, [Xn, #byte_off]`. `byte_off` is a signed 9-bit byte offset, so
+/// the store can sit at a 4-byte boundary inside a write buffer.
+pub(crate) fn stur(rt: u32, rn: u32, byte_off: i32) -> u32 {
+    0xf800_0000 | (((byte_off as u32) & 0x1ff) << 12) | (rn << 5) | rt
+}
+pub(crate) fn strb(rt: u32, rn: u32) -> u32 {
     0x3900_0000 | (rn << 5) | rt
 }
-fn movz(rd: u32, imm: u32) -> u32 {
+pub(crate) fn strb_off(rt: u32, rn: u32, byte_off: u32) -> u32 {
+    0x3900_0000 | (byte_off << 10) | (rn << 5) | rt
+}
+pub(crate) fn ldrb(rt: u32, rn: u32, byte_off: u32) -> u32 {
+    0x3940_0000 | (byte_off << 10) | (rn << 5) | rt
+}
+/// `UBFM Xd, Xn, #shift, #63`, which is `LSR Xd, Xn, #shift`.
+pub(crate) fn lsr(rd: u32, rn: u32, shift: u32) -> u32 {
+    0xd340_fc00 | (shift << 16) | (rn << 5) | rd
+}
+/// `AND Xd, Xn, #0x3fff`. The logical immediate is a 64-bit element of 14 ones.
+pub(crate) fn and_3fff(rd: u32, rn: u32) -> u32 {
+    0x9240_3400 | (rn << 5) | rd
+}
+/// `AND Xd, Xn, #0xf`.
+pub(crate) fn and_15(rd: u32, rn: u32) -> u32 {
+    0x9240_0c00 | (rn << 5) | rd
+}
+pub(crate) fn movz(rd: u32, imm: u32) -> u32 {
     0xd280_0000 | (imm << 5) | rd
 }
-fn movk(rd: u32, imm: u32, hw: u32) -> u32 {
+pub(crate) fn movk(rd: u32, imm: u32, hw: u32) -> u32 {
     0xf280_0000 | (hw << 21) | (imm << 5) | rd
 }
-fn movn0(rd: u32) -> u32 {
-    0x9280_0000 | rd
+pub(crate) fn movn(rd: u32, imm: u32) -> u32 {
+    0x9280_0000 | (imm << 5) | rd
 }
-fn mov_reg(rd: u32, rm: u32) -> u32 {
+fn movn0(rd: u32) -> u32 {
+    movn(rd, 0)
+}
+pub(crate) fn mov_reg(rd: u32, rm: u32) -> u32 {
     // ORR (register) reads register 31 as XZR, never SP.
     0xaa00_03e0 | (rm << 16) | rd
 }
@@ -239,23 +285,26 @@ fn mov_reg(rd: u32, rm: u32) -> u32 {
 /// `mov xd, sp`. The ARM ARM alias is `add xd, sp, #0`. `mov_reg` cannot
 /// encode it: the same register field 31 is XZR there, so `mov_reg(rd, SP)`
 /// is `mov xd, xzr`.
-fn mov_from_sp(rd: u32) -> u32 {
+pub(crate) fn mov_from_sp(rd: u32) -> u32 {
     add_imm(rd, SP, 0)
 }
-fn cmp_imm(rn: u32, imm: u32) -> u32 {
+pub(crate) fn cmp_imm(rn: u32, imm: u32) -> u32 {
     0xf100_001f | (imm << 10) | (rn << 5)
 }
-fn cmp_reg(rn: u32, rm: u32) -> u32 {
+pub(crate) fn cmp_reg(rn: u32, rm: u32) -> u32 {
     0xeb00_001f | (rm << 16) | (rn << 5)
 }
-fn udiv(rd: u32, rn: u32, rm: u32) -> u32 {
+pub(crate) fn udiv(rd: u32, rn: u32, rm: u32) -> u32 {
     0x9ac0_0800 | (rm << 16) | (rn << 5) | rd
 }
-fn msub(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
+pub(crate) fn msub(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
     0x9b00_8000 | (rm << 16) | (ra << 10) | (rn << 5) | rd
 }
-fn svc() -> u32 {
+pub(crate) fn svc() -> u32 {
     SVC0
+}
+pub(crate) fn ret() -> u32 {
+    0xd65f_03c0
 }
 fn msr_tp(rn: u32) -> u32 {
     MSR_TPIDR | rn
@@ -264,10 +313,10 @@ fn mrs_tp(rt: u32) -> u32 {
     MRS_TPIDR | rt
 }
 
-const SP: u32 = 31;
+pub(crate) const SP: u32 = 31;
 const XZR: u32 = 31;
 
-fn mov_imm64(a: &mut Asm, rd: u32, value: u64) {
+pub(crate) fn mov_imm64(a: &mut Asm, rd: u32, value: u64) {
     a.emit(movz(rd, (value & 0xffff) as u32));
     for hw in 1..4 {
         let part = ((value >> (hw * 16)) & 0xffff) as u32;
@@ -441,7 +490,8 @@ mod tests {
         assert_eq!(svc(), 0xd400_0001);
         assert_eq!(msr_tp(14), 0xd51b_d04e);
         assert_eq!(mrs_tp(15), 0xd53b_d04f);
-        assert_eq!(encode_fix(0, 1), 0x1400_0001);
+        assert_eq!(encode_fix(0x100, 1), 0x1400_0001);
+        assert_eq!(encode_fix(0, 1), 0x5400_0020);
         assert_eq!(encode_fix(1, 2), 0x5400_0041);
         assert_eq!(encode_fix(0x200 + 10, -1), 0xb4ff_ffea);
         assert_eq!(encode_fix(0x300 + 10, 1), 0xb500_002a);

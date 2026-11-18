@@ -11,26 +11,52 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aim_elf_smoke::{install, program, trace_matches, PAGE_LINE, TLS_LINE};
+use aim_elf_smoke::{binder_program, install, program, trace_matches, PAGE_LINE, TLS_LINE};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut linux_run: Option<PathBuf> = None;
     let mut self_check = false;
+    let mut install_binder: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--self-check" => self_check = true,
+            "--install-binder" => {
+                install_binder = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    fail(2, "--install-binder needs a path");
+                })));
+            }
             "--linux-run" => {
                 linux_run = Some(PathBuf::from(args.next().unwrap_or_else(|| {
                     fail(2, "--linux-run needs a path");
                 })));
             }
             "--help" | "-h" => {
-                println!("usage: elf-smoke --self-check\n       elf-smoke --linux-run PATH");
+                println!(
+                    "usage: elf-smoke --self-check\n       elf-smoke --linux-run PATH\n       elf-smoke --install-binder PATH"
+                );
                 return;
             }
             other => fail(2, &format!("unknown argument {other}")),
         }
+    }
+    if let Some(path) = install_binder {
+        // The file is a synthetic binder client, not an Android library.
+        // Installing it does not execute it.
+        let elf = binder_program();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                fail(2, &format!("cannot create {}: {error}", parent.display()));
+            });
+        }
+        install(&path, &elf).unwrap_or_else(|error| {
+            fail(2, &format!("cannot install {}: {error}", path.display()));
+        });
+        println!(
+            "binder-guest: {} bytes, synthetic AArch64 PIE, not an Android library, not executed",
+            elf.len()
+        );
+        return;
     }
     let (elf, rewrites) = program();
     if rewrites.mrs_tpidr != 1 || rewrites.msr_tpidr != 1 || rewrites.svc < 7 {
