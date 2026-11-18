@@ -1,13 +1,12 @@
-//! How a 4 KiB guest `mprotect` lands on a 16 KiB host page.
+//! Guest `mprotect` is tracked in 4 KiB slices. The host page stays 16 KiB,
+//! and its protection is the union of the slices that share it.
 //!
-//! Bionic's `WriteProtected` locks `__libc_globals` with a hardcoded
-//! `mprotect(addr, 0x1000, PROT_READ)` (`linker64` vaddr `0x18e000`, 8 KiB
-//! into a 16 KiB page) even though every `PT_LOAD` is 16 KiB-aligned.
-//! Darwin cannot change protection below 16 KiB. The host page's protection
-//! is the union of its 4 KiB slices. A stricter slice beside a more
-//! permissive one is recorded by the caller and not enforced. This is not
-//! a 4 KiB sandbox. `PROT_EXEC` on a partial host page is rejected instead
-//! of widening the page to RWX.
+//! Bionic's `WriteProtected` calls `mprotect` on `__libc_globals` (vaddr
+//! `0x18e000`, length `0x1000`, `PROT_READ`). That slice sits inside a host
+//! page that also holds writable globals. The call succeeds and those
+//! globals stay writable. When every slice of a page asks for the same
+//! protection, the host page changes. A slice that asks for execute while a
+//! neighbor does not is rejected, so a data page is not marked executable.
 
 /// Host and guest granules. The guest value is Bionic's hardcoded length,
 /// not `AT_PAGESZ`.

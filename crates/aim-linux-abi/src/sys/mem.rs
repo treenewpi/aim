@@ -935,8 +935,8 @@ fn file_backed(addr: u64) -> bool {
 /// hardcodes 4 KiB inside a 16 KiB page.
 const GUEST_PAGE: u64 = aim_guest_page::GUEST_PAGE;
 
-/// Recorded guest-page protections that the host page cannot express on
-/// their own. Absence means the slice has the host page's protection.
+/// Guest slices whose protection differs from their 16 KiB host page.
+/// Absence means the slice has the host page's protection.
 static GUEST_SLICES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
 
 fn forget_guest_slices(lo: u64, hi: u64) {
@@ -968,9 +968,8 @@ fn slice_prot(page: u64) -> Result<u32, i64> {
 
 /// `mprotect` of a 4 KiB-aligned range that is not 16 KiB-aligned.
 ///
-/// The host page stays at the union of its slices (`aim_guest_page`).
-/// A stricter slice is recorded and is not enforced while a neighbor is
-/// more permissive. That is not a 4 KiB sandbox.
+/// The host page stays 16 KiB. Its protection is the union of its slices
+/// (`aim_guest_page`), so a read-only slice keeps its writable neighbors.
 fn mprotect_subpage(a: [u64; 6]) -> i64 {
     let _epoch = super::verity_pager::exclusive_mutation();
     let prot = aim_guest_page::prot_bits((a[2] & !(PROT_BTI | PROT_MTE)) as u32);
