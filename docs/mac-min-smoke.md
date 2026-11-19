@@ -321,7 +321,38 @@ satisfy this section.
 
 `bionic-smoke --property` is the next measurement. It does not use the
 servicemanager root and it does not write `servicemanager.ready` ahead
-of the client. `--prepare-property` copies the bionic root and adds the
+of the client.
+
+Commit `5ed18579df90d5c2e51908df3d3fd634b9fd8913` was run on the same M4
+(macOS 26.5.1, Darwin 25.5.0, arm64, 16 KiB pages, Rust 1.88). Targeted
+tests were 9 pass. The original `android` and `libbinder` commands each
+passed one round on their own static ready roots. `bionic-smoke
+--property` exited 1. The property service had published
+`ro.property_service.version=2`, `servicemanager.ready` was absent, and
+the socket was listening. The first original `getprop` (pid 91247)
+exited 127 with empty stdout before any `openat` of `property_info`.
+Stderr was `POSIX admission pid=91247 stage=standalone-owner errno=2`
+and `linux-run: POSIX lock process admission: errno 2`. An independent
+repro with the same `--by-pid` directory (pid 91271) exited 127 the
+same way. `linux-run`, the guest root, that directory, and `toolbox`
+existed. `aim-lock-holder` was not beside `linux-run`. The same Mac's
+`android` and `libbinder` guests also had no `aim-lock-holder`, and
+they passed: a standalone `linux-run` is its own lock holder. The
+failure is the harness directory passed as `--by-pid`. That skips
+`new_table`, so the pid-namespace watcher never writes
+`posix-control-owner`, and admission opens a missing file. No futex
+wait or `setprop` ran. The log archive is
+`ce121fe693c874eee31c49ebe8b35a8d6b61a588a9c7138b44264535423a0168`.
+
+The property command no longer passes `--by-pid`. Each `linux-run`
+creates `aim-pidns-<its pid>`, the watcher writes
+`posix-control-owner`, and `linux-run` publishes the identity text into
+that table. The server reads that file. It does not create the table
+and it does not require `aim-lock-holder`. `stage=standalone-owner`
+with errno 2 is still not a pass. Do not pass `--fetch`. The Mac does
+not compile `property-wait`.
+
+`--prepare-property` copies the bionic root and adds the
 original `system/bin/toolbox` (sha256
 `f2233523a39537e741a0c728fb56abbb1c0c5bc8422ce623a84f12a0f52192e4`).
 `getprop` and `setprop` are the image's symlinks to `toolbox`; `argv[0]`
@@ -336,10 +367,10 @@ Original `getprop` has no wait flag, so the waiter is not an image file.
 The server is in `bionic-smoke`. It maps `/dev/__properties__` with
 `MAP_SHARED`, writes only `ro.property_service.version=2` (init's
 protocol version), and listens on `/dev/socket/property_service`. A set
-is accepted only when `linux-run --by-pid` has published the peer's
-`seclabel`. There is no fallback context. The trie is the default
-string context, not the image `property_contexts`. This is not
-`libbinder-ping ok` and not a boot.
+is accepted only when the peer's own `linux-run` has published
+`seclabel` in `aim-pidns-<pid>/<pid>`. There is no fallback context.
+The trie is the default string context, not the image
+`property_contexts`. This is not `libbinder-ping ok` and not a boot.
 
 Keep the `android` and `libbinder` commands above as regressions. Their
 static ready area stays until this path has passed on the Mac. Do not

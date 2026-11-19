@@ -65,11 +65,19 @@ pub fn property_root() -> PathBuf {
         .join("root")
 }
 
-fn by_pid_dir() -> PathBuf {
-    property_root()
-        .parent()
-        .expect("property root")
-        .join("by-pid")
+/// The identity file `linux-run` publishes when it is its own pid-namespace
+/// init. `new_table` names the directory `aim-pidns-<pid>` and the watcher
+/// writes `posix-control-owner` there before the guest is loaded.
+///
+/// A directory this harness creates and passes as `--by-pid` is not that
+/// table. Admission then opens a missing `posix-control-owner` and returns
+/// errno 2 (`stage=standalone-owner`) before `getprop` runs. `linux-run` is
+/// the lock holder when `aim-lock-holder` is not beside it; that sibling is
+/// not what creates the owner file.
+fn standalone_identity(pid: i32) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("aim-pidns-{pid}"))
+        .join(pid.to_string())
 }
 
 /// Copy the audited bionic root and add the original property clients.
@@ -375,7 +383,8 @@ pub struct PropertyServer {
 impl PropertyServer {
     /// Maps `/dev/__properties__` under `root` and listens on
     /// `/dev/socket/property_service`. `servicemanager.ready` is absent.
-    pub fn start(root: &Path, by_pid: &Path) -> Result<Self, String> {
+    /// A peer's context is the file its own `linux-run` published.
+    pub fn start(root: &Path) -> Result<Self, String> {
         let prop_dir = root.join("dev/__properties__");
         if prop_dir.exists() {
             fs::remove_dir_all(&prop_dir)
@@ -424,8 +433,7 @@ impl PropertyServer {
         let stop_flag = Arc::clone(&stop);
         let service_thr = Arc::clone(&service);
         let log_thr = Arc::clone(&log);
-        let by_pid = by_pid.to_path_buf();
-        let thread = thread::spawn(move || accept_loop(listener, service_thr, by_pid, stop_flag, log_thr));
+        let thread = thread::spawn(move || accept_loop(listener, service_thr, stop_flag, log_thr));
         println!("property-service init name={VERSION} value=2 reply=0");
         println!("property-service: {READY} absent");
         println!("property-service listening");
@@ -460,13 +468,12 @@ impl Drop for PropertyServer {
 fn accept_loop(
     listener: UnixListener,
     service: Arc<Mutex<PropertyService<MmapMem>>>,
-    by_pid: PathBuf,
     stop: Arc<AtomicBool>,
     log: Arc<Mutex<String>>,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((mut stream, _)) => handle_client(&mut stream, &service, &by_pid, &log),
+            Ok((mut stream, _)) => handle_client(&mut stream, &service, &log),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -482,7 +489,6 @@ fn accept_loop(
 fn handle_client(
     stream: &mut UnixStream,
     service: &Mutex<PropertyService<MmapMem>>,
-    by_pid: &Path,
     log: &Mutex<String>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -527,10 +533,10 @@ fn handle_client(
             return;
         }
     };
-    let Some((uid, gid, context)) = read_identity(by_pid, pid) else {
+    let Some((uid, gid, context)) = read_identity(pid) else {
         note(
             log,
-            &format!("property-service: peer pid={pid} has no by-pid identity"),
+            &format!("property-service: peer pid={pid} has no published identity"),
         );
         reply(stream, PROP_ERROR_PERMISSION_DENIED);
         return;
@@ -570,8 +576,8 @@ fn note(log: &Mutex<String>, line: &str) {
     log.lock().expect("property log").push('\n');
 }
 
-fn read_identity(by_pid: &Path, pid: i32) -> Option<(u32, u32, String)> {
-    let path = by_pid.join(pid.to_string());
+fn read_identity(pid: i32) -> Option<(u32, u32, String)> {
+    let path = standalone_identity(pid);
     for _ in 0..25 {
         if let Ok(text) = fs::read_to_string(&path) {
             let mut uid = None;
@@ -732,30 +738,25 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    let by_pid = by_pid_dir();
-    if by_pid.exists() {
-        fs::remove_dir_all(&by_pid).map_err(|e| e.to_string())?;
-    }
-    fs::create_dir_all(&by_pid).map_err(|e| e.to_string())?;
-    set_mode(&by_pid, 0o755)?;
-    let server = PropertyServer::start(&root, &by_pid)?;
+    let server = PropertyServer::start(&root)?;
     if server.get(READY).is_some() {
         return blocker("ready was present at start", &server.log());
     }
-    let mut before = guest(
-        linux_run,
-        &root,
-        &by_pid,
-        &["/system/bin/getprop", READY],
-    )?;
+    let mut before = guest(linux_run, &root, &["/system/bin/getprop", READY])?;
     let (code, out, err) = finish(&mut before, Duration::from_secs(25));
     println!(
         "property-service: getprop before pid={} exit={code:?} stdout={out:?}",
         before.child.id()
     );
-    if code != Some(0) || out.contains("true") {
+    if code != Some(0) {
         return blocker(
-            "getprop before setprop printed true or failed",
+            "getprop before setprop did not run",
+            &format!("exit={code:?}\nstdout={out:?}\n{err}"),
+        );
+    }
+    if out.contains("true") {
+        return blocker(
+            "getprop before setprop printed true",
             &format!("stdout={out:?}\n{err}"),
         );
     }
@@ -765,7 +766,6 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     let mut waiter = guest(
         linux_run,
         &root,
-        &by_pid,
         &["/system/bin/property-wait", READY, "true"],
     )?;
     let waiter_pid = waiter.child.id();
@@ -778,12 +778,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
         );
     }
     println!("property-service: waiter pid={waiter_pid} parked");
-    let mut set = guest(
-        linux_run,
-        &root,
-        &by_pid,
-        &["/system/bin/setprop", READY, "true"],
-    )?;
+    let mut set = guest(linux_run, &root, &["/system/bin/setprop", READY, "true"])?;
     let set_pid = set.child.id();
     let (set_code, set_out, set_err) = finish(&mut set, Duration::from_secs(25));
     println!("property-service: setprop pid={set_pid} exit={set_code:?} stdout={set_out:?}");
@@ -816,7 +811,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     if futex_parked(&wait_err) {
         return blocker("property-wait exited while a futex was still entered", &wait_err);
     }
-    let mut after = guest(linux_run, &root, &by_pid, &["/system/bin/getprop", READY])?;
+    let mut after = guest(linux_run, &root, &["/system/bin/getprop", READY])?;
     let after_pid = after.child.id();
     let (after_code, after_out, after_err) = finish(&mut after, Duration::from_secs(25));
     println!("property-service: getprop after pid={after_pid} exit={after_code:?} stdout={after_out:?}");
@@ -826,12 +821,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     if after_pid == set_pid || after_pid == waiter_pid {
         return blocker("getprop pid collided with setprop or the waiter", "");
     }
-    let mut ro = guest(
-        linux_run,
-        &root,
-        &by_pid,
-        &["/system/bin/setprop", VERSION, "9"],
-    )?;
+    let mut ro = guest(linux_run, &root, &["/system/bin/setprop", VERSION, "9"])?;
     let ro_pid = ro.child.id();
     let (ro_code, ro_out, ro_err) = finish(&mut ro, Duration::from_secs(25));
     println!("property-service: ro setprop pid={ro_pid} exit={ro_code:?} stdout={ro_out:?}");
@@ -841,7 +831,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
             &format!("stdout={ro_out:?}\n{ro_err}\n{}", server.log()),
         );
     }
-    let mut version = guest(linux_run, &root, &by_pid, &["/system/bin/getprop", VERSION])?;
+    let mut version = guest(linux_run, &root, &["/system/bin/getprop", VERSION])?;
     let (ver_code, ver_out, ver_err) = finish(&mut version, Duration::from_secs(25));
     println!("property-service: getprop version exit={ver_code:?} stdout={ver_out:?}");
     if ver_code != Some(0) || ver_out != "2\n" {
@@ -850,12 +840,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
             &format!("stdout={ver_out:?}\n{ver_err}"),
         );
     }
-    let mut unset = guest(
-        linux_run,
-        &root,
-        &by_pid,
-        &["/system/bin/getprop", "debug.aim.unset"],
-    )?;
+    let mut unset = guest(linux_run, &root, &["/system/bin/getprop", "debug.aim.unset"])?;
     let (unset_code, unset_out, unset_err) = finish(&mut unset, Duration::from_secs(25));
     println!("property-service: getprop unset exit={unset_code:?} stdout={unset_out:?}");
     if unset_code != Some(0) || unset_out.contains("true") || unset_out.contains("set-me") {
@@ -879,20 +864,25 @@ fn blocker(why: &str, detail: &str) -> Result<(), String> {
     Err(format!("property-service: first blocker: {why}\n{detail}"))
 }
 
-fn guest(linux_run: &Path, root: &Path, by_pid: &Path, args: &[&str]) -> Result<Guest, String> {
-    let mut child = Command::new(linux_run);
-    child
+fn linux_run_command(linux_run: &Path, root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(linux_run);
+    // No `--by-pid`: linux-run creates `aim-pidns-<pid>`, starts its watcher,
+    // and that watcher writes `posix-control-owner`. The identity text is
+    // published into that table by linux-run, not by this process.
+    command
         .arg("--no-cache")
         .arg("--trace")
         .arg("--root")
         .arg(root)
         .arg("--identity-text")
         .arg(SHELL)
-        .arg("--by-pid")
-        .arg(by_pid)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .args(args);
+    command
+}
+
+fn guest(linux_run: &Path, root: &Path, args: &[&str]) -> Result<Guest, String> {
+    let mut child = linux_run_command(linux_run, root, args);
+    child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child
         .spawn()
         .map_err(|e| format!("start linux-run {}: {e}", args.join(" ")))?;
@@ -1070,6 +1060,7 @@ fn print_host() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use aim_android_init::props::protocol::{encode_setprop2, PROP_ERROR_READ_ONLY_PROPERTY};
     use sha2::Digest;
     use std::io::Read;
@@ -1103,6 +1094,16 @@ mod tests {
         assert!(connect_ok(
             "[linux] connect(0x3, 0x1, 0x6e) = 0 [pid=4 tid=4 call=3 leave]\n"
         ));
+        let args: Vec<String> = linux_run_command(
+            Path::new("linux-run"),
+            Path::new("root"),
+            &["/system/bin/getprop", READY],
+        )
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(args.iter().any(|arg| arg == "--identity-text"));
+        assert!(!args.iter().any(|arg| arg == "--by-pid"));
     }
 
     #[test]
@@ -1110,19 +1111,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aim-prop-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("dev")).unwrap();
-        let by_pid = dir.join("by-pid");
-        fs::create_dir_all(&by_pid).unwrap();
-        let server = PropertyServer::start(&dir, &by_pid).unwrap();
+        let pid = std::process::id() as i32;
+        let identity = standalone_identity(pid);
+        let table = identity.parent().unwrap().to_path_buf();
+        assert!(
+            !table.exists(),
+            "this process already has a standalone pid table"
+        );
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove_table = Remove(table.clone());
+        let server = PropertyServer::start(&dir).unwrap();
         assert!(server.get(READY).is_none());
         assert_eq!(server.get(VERSION).as_deref(), Some("2"));
 
         let denied = exchange(&dir, &encode_setprop2(READY.as_bytes(), b"true"));
         assert_eq!(denied, PROP_ERROR_PERMISSION_DENIED);
         assert!(server.get(READY).is_none());
-        assert!(server.log().contains("has no by-pid identity"));
+        assert!(server.log().contains("has no published identity"));
 
-        let pid = std::process::id();
-        fs::write(by_pid.join(pid.to_string()), SHELL).unwrap();
+        fs::create_dir_all(&table).unwrap();
+        fs::write(&identity, SHELL).unwrap();
         let ok = exchange(&dir, &encode_setprop2(READY.as_bytes(), b"true"));
         assert_eq!(ok, PROP_SUCCESS);
         assert_eq!(server.get(READY).as_deref(), Some("true"));
