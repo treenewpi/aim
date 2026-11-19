@@ -15,9 +15,10 @@
 //! `android LINUX_RUN ROOT` runs the original reDroid `servicemanager`
 //! and `service` from that root. The root's generated
 //! `servicemanager.ready` property lets the original client finish its
-//! wait and open the driver; the harness still requires the driver's
-//! result and the client's own text. It prints their stdout and stops at
-//! the first real failure. Acceptance is that run on Apple Silicon macOS/XNU,
+//! property wait and open the driver. With no context manager this
+//! binary keeps calling and sleeping; the harness records `BR_DEAD_REPLY`
+//! and that wait, then stops the client. It does not print a service
+//! list. Acceptance is that run on Apple Silicon macOS/XNU,
 //! with the host platform, page size, commit, pids, exit codes, and the
 //! original transaction text. A Linux run is not that result. The
 //! host-only subcommands stay as they are.
@@ -968,6 +969,94 @@ fn binder_device_opened(stderr: &str) -> bool {
     false
 }
 
+struct Absence {
+    pid: u32,
+    kind: &'static str,
+    headline: String,
+    stdout: String,
+    stderr: String,
+    blocker: Option<String>,
+}
+
+/// How this Android 16 `service` behaves with no context manager.
+///
+/// `defaultServiceManager` does not return null. After
+/// `servicemanager.ready` is true it transacts to handle 0 and, on
+/// `BR_DEAD_REPLY`, logs and `sleep`s, then tries again. The string
+/// `Unable to get default service manager` is the path that runs only
+/// when that function returns null, which this wait does not do.
+/// Either that exit, or one completed dead reply followed by `nanosleep`
+/// while the process is still running, is the real absence. A reply, a
+/// "found" line, or an ioctl that never returns is not.
+fn observe_no_manager(linux_run: &Path, root: &Path, name: &str, identity: &str) -> Absence {
+    let mut guest = spawn_android(
+        linux_run,
+        root,
+        name,
+        identity,
+        &["/system/bin/service", "check", "manager"],
+    );
+    let pid = guest.child.id();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut exited = None;
+    let outcome = loop {
+        if let Ok(Some(status)) = guest.child.try_wait() {
+            exited = Some(status);
+            break aim_binder_driver::absence::no_manager_outcome(
+                &guest.stdout(),
+                &guest.stderr(),
+                true,
+            );
+        }
+        if let Some(kind) =
+            aim_binder_driver::absence::no_manager_outcome(&guest.stdout(), &guest.stderr(), false)
+        {
+            break Some(kind);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if outcome == Some("waiting") {
+        let _ = guest.child.kill();
+        let _ = guest.child.wait();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let stdout = guest.stdout();
+    let stderr = guest.stderr();
+    match outcome {
+        Some("waiting") => Absence {
+            pid,
+            kind: "waiting",
+            headline: format!("pid={pid} still waiting; stopped after BR_DEAD_REPLY"),
+            stdout,
+            stderr,
+            blocker: None,
+        },
+        Some("exited") => Absence {
+            pid,
+            kind: "exited",
+            headline: format!("pid={pid} exit={exited:?} printed the original no-manager line"),
+            stdout,
+            stderr,
+            blocker: None,
+        },
+        _ => Absence {
+            pid,
+            kind: "blocked",
+            headline: format!("pid={pid} exit={exited:?} absence not observed"),
+            blocker: Some(aim_binder_driver::absence::absence_blocker(
+                &stdout,
+                &stderr,
+                exited.is_some(),
+            )),
+            stdout,
+            stderr,
+        },
+    }
+}
+
 fn print_host() {
     let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
     let named = unsafe { libc::uname(&mut uts) } == 0;
@@ -1031,25 +1120,19 @@ fn android_orchestrate(linux_run: Option<String>, root: Option<String>) -> ExitC
         return ExitCode::from(1);
     }
     let shell = "uid\t2000\ngid\t2000\nseclabel\tu:r:shell:s0\n";
-    let (absent_code, absent_out, absent_err) = run_android(
-        &linux_run,
-        &root,
-        &name,
-        shell,
-        &["/system/bin/service", "check", "manager"],
-        Duration::from_secs(20),
-    );
+    let absent = observe_no_manager(&linux_run, &root, &name, shell);
     println!(
-        "----- service check manager without a context manager exit={absent_code:?} -----\n{absent_out}----- stderr -----\n{absent_err}----- end -----"
+        "----- service check manager without a context manager {} -----\n{}----- stderr -----\n{}----- end -----",
+        absent.headline, absent.stdout, absent.stderr
     );
-    if !absent_out.contains("Unable to get default service manager")
-        || !binder_device_opened(&absent_err)
-    {
-        eprintln!(
-            "android-servicemanager: first blocker: service check did not reach a live driver and report no context manager"
-        );
+    if let Some(why) = absent.blocker {
+        eprintln!("android-servicemanager: first blocker: {why}");
         return ExitCode::from(1);
     }
+    println!(
+        "android-servicemanager no-context-manager {} pid={} (not a service lookup)",
+        absent.kind, absent.pid
+    );
     let sm_id = "uid\t1000\ngid\t1000\ngroups\t1000 3009\nseclabel\tu:r:servicemanager:s0\n";
     let mut sm = spawn_android(
         &linux_run,

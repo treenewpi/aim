@@ -140,12 +140,17 @@ stay the layer's. `linkerconfig/ld.config.txt` is generated.
 because the original `service` waits for that value before it opens
 `/dev/binder`. The area is bionic's property format. It is not a binder
 result, and the original binaries are not modified. Staging does not
-execute either program. `aim-binder-proc android` is the run:
-one binder daemon, then the original `service check manager` with no
-context manager, then the original `servicemanager`, then `service
-list`, `service check manager`, and `service check servicemanager`.
-The harness prints those programs' stdout and stderr. It does not
-invent a service list.
+execute either program. `aim-binder-proc android` is the run: one binder daemon, then the
+original `service check manager` with no context manager, then the
+original `servicemanager`, then `service list`, `service check manager`,
+and `service check servicemanager`. With no context manager this
+`service` binary does not exit. `defaultServiceManager` transacts to
+handle 0, the driver returns `BR_DEAD_REPLY`, and the client sleeps and
+tries again. The harness records that reply and the following
+`nanosleep`, stops the still-running client, and only then starts
+servicemanager. It prints the original stdout and stderr. It does not
+invent a service list or the line `Unable to get default service
+manager`.
 
 `TMPDIR` has to be short enough for the daemon socket path. Do not pass
 `--fetch`. The layer is the 733630886-byte cache already used for
@@ -158,6 +163,7 @@ git rev-parse HEAD
 cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
 cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
 cargo build --locked -p aim-linux-abi --release --bin linux-run
+cargo test --locked -p aim-vdso-retry
 ./target/release/bionic-smoke --prepare
 ./target/release/bionic-smoke --prepare-servicemanager
 ./target/release/aim-binder-proc android ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
@@ -169,9 +175,19 @@ machine=arm64` and `pagesize=16384`. A pass is all of these, from that
 process:
 
 - `android-servicemanager original-binary not-synthetic`
-- `service check manager` before servicemanager starts prints
-  `Unable to get default service manager`, and its stderr has a completed
-  `openat(-100, "/dev/binder", ...) = <fd>`
+- `cargo test --locked -p aim-vdso-retry` exits 0. That checks the
+  commpage retry encodings. It does not execute the syscall fallback
+- before servicemanager starts, `service check manager` either keeps
+  running after a completed `openat` of `"/dev/binder"` (AT_FDCWD prints
+  as `-100` or `0xffffff9c`) whose result is a file descriptor, a
+  `BINDER_WRITE_READ` (`0xc0306201`) leave of 0, a
+  `[linux-abi] binder-read` line whose commands include `BR_DEAD_REPLY`
+  and not `BR_REPLY`, and a later `nanosleep` leave of 0, or it exits
+  and its own stdout contains `Unable to get default service manager`.
+  Stdout must not contain `Service manager: found`. The harness then
+  prints `android-servicemanager no-context-manager waiting` or
+  `exited`, and `(not a service lookup)`. It stops a client that is
+  still waiting. That line is the absence, not `android-servicemanager ok`
 - servicemanager stays up, and its pid is distinct from the daemon
 - `service list` exits 0 and its stdout contains
   `manager: [android.os.IServiceManager]`
@@ -191,6 +207,23 @@ input. A harness deadline is the observation window. It is not a fix
 for a guest that never returns. This is still not ART or a reDroid
 boot. Linux tests of the staging tool do not satisfy this section.
 
+`cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
+including the AIDL services. `cargo test -p aim-vdso-retry` does not.
+The fallback branch itself is taken only when the commpage offset
+changes between the two loads. A clock read that returns without a
+`clock_gettime` syscall used the fast path and did not execute the
+fallback.
+
+Commit `141f705` on this branch was run on an M4, macOS 26.5.1
+(25F80), Darwin 25.5.0, 16 KiB pages. The vDSO busy loop was gone.
+Original `service check manager` opened `/dev/binder` and its
+`BINDER_WRITE_READ` calls returned 0, then the thread slept in
+`nanosleep`. Stdout stayed empty for the harness window, so
+servicemanager was not started. That wait is this binary's no-manager
+loop, not a parked ioctl. The same run's `toybox date` printed the
+current epoch and did not enter the clock syscall, so the eight-try
+fallback was not executed there.
+
 Commit `681b331` on this branch was run on an M4, macOS 26.5.1
 (25F80), Darwin 25.5.0, 16 KiB pages. Staging hashes matched. With no
 context manager, original `service check manager` produced no stdout
@@ -198,10 +231,11 @@ and no completed `openat` of `/dev/binder`. The main thread stayed in
 the anonymous vDSO at `0x80049f50b8` (`mrs x12, S3_4_C15_C10_6`) and
 `0x80049f50bc` (the second load of the commpage timebase offset). The
 caller was `android::base::WaitForProperty` via bionic
-`clock_gettime`. The following commit bounds that retry and then uses
-the `clock_gettime` syscall. The same vDSO is mapped for every guest,
-so earlier Mac results for guests that call `clock_gettime` were not
-re-run after this change and are not a new acceptance of it.
+`clock_gettime`. Commit `141f705` bounds that retry and then uses the
+`clock_gettime` syscall. That Mac re-ran the bionic, host binder, and
+synthetic guest checks, and `toybox date` printed the current time.
+Those reads took the fast path, so the fallback syscall was not the
+path measured.
 
 ## Synthetic ELF
 

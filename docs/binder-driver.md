@@ -118,9 +118,12 @@ pinned reDroid layer are the next guest on that path
 (`bionic-smoke --prepare-servicemanager`, then `aim-binder-proc android`).
 The staged root adds a generated `servicemanager.ready=true` property
 area so the original client can leave `WaitForProperty` and open
-`/dev/binder`. The vDSO's commpage timebase retry is bounded and then
-takes the `clock_gettime` syscall; an open retry never returned on the
-M4 sample of that client. Neither change is a binder result.
+`/dev/binder`. That value is the test root, not a property service.
+The vDSO's commpage timebase retry is bounded and then takes the
+`clock_gettime` syscall. With no context manager the original
+`service` keeps transacting: the driver returns `BR_DEAD_REPLY` in the
+read buffer and the client sleeps. The harness records that and stops
+the client. It does not treat the wait as a successful lookup.
 A Linux staging of those files is not the run, and neither is a Linux
 VM or container on the Mac. Acceptance is the Mac command in
 [mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host

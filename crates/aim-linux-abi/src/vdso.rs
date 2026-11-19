@@ -460,6 +460,58 @@ pub fn rt_sigreturn() -> u64 {
     BASE.load(Relaxed) + (TEXT_OFF + at) as u64
 }
 
+/// The translated vDSO text. The commpage retry check reads it without
+/// the rest of this crate's tests.
+pub fn translated_text() -> Vec<u8> {
+    let image = build();
+    let len = aim_vdso_end as usize - aim_vdso_start as usize;
+    image[TEXT_OFF..TEXT_OFF + len].to_vec()
+}
+
+/// Eight tries, then a branch out. `w17` is the monotonic counter retry
+/// and `w16` the wall-clock generation retry. An open `b.ne` has no `subs`.
+pub fn commpage_retry_is_bounded(text: &[u8]) -> Result<(), String> {
+    if text.len() % 4 != 0 || text.is_empty() {
+        return Err(format!("vDSO text length {}", text.len()));
+    }
+    let words: Vec<u32> = text
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    let count = |word: u32| words.iter().filter(|w| **w == word).count();
+    if count(0x5280_0111) != 3 {
+        return Err(format!("mov w17, #8 x{}", count(0x5280_0111)));
+    }
+    if count(0x5280_0110) != 2 {
+        return Err(format!("mov w16, #8 x{}", count(0x5280_0110)));
+    }
+    let bounded = |subs: u32, label: &str| -> Result<(), String> {
+        let mut seen = 0;
+        for (index, word) in words.iter().enumerate() {
+            if *word != subs {
+                continue;
+            }
+            let next = words.get(index + 1).copied().unwrap_or(0);
+            let after = words.get(index + 2).copied().unwrap_or(0);
+            // b.cond, then an unconditional b out of the loop.
+            if next >> 24 != 0x54 || after >> 26 != 0b000101 {
+                return Err(format!("{label} at {index} is not a bounded branch"));
+            }
+            seen += 1;
+        }
+        if seen == 0 {
+            return Err(format!("{label} missing"));
+        }
+        Ok(())
+    };
+    bounded(0x7100_0631, "subs w17, w17, #1")?;
+    bounded(0x7100_0610, "subs w16, w16, #1")?;
+    if count(0x7100_0631) != 3 || count(0x7100_0610) != 2 {
+        return Err("retry count".into());
+    }
+    Ok(())
+}
+
 /// What `/proc/<pid>/maps` names the mapping at `addr`: `[vvar]`, `[vdso]`.
 pub fn name_of(addr: u64) -> Option<&'static str> {
     let base = BASE.load(Relaxed);
@@ -593,17 +645,6 @@ mod tests {
                 .all(|w| a64::classify(u32::from_le_bytes(w.try_into().unwrap())).is_none()),
             "an svc left in the vDSO"
         );
-        // The commpage retry is `mov w17, #8` / `subs w17, w17, #1`, and the
-        // wall-clock generation retry is the same with w16. An open `b.ne`
-        // has neither. Three ABSTIME sites, two REALTIME sites.
-        let words: Vec<u32> = text
-            .chunks(4)
-            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-            .collect();
-        let count = |word| words.iter().filter(|w| **w == word).count();
-        assert_eq!(count(0x5280_0111), 3, "mov w17, #8");
-        assert_eq!(count(0x7100_0631), 3, "subs w17, w17, #1");
-        assert_eq!(count(0x5280_0110), 2, "mov w16, #8");
-        assert_eq!(count(0x7100_0610), 2, "subs w16, w16, #1");
+        commpage_retry_is_bounded(text).unwrap();
     }
 }
