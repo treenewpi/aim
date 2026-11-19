@@ -29,6 +29,11 @@ pub const BOOTSTRAP_LINKER_SHA256: &str =
     "85284627f597726c152445292fd89d63895cd12d80ed97b3d97256da2db8a8ec";
 pub const LIBBINDER_SHA256: &str =
     "988b365aa7f0907942bf0685956ab86089c6304302f9013fcb2016efe18aa401";
+/// Original `libbinder_ndk.so` from the pinned layer. The probe links it.
+pub const LIBBINDER_NDK_SHA256: &str =
+    "3eed4eb5a9adba460f510abd749559fb499f8d95aed84cdbe50c55cb722d79c6";
+/// Generated guest that calls that library. Not an image file.
+pub const PROBE_SHA256: &str = "534870e72befe36ebfe57880e635718ac4af46267d91dcb4e3c10beebd97663a";
 pub const PLAT_SEPOLICY_SHA256: &str =
     "c3390caf754eb7924b638c9f1a156336e80391fae12afbccb56ba01faa790883";
 pub const LIBDL_ANDROID_SHA256: &str =
@@ -45,6 +50,7 @@ const EXACT: &[&str] = &[
     "system/lib64/libselinux.so",
     "system/lib64/libperfetto_c.so",
     "system/lib64/libbinder.so",
+    "system/lib64/libbinder_ndk.so",
     "system/lib64/libutils.so",
     "system/lib64/libc++.so",
     "system/lib64/libtinyxml2.so",
@@ -101,6 +107,7 @@ pub fn prepare_manager() -> Result<PathBuf, String> {
     copy_tree(&bionic, &root)?;
     extract_originals(&layer, &root)?;
     copy_apex_libdl(&root)?;
+    write_probe(&root)?;
     let config = root.join("linkerconfig/ld.config.txt");
     fs::write(&config, linker_config()).map_err(|e| e.to_string())?;
     write_ready_property(&root)?;
@@ -209,6 +216,26 @@ fn audit(root: &Path) -> Result<(), String> {
         BOOTSTRAP_LINKER_SHA256,
     )?;
     check_hash(root, "system/lib64/libbinder.so", LIBBINDER_SHA256)?;
+    check_hash(root, "system/lib64/libbinder_ndk.so", LIBBINDER_NDK_SHA256)?;
+    check_hash(root, "system/bin/libbinder-ping", PROBE_SHA256)?;
+    let probe =
+        read_elf(&fs::read(root.join("system/bin/libbinder-ping")).map_err(|e| e.to_string())?)?;
+    if probe.interp.as_deref() != Some("/system/bin/linker64") {
+        return Err(format!("libbinder-ping interpreter {:?}", probe.interp));
+    }
+    require_arm64(&probe, "libbinder-ping")?;
+    if !probe.needed.iter().any(|n| n == "libbinder_ndk.so")
+        || !probe.needed.iter().any(|n| n == "libc.so")
+    {
+        return Err(format!("libbinder-ping NEEDED {:?}", probe.needed));
+    }
+    let ndk = read_elf(
+        &fs::read(root.join("system/lib64/libbinder_ndk.so")).map_err(|e| e.to_string())?,
+    )?;
+    require_arm64(&ndk, "libbinder_ndk.so")?;
+    for lib in probe.needed.iter().chain(ndk.needed.iter()) {
+        resolve_lib(root, lib)?;
+    }
     check_hash(
         root,
         "system/etc/selinux/plat_sepolicy.cil",
@@ -315,6 +342,14 @@ fn require_arm64(info: &super::ElfInfo, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn write_probe(root: &Path) -> Result<(), String> {
+    let path = root.join("system/bin/libbinder-ping");
+    fs::write(&path, include_bytes!("../probe/libbinder-ping"))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    set_mode(&path, 0o755)?;
+    Ok(())
+}
+
 fn check_hash(root: &Path, rel: &str, expect: &str) -> Result<(), String> {
     let hash = sha256_file(&root.join(rel))?;
     if hash != expect {
@@ -329,7 +364,7 @@ pub const READY_PROPERTY: &str = "servicemanager.ready";
 const READY_CONTEXT: &str = "u:object_r:default_prop:s0";
 
 fn write_ready_property(root: &Path) -> Result<(), String> {
-    use aim_android_init::props::{NoWake, PropertyAreas, PropertyInfoEntry, build_trie};
+    use aim_android_init::props::{build_trie, NoWake, PropertyAreas, PropertyInfoEntry};
 
     let info = build_trie(
         &[PropertyInfoEntry::new(
@@ -382,6 +417,12 @@ fn write_provenance(root: &Path, layer: &Path) -> Result<(), String> {
          generated linkerconfig/ld.config.txt\n\
          generated dev/__properties__ servicemanager.ready=true\n\
          generated_property_is_not_a_binder_result true\n\
+         generated_property_is_not_a_property_service true\n\
+         original system/lib64/libbinder_ndk.so\n\
+         generated system/bin/libbinder-ping\n\
+         probe_links_original_libbinder_ndk true\n\
+         probe_is_not_an_original_image_file true\n\
+         probe_is_not_the_synthetic_binder_pie true\n\
          selinux_texts original plat_sepolicy.cil and service contexts\n\
          selinux_decisions the existing permissive runtime, not a policy loaded from this root\n\
          acceptance_platform apple-silicon-macos-xnu\n\
@@ -438,6 +479,8 @@ mod tests {
             LIBBINDER_SHA256,
             PLAT_SEPOLICY_SHA256,
             LIBDL_ANDROID_SHA256,
+            LIBBINDER_NDK_SHA256,
+            PROBE_SHA256,
         ] {
             assert_eq!(hash.len(), 64);
         }
@@ -454,6 +497,20 @@ mod tests {
         assert_eq!(reader.read(info).unwrap().value, "true");
         assert!(prop.join("property_info").is_file());
         assert!(prop.join("properties_serial").is_file());
+        let probe_bytes = include_bytes!("../probe/libbinder-ping");
+        let probe = read_elf(probe_bytes).unwrap();
+        assert_eq!(probe.machine, 183);
+        assert_eq!(probe.interp.as_deref(), Some("/system/bin/linker64"));
+        assert!(probe.needed.iter().any(|n| n == "libbinder_ndk.so"));
+        assert!(probe.needed.iter().any(|n| n == "libc.so"));
+        assert!(probe.aligns.iter().all(|align| *align >= 16384));
+        let text = String::from_utf8_lossy(probe_bytes);
+        assert!(text.contains("binder reply: value="));
+        assert!(text.contains("serving %s pid="));
+        assert!(text.contains("binder missing:"));
+        let file = dir.join("libbinder-ping");
+        fs::write(&file, probe_bytes).unwrap();
+        assert_eq!(sha256_file(&file).unwrap(), PROBE_SHA256);
         let _ = fs::remove_dir_all(&dir);
         assert!(!binder_device_opened(
             "openat(\"/dev/binder\"\n[linux] ioctl(0x3, 0x1, 0x2)\n"
@@ -489,6 +546,16 @@ mod tests {
         assert!(note.contains("executed false"));
         assert!(note.contains("linux_stage_is_not_acceptance true"));
         assert!(note.contains("generated dev/__properties__ servicemanager.ready=true"));
+        assert!(note.contains("probe_is_not_an_original_image_file true"));
+        assert!(note.contains("generated_property_is_not_a_property_service true"));
+        assert_eq!(
+            sha256_file(&root.join("system/lib64/libbinder_ndk.so")).unwrap(),
+            LIBBINDER_NDK_SHA256
+        );
+        assert_eq!(
+            sha256_file(&root.join("system/bin/libbinder-ping")).unwrap(),
+            PROBE_SHA256
+        );
         let ready = fs::read(root.join("dev/__properties__").join(READY_CONTEXT)).unwrap();
         let reader = aim_android_init::props::PropAreaReader::new(&ready).unwrap();
         let found = reader.find(READY_PROPERTY).unwrap();

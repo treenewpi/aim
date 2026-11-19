@@ -53,6 +53,40 @@ pub fn absence_blocker(stdout: &str, stderr: &str, exited: bool) -> String {
         .into()
 }
 
+/// `serving NAME pid=N` from the libbinder probe. The pid is the one
+/// the probe printed, not a pid the harness invented.
+pub fn serving_pid(stdout: &str, name: &str) -> Option<u32> {
+    let prefix = format!("serving {name} pid=");
+    stdout.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
+
+/// `binder reply: value=N server_pid=S caller_pid=C`.
+pub fn parcel_reply(stdout: &str) -> Option<(u32, u32, u32)> {
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("binder reply: value=") else {
+            continue;
+        };
+        let (value, rest) = rest.split_once(" server_pid=")?;
+        let (server, caller) = rest.split_once(" caller_pid=")?;
+        return Some((
+            value.parse().ok()?,
+            server.parse().ok()?,
+            caller.parse().ok()?,
+        ));
+    }
+    None
+}
+
+/// A binder-read line whose command words include `name` as a whole word.
+pub fn saw_return(stderr: &str, name: &str) -> bool {
+    stderr.lines().any(|line| {
+        binder_read_commands(line).is_some_and(|commands| commands.iter().any(|c| *c == name))
+    })
+}
+
 fn binder_read_commands(line: &str) -> Option<Vec<&str>> {
     let rest = line.strip_prefix("[linux-abi] binder-read ")?;
     let mut parts = rest.split_whitespace();
@@ -137,7 +171,10 @@ fn binder_device_opened(stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{absence_blocker, binder_device_opened, dead_reply_then_sleep, no_manager_outcome};
+    use super::{
+        absence_blocker, binder_device_opened, dead_reply_then_sleep, no_manager_outcome,
+        parcel_reply, saw_return, serving_pid,
+    };
 
     fn trace(open_dirfd: &str, extra: &str) -> String {
         format!(
@@ -215,5 +252,21 @@ mod tests {
         assert_eq!(no_manager_outcome("", stderr, false), None);
         let why = absence_blocker("", stderr, false);
         assert!(why.contains("BR_DEAD_REPLY"), "{why}");
+    }
+
+    #[test]
+    fn a_probe_reply_names_both_pids() {
+        let stdout = "binder reply: value=2 server_pid=10 caller_pid=11\n";
+        assert_eq!(parcel_reply(stdout), Some((2, 10, 11)));
+        assert_eq!(
+            serving_pid("serving dev.aim.ping pid=10\n", "dev.aim.ping"),
+            Some(10)
+        );
+        let stderr = "[linux-abi] binder-read fd=3 BR_NOOP BR_REPLY\n";
+        assert!(saw_return(stderr, "BR_REPLY"));
+        assert!(!saw_return(
+            "[linux-abi] binder-read fd=3 BR_NOOP BR_DEAD_REPLY\n",
+            "BR_REPLY"
+        ));
     }
 }

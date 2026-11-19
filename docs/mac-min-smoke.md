@@ -207,6 +207,80 @@ input. A harness deadline is the observation window. It is not a fix
 for a guest that never returns. This is still not ART or a reDroid
 boot. Linux tests of the staging tool do not satisfy this section.
 
+Commit `3cc6a057a27184ec3c841190f95a5020e99667fd` passed that matrix
+twice on an M4, macOS 26.5.1 (25F80), Darwin 25.5.0, 16 KiB pages.
+servicemanager pids 89938 and 89956. `service list` exited 0 with
+`manager: [android.os.IServiceManager]`. `service check manager` printed
+`Service manager: found`. `service check servicemanager` printed
+`Service servicemanager: not found`. Each exited 0, opened `/dev/binder`,
+and the read buffer contained `BR_REPLY`. The no-context-manager clients
+89935 and 89953 showed `BR_DEAD_REPLY`, an ioctl leave of 0, and a
+`nanosleep` leave of 0. The harness stopped those still-waiting
+processes. That stop is not a successful lookup. `cargo test -p
+aim-vdso-retry` and the absence checks passed on that Mac. The bionic,
+host binder, and synthetic guest checks passed again. The eight-try
+vDSO fallback still was not the path `toybox date` took. The log archive
+is `768710b7cc6979ffd6c0d9dd63b8d08618730fe1760fcf9b099065d377f389e2`.
+
+## libbinder addService
+
+`aim-binder-proc libbinder` uses the same original servicemanager and
+the same binder daemon. It adds `system/lib64/libbinder_ndk.so` from the
+pinned layer and `system/bin/libbinder-ping`. The second file is a
+generated probe: the source is `crates/aim-bionic-smoke/probe/`, and the
+ELF checked in next to it is what prepare installs. It is not an
+original image file and not the synthetic binder PIE. It calls
+`AServiceManager_addService` and `AIBinder_transact` in the original
+`libbinder_ndk.so`. The generated `servicemanager.ready=true` area is
+still only the test root. It is not a property service. This is not a
+reDroid boot.
+
+Re-run `--prepare-servicemanager` so the root contains the new files.
+Do not pass `--fetch`.
+
+```sh
+git fetch origin cursor/binder-fd-elf-smoke-602d
+git checkout cursor/binder-fd-elf-smoke-602d
+git rev-parse HEAD
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
+cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+./target/release/bionic-smoke --prepare
+./target/release/bionic-smoke --prepare-servicemanager
+./target/release/aim-binder-proc libbinder ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
+```
+
+`git rev-parse HEAD` has to be the commit that contains this probe.
+The log has to include `host sysname=Darwin machine=arm64` and
+`pagesize=16384`. A pass is all of:
+
+- `libbinder-ping original-libbinder_ndk not-synthetic`
+- before addService, `service check dev.aim.ping` exits 0, stdout
+  contains `Service dev.aim.ping: not found`, stderr completed
+  `openat` of `/dev/binder`, and a binder-read line contains `BR_REPLY`
+- the serve guest prints `serving dev.aim.ping pid=<its linux-run pid>`
+  and stays up; that pid is distinct from the daemon and servicemanager
+- `service check dev.aim.ping` then exits 0, stdout contains
+  `Service dev.aim.ping: found`, and stderr has `BR_REPLY`
+- the call guest exits 0 and its stdout contains the line
+  `binder reply: value=2 server_pid=<serve pid> caller_pid=<call pid>`
+  with those pids equal to the two linux-run pids; stderr opened
+  `/dev/binder` and contains `BR_REPLY`
+- after the harness kills the server, `service check dev.aim.ping`
+  exits 0, stdout contains `Service dev.aim.ping: not found`, and
+  stderr contains `BR_REPLY`
+- `libbinder-ping call` then exits 1, stdout contains
+  `binder missing: dev.aim.ping`, and stderr contains `BR_REPLY`
+- `libbinder-ping daemon=… servicemanager=… server=… caller=…` and
+  `libbinder-ping ok`
+- the daemon name is gone, and no `linux-run` or `aim-binder-proc` remains
+
+`libbinder-ping: first blocker:` is not a pass. Keep that command's pid,
+exit code, and the original stdout and stderr. `libbinder-ping ok` is
+this registration and one Parcel call. It is not ART, zygote, or a boot.
+The vDSO fallback branch is still unmeasured. Linux tests do not
+satisfy this section.
+
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.
 The fallback branch itself is taken only when the commpage offset

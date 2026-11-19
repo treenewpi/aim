@@ -20,8 +20,12 @@
 //! and that wait, then stops the client. It does not print a service
 //! list. Acceptance is that run on Apple Silicon macOS/XNU,
 //! with the host platform, page size, commit, pids, exit codes, and the
-//! original transaction text. A Linux run is not that result. The
-//! host-only subcommands stay as they are.
+//! original transaction text. `libbinder LINUX_RUN ROOT` keeps that
+//! servicemanager and adds one generated probe, linked to the original
+//! `libbinder_ndk.so`, which registers a service. A second guest calls
+//! it. That probe is not an image file and not the synthetic binder PIE.
+//! A Linux run is not that result. The host-only subcommands stay as
+//! they are.
 //!
 //! An ioctl that is still blocked after 15s exits 101. This process raises
 //! only its own soft `NOFILE` when the hard limit allows 4096.
@@ -70,11 +74,13 @@ fn main() -> ExitCode {
         Some("dead") => dead(&need(&mut args)),
         Some("guest") => guest_orchestrate(args.next(), args.next()),
         Some("android") => android_orchestrate(args.next(), args.next()),
+        Some("libbinder") => libbinder_orchestrate(args.next(), args.next()),
         _ => {
             eprintln!(
                 "usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]\n       \
                  aim-binder-proc guest LINUX_RUN GUEST\n       \
-                 aim-binder-proc android LINUX_RUN ROOT"
+                 aim-binder-proc android LINUX_RUN ROOT\n       \
+                 aim-binder-proc libbinder LINUX_RUN ROOT"
             );
             ExitCode::from(2)
         }
@@ -1232,6 +1238,323 @@ fn android_orchestrate(linux_run: Option<String>, root: Option<String>) -> ExitC
     );
     println!("android-servicemanager ok");
     ExitCode::SUCCESS
+}
+
+/// Original servicemanager, then a generated probe that calls the image's
+/// `libbinder_ndk`. One guest `addService`s. Another guest, and the
+/// original `service` binary, look it up. The call's stdout is the Parcel
+/// the service wrote. Killing the server has to make the name disappear.
+fn libbinder_orchestrate(linux_run: Option<String>, root: Option<String>) -> ExitCode {
+    let (Some(linux_run), Some(root)) = (linux_run, root) else {
+        eprintln!("usage: aim-binder-proc libbinder LINUX_RUN ROOT");
+        return ExitCode::from(2);
+    };
+    let linux_run = PathBuf::from(linux_run);
+    let root = PathBuf::from(root);
+    let probe = root.join("system/bin/libbinder-ping");
+    if !linux_run.is_file()
+        || !root.join("system/bin/servicemanager").is_file()
+        || !probe.is_file()
+        || !root.join("system/lib64/libbinder_ndk.so").is_file()
+    {
+        eprintln!(
+            "aim-binder-proc libbinder: missing linux-run, servicemanager, libbinder_ndk.so, or {}",
+            probe.display()
+        );
+        eprintln!(
+            "aim-binder-proc libbinder: run bionic-smoke --prepare-servicemanager on this commit first"
+        );
+        return ExitCode::from(2);
+    }
+    raise_nofile(true);
+    println!("libbinder-ping original-libbinder_ndk not-synthetic");
+    print_host();
+    let exe = std::env::current_exe().unwrap_or_else(|error| {
+        eprintln!("aim-binder-proc: current_exe: {error}");
+        std::process::exit(1);
+    });
+    let name = format!("dev.aim.libbinder.{}", std::process::id());
+    let service = "dev.aim.ping";
+    let mut kids = Kids::default();
+    kids.push(spawn(&exe, &["daemon", &name]));
+    let daemon_pid = kids.pids[0];
+    if !wait_until(Duration::from_secs(5), || Client::connect(&name).is_some()) {
+        eprintln!("libbinder-ping: first blocker: daemon did not check in {name}");
+        return ExitCode::from(1);
+    }
+    let shell = "uid\t2000\ngid\t2000\nseclabel\tu:r:shell:s0\n";
+    let sm_id = "uid\t1000\ngid\t1000\ngroups\t1000 3009\nseclabel\tu:r:servicemanager:s0\n";
+    let mut sm = spawn_android(
+        &linux_run,
+        &root,
+        &name,
+        sm_id,
+        &["/system/bin/servicemanager"],
+    );
+    let sm_pid = sm.child.id();
+    if !servicemanager_opened(&mut sm, sm_pid) {
+        return ExitCode::from(1);
+    }
+    let (miss_code, miss_out, miss_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "check", service],
+        Duration::from_secs(15),
+    );
+    println!(
+        "----- service check {service} before addService exit={miss_code:?} stdout -----\n{miss_out}----- stderr -----\n{miss_err}----- end -----"
+    );
+    let absent_line = format!("Service {service}: not found");
+    if miss_code != Some(0)
+        || !miss_out.contains(&absent_line)
+        || !binder_device_opened(&miss_err)
+        || !aim_binder_driver::absence::saw_return(&miss_err, "BR_REPLY")
+    {
+        eprintln!(
+            "libbinder-ping: first blocker: the name was not reported missing before addService"
+        );
+        return ExitCode::from(1);
+    }
+    let mut server = spawn_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/libbinder-ping", "serve", service],
+    );
+    let server_pid = server.child.id();
+    let printed = match wait_serving(&mut server, service, Duration::from_secs(8)) {
+        Ok(pid) => pid,
+        Err(text) => {
+            eprintln!("libbinder-ping: first blocker: serve did not register\n{text}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "----- libbinder-ping serve pid={server_pid} stdout -----\n{}----- stderr -----\n{}----- end -----",
+        server.stdout(),
+        server.stderr()
+    );
+    if printed != server_pid || !binder_device_opened(&server.stderr()) {
+        eprintln!(
+            "libbinder-ping: first blocker: serve pid printed {printed}, linux-run pid {server_pid}, binder open {}",
+            binder_device_opened(&server.stderr())
+        );
+        return ExitCode::from(1);
+    }
+    let found_line = format!("Service {service}: found");
+    let (found_code, found_out, found_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "check", service],
+        Duration::from_secs(15),
+    );
+    println!(
+        "----- service check {service} after addService exit={found_code:?} stdout -----\n{found_out}----- stderr -----\n{found_err}----- end -----"
+    );
+    if found_code != Some(0)
+        || !found_out.contains(&found_line)
+        || !binder_device_opened(&found_err)
+        || !aim_binder_driver::absence::saw_return(&found_err, "BR_REPLY")
+    {
+        eprintln!(
+            "libbinder-ping: first blocker: original service check did not get a reply for {service}"
+        );
+        return ExitCode::from(1);
+    }
+    let mut caller = spawn_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/libbinder-ping", "call", service],
+    );
+    let caller_pid = caller.child.id();
+    let call_status = wait_exit(&mut caller, Duration::from_secs(15));
+    let call_code = call_status.and_then(|status| status.code());
+    let call_out = caller.stdout();
+    let call_err = caller.stderr();
+    println!(
+        "----- libbinder-ping call pid={caller_pid} exit={call_code:?} stdout -----\n{call_out}----- stderr -----\n{call_err}----- end -----"
+    );
+    let reply = aim_binder_driver::absence::parcel_reply(&call_out);
+    let Some((value, reply_server, reply_caller)) = reply else {
+        eprintln!("libbinder-ping: first blocker: call did not print a parcel reply");
+        return ExitCode::from(1);
+    };
+    if call_code != Some(0)
+        || value != 2
+        || reply_server != server_pid
+        || reply_caller != caller_pid
+        || !binder_device_opened(&call_err)
+        || !aim_binder_driver::absence::saw_return(&call_err, "BR_REPLY")
+    {
+        eprintln!(
+            "libbinder-ping: first blocker: parcel value={value} server_pid={reply_server} caller_pid={reply_caller} exit={call_code:?}; linux-run serve={server_pid} call={caller_pid}"
+        );
+        return ExitCode::from(1);
+    }
+    if server.child.try_wait().ok().flatten().is_some() {
+        eprintln!("libbinder-ping: first blocker: the service process exited before the call");
+        return ExitCode::from(1);
+    }
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+    let gone = wait_name_gone(&linux_run, &root, &name, shell, service, &absent_line);
+    if !gone {
+        eprintln!(
+            "libbinder-ping: first blocker: {service} was still registered after the server exited"
+        );
+        return ExitCode::from(1);
+    }
+    let (dead_code, dead_out, dead_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/libbinder-ping", "call", service],
+        Duration::from_secs(15),
+    );
+    println!(
+        "----- libbinder-ping call after death exit={dead_code:?} stdout -----\n{dead_out}----- stderr -----\n{dead_err}----- end -----"
+    );
+    let missing_line = format!("binder missing: {service}");
+    if dead_code != Some(1)
+        || !dead_out.contains(&missing_line)
+        || !binder_device_opened(&dead_err)
+        || !aim_binder_driver::absence::saw_return(&dead_err, "BR_REPLY")
+    {
+        eprintln!(
+            "libbinder-ping: first blocker: a call after the server died did not report the service missing"
+        );
+        return ExitCode::from(1);
+    }
+    let _ = sm.child.kill();
+    let _ = sm.child.wait();
+    kids.pids.clear();
+    if !kids.stop_first(daemon_pid) {
+        eprintln!("libbinder-ping: first blocker: daemon {daemon_pid} did not exit");
+        return ExitCode::from(1);
+    }
+    if !wait_until(Duration::from_secs(2), || Client::connect(&name).is_none()) {
+        eprintln!("libbinder-ping: first blocker: {name} still registered");
+        return ExitCode::from(1);
+    }
+    if reply_caller == server_pid || reply_caller == sm_pid || reply_caller == daemon_pid {
+        eprintln!(
+            "libbinder-ping: first blocker: caller pid {reply_caller} is not a distinct guest"
+        );
+        return ExitCode::from(1);
+    }
+    println!(
+        "libbinder-ping daemon={daemon_pid} servicemanager={sm_pid} server={server_pid} caller={reply_caller}"
+    );
+    println!("libbinder-ping ok");
+    ExitCode::SUCCESS
+}
+
+fn wait_name_gone(
+    linux_run: &Path,
+    root: &Path,
+    name: &str,
+    shell: &str,
+    service: &str,
+    absent_line: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let (code, out, err) = run_android(
+            linux_run,
+            root,
+            name,
+            shell,
+            &["/system/bin/service", "check", service],
+            Duration::from_secs(8),
+        );
+        println!(
+            "----- service check {service} after server exit={code:?} stdout -----\n{out}----- stderr -----\n{err}----- end -----"
+        );
+        if code == Some(0)
+            && out.contains(absent_line)
+            && binder_device_opened(&err)
+            && aim_binder_driver::absence::saw_return(&err, "BR_REPLY")
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn servicemanager_opened(sm: &mut AndroidProc, sm_pid: u32) -> bool {
+    let opened = wait_until(Duration::from_secs(20), || {
+        sm.child.try_wait().ok().flatten().is_some() || binder_device_opened(&sm.stderr())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let opened = opened || binder_device_opened(&sm.stderr());
+    let exited = sm.child.try_wait().ok().flatten().is_some();
+    if exited || !opened {
+        let _ = sm.child.kill();
+        let status = sm.child.wait().ok();
+        let why = if exited {
+            "servicemanager exited"
+        } else {
+            "servicemanager produced no completed openat of /dev/binder within 20s"
+        };
+        eprintln!(
+            "libbinder-ping: first blocker: {why} pid={sm_pid} status={status:?}\n{}\n{}",
+            sm.stdout(),
+            sm.stderr()
+        );
+        return false;
+    }
+    true
+}
+
+fn wait_exit(guest: &mut AndroidProc, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(Some(status)) = guest.child.try_wait() {
+            std::thread::sleep(Duration::from_millis(50));
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = guest.child.kill();
+            return guest.child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_serving(guest: &mut AndroidProc, name: &str, limit: Duration) -> Result<u32, String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(pid) = aim_binder_driver::absence::serving_pid(&guest.stdout(), name) {
+            return Ok(pid);
+        }
+        if let Ok(Some(status)) = guest.child.try_wait() {
+            return Err(format!(
+                "exit={status:?}\n{}\n{}",
+                guest.stdout(),
+                guest.stderr()
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no serving line within {}s\n{}\n{}",
+                limit.as_secs(),
+                guest.stdout(),
+                guest.stderr()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 struct AndroidProc {

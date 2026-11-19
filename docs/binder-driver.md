@@ -114,7 +114,7 @@ path. The check parses leave lines. The open leave is
 `openat(-100, "/dev/binder", 0x80002, 0x0) = <fd>`, because the tracer
 prints the directory fd (`AT_FDCWD`) first; a path substring is not a
 pass. The original `servicemanager` and `service` binaries from the
-pinned reDroid layer are the next guest on that path
+pinned reDroid layer run on that path
 (`bionic-smoke --prepare-servicemanager`, then `aim-binder-proc android`).
 The staged root adds a generated `servicemanager.ready=true` property
 area so the original client can leave `WaitForProperty` and open
@@ -124,6 +124,12 @@ The vDSO's commpage timebase retry is bounded and then takes the
 `service` keeps transacting: the driver returns `BR_DEAD_REPLY` in the
 read buffer and the client sleeps. The harness records that and stops
 the client. It does not treat the wait as a successful lookup.
+`aim-binder-proc libbinder` then runs a generated probe,
+`system/bin/libbinder-ping`, which calls the original `libbinder_ndk.so`
+to `addService` and to transact. The probe is not an image file and not
+the synthetic PIE. A second guest prints the Parcel result and both
+pids. After the server exits, the original `service check` reports the
+name missing.
 A Linux staging of those files is not the run, and neither is a Linux
 VM or container on the Mac. Acceptance is the Mac command in
 [mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host
