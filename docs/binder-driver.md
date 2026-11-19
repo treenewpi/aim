@@ -126,8 +126,10 @@ does not replace the fixture this binder command still uses.
 `aim-binder-proc integrated` uses a third root that drops the fixture.
 Original servicemanager's `SetProperty` is what publishes
 `servicemanager.ready` there, and the original client has to be waiting
-before that set. The `android` and `libbinder` commands stay on the
-seeded root.
+before that set. The server removes `dev/__properties__` on the way
+out, and the next integrated run reclaims only an area marked by
+`property-area-owner-root`. The `android` and `libbinder` commands stay
+on the seeded root.
 The vDSO's commpage timebase retry is bounded and then takes the
 `clock_gettime` syscall. With no context manager the original
 `service` keeps transacting: the driver returns `BR_DEAD_REPLY` in the

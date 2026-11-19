@@ -16,8 +16,8 @@ use aim_binder_driver::absence::{parcel_reply, saw_return};
 
 use super::manager::{copy_tree, manager_root};
 use super::property::{
-    self, emit_guest, finish, launch, opened, stderr_of, stdout_of, PropertyServer, READY,
-    SERVICEMANAGER_IDENTITY, SHELL,
+    self, emit_guest, finish, launch, opened, property_area, reclaim_owned_property_area,
+    stderr_of, stdout_of, PropertyServer, READY, SERVICEMANAGER_IDENTITY, SHELL,
 };
 use super::{binder_device_opened, require_layer, set_mode, sha256_file};
 
@@ -52,12 +52,16 @@ pub fn prepare_integrated() -> Result<PathBuf, String> {
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     copy_tree(&source, &root)?;
     set_mode(&root, 0o755)?;
-    let seeded = root.join("dev/__properties__");
+    let seeded = property_area(&root);
     if seeded.exists() {
         fs::remove_dir_all(&seeded).map_err(|e| format!("remove {}: {e}", seeded.display()))?;
     }
+    let owner = property::property_area_owner(&root);
+    if owner.exists() {
+        fs::remove_file(&owner).map_err(|e| format!("remove {}: {e}", owner.display()))?;
+    }
     property::install_property_clients(&layer, &root)?;
-    if root.join("dev/__properties__").exists() {
+    if property_area(&root).exists() {
         return Err("integrated root still has a property area".into());
     }
     let original = sha256_file(&source.join("system/bin/servicemanager"))?;
@@ -86,6 +90,8 @@ fn write_provenance(root: &Path, layer: &Path) -> Result<(), String> {
          copied_from redroid-16-servicemanager/root\n\
          seeded_servicemanager_ready_removed true\n\
          servicemanager_ready_not_seeded true\n\
+         property_area_removed_when_server_stops true\n\
+         seeded_area_without_owner_still_rejected true\n\
          android_and_libbinder_regression_roots_unchanged true\n\
          property_info_is_default_context_only true\n\
          acceptance_platform apple-silicon-macos-xnu\n\
@@ -116,7 +122,11 @@ pub fn run_integrated(linux_run: &Path, binder_name: &str) -> Result<(), String>
             "integrated root is not staged; run bionic-smoke --prepare-integrated".into(),
         );
     }
-    if root.join("dev/__properties__").exists() {
+    // A previous server may have been killed before Drop. Only an area
+    // that server marked is removed. A seeded area has no mark and still
+    // fails below, so this is not a manual clear of the assertion.
+    reclaim_owned_property_area(&root)?;
+    if property_area(&root).exists() {
         return blocker(
             "integrated root already had a property area",
             "the server must be the process that creates it",
@@ -324,6 +334,9 @@ pub fn run_integrated(linux_run: &Path, binder_name: &str) -> Result<(), String>
     drop(server);
     if root.join("dev/socket/property_service").exists() {
         return blocker("property socket was left behind", "");
+    }
+    if property_area(&root).exists() {
+        return blocker("property area was left behind", "the server must remove the area it created");
     }
     println!(
         "integrated ok client={client_pid} servicemanager={sm_pid} getprop={after_pid} serve={serve_pid} call={call_pid}"

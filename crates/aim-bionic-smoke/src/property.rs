@@ -387,6 +387,57 @@ pub struct PropertyServer {
     log: Arc<Mutex<String>>,
     thread: Option<JoinHandle<()>>,
     socket: PathBuf,
+    area: PathBuf,
+    owner: PathBuf,
+}
+
+/// `dev/__properties__` under a guest root.
+pub(crate) fn property_area(root: &Path) -> PathBuf {
+    root.join("dev/__properties__")
+}
+
+/// Beside the guest root, not inside it. The guest cannot see this file.
+/// It marks an area this process created, so a later run can remove that
+/// leftover without deleting a seeded area that has no mark.
+pub(crate) fn property_area_owner(root: &Path) -> PathBuf {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("root");
+    root.parent()
+        .unwrap_or(root)
+        .join(format!("property-area-owner-{name}"))
+}
+
+const AREA_OWNER_MARK: &str = "property-service\n";
+
+fn owner_is_ours(path: &Path) -> bool {
+    fs::read_to_string(path).ok().as_deref() == Some(AREA_OWNER_MARK)
+}
+
+/// Remove an area this server created and then left behind. A directory
+/// with no owner file stays, so a seeded `servicemanager.ready` fixture
+/// still fails the caller's assertion.
+pub(crate) fn reclaim_owned_property_area(root: &Path) -> Result<(), String> {
+    let area = property_area(root);
+    let owner = property_area_owner(root);
+    let owned = owner_is_ours(&owner);
+    if area.exists() && owned {
+        fs::remove_dir_all(&area).map_err(|e| format!("remove {}: {e}", area.display()))?;
+        let _ = fs::remove_file(&owner);
+    } else if !area.exists() && owned {
+        let _ = fs::remove_file(&owner);
+    }
+    Ok(())
+}
+
+pub(crate) fn release_property_area(area: &Path, owner: &Path) {
+    if area.exists() {
+        let _ = fs::remove_dir_all(area);
+    }
+    if owner.exists() {
+        let _ = fs::remove_file(owner);
+    }
 }
 
 impl PropertyServer {
@@ -394,13 +445,18 @@ impl PropertyServer {
     /// `/dev/socket/property_service`. `servicemanager.ready` is absent.
     /// A peer's context is the file its own `linux-run` published.
     pub fn start(root: &Path) -> Result<Self, String> {
-        let prop_dir = root.join("dev/__properties__");
+        let prop_dir = property_area(root);
+        let owner = property_area_owner(root);
         if prop_dir.exists() {
             fs::remove_dir_all(&prop_dir)
                 .map_err(|e| format!("remove {}: {e}", prop_dir.display()))?;
         }
         fs::create_dir_all(&prop_dir).map_err(|e| e.to_string())?;
         set_mode(&prop_dir, 0o755)?;
+        if let Err(error) = fs::write(&owner, AREA_OWNER_MARK) {
+            let _ = fs::remove_dir_all(&prop_dir);
+            return Err(format!("write {}: {error}", owner.display()));
+        }
         let info = build_trie(&[], DEFAULT_CONTEXT, DEFAULT_TYPE)?;
         fs::write(prop_dir.join(PROPERTY_INFO), &info).map_err(|e| e.to_string())?;
         set_mode(&prop_dir.join(PROPERTY_INFO), 0o444)?;
@@ -452,6 +508,8 @@ impl PropertyServer {
             log,
             thread: Some(thread),
             socket: sock_dir.join("property_service"),
+            area: prop_dir,
+            owner,
         })
     }
 
@@ -471,6 +529,7 @@ impl Drop for PropertyServer {
             let _ = thread.join();
         }
         let _ = fs::remove_file(&self.socket);
+        release_property_area(&self.area, &self.owner);
     }
 }
 
@@ -1045,6 +1104,39 @@ fn take(
 
 /// The success path prints the guest's own stdout, stderr, and the
 /// `linux-run` trace. A count line is not a substitute for that text.
+pub(crate) fn format_guest(
+    role: &str,
+    pid: u32,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "----- {role} pid={pid} exit={exit_code:?} stdout -----\n"
+    ));
+    text.push_str(stdout);
+    if !stdout.is_empty() && !stdout.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("----- {role} pid={pid} stderr -----\n"));
+    text.push_str(stderr);
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("----- end {role} pid={pid} -----\n"));
+    let counts = trace_counts(stderr);
+    text.push_str(&format!(
+        "property-trace {role} pid={pid} exit={exit_code:?} property_info_open={} connect_ok={} futex_enter={} futex_leave={} binder_open={}\n",
+        counts.property_info_open,
+        counts.connect_ok,
+        counts.futex_enter,
+        counts.futex_leave,
+        counts.binder_open
+    ));
+    text
+}
+
 pub(crate) fn emit_guest(
     role: &str,
     pid: u32,
@@ -1052,25 +1144,9 @@ pub(crate) fn emit_guest(
     stdout: &str,
     stderr: &str,
 ) {
-    println!("----- {role} pid={pid} exit={exit_code:?} stdout -----");
-    print!("{stdout}");
-    if !stdout.is_empty() && !stdout.ends_with('\n') {
-        println!();
-    }
-    println!("----- {role} pid={pid} stderr -----");
-    print!("{stderr}");
-    if !stderr.is_empty() && !stderr.ends_with('\n') {
-        println!();
-    }
-    println!("----- end {role} pid={pid} -----");
-    let counts = trace_counts(stderr);
-    println!(
-        "property-trace {role} pid={pid} exit={exit_code:?} property_info_open={} connect_ok={} futex_enter={} futex_leave={} binder_open={}",
-        counts.property_info_open,
-        counts.connect_ok,
-        counts.futex_enter,
-        counts.futex_leave,
-        counts.binder_open
+    print!(
+        "{}",
+        format_guest(role, pid, exit_code, stdout, stderr)
     );
 }
 
@@ -1292,7 +1368,36 @@ mod tests {
         assert_eq!(server.get(VERSION).as_deref(), Some("2"));
         drop(server);
         assert!(!dir.join("dev/socket/property_service").exists());
+        assert!(
+            !property_area(&dir).exists(),
+            "the server removes the area it created"
+        );
+        assert!(!property_area_owner(&dir).exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reclaim_removes_only_an_area_this_server_created() {
+        let parent = std::env::temp_dir().join(format!("aim-area-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        let root = parent.join("root");
+        let area = property_area(&root);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("property_info"), b"seed").unwrap();
+        reclaim_owned_property_area(&root).unwrap();
+        assert!(area.join("property_info").is_file(), "a seed has no owner file");
+        fs::write(property_area_owner(&root), AREA_OWNER_MARK).unwrap();
+        reclaim_owned_property_area(&root).unwrap();
+        assert!(!area.exists());
+        assert!(!property_area_owner(&root).exists());
+        fs::create_dir_all(&area).unwrap();
+        fs::write(property_area_owner(&root), b"not-the-server\n").unwrap();
+        reclaim_owned_property_area(&root).unwrap();
+        assert!(area.exists(), "a foreign marker is not this server");
+        release_property_area(&area, &property_area_owner(&root));
+        assert!(!area.exists());
+        assert!(!property_area_owner(&root).exists());
+        let _ = fs::remove_dir_all(&parent);
     }
 
     fn exchange(root: &Path, request: &[u8]) -> u32 {

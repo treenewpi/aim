@@ -442,7 +442,13 @@ area. `bionic-smoke --prepare-integrated` copies that root to
 `_build/redroid-16-integrated/root`, deletes `dev/__properties__`, and
 adds original `getprop`. `aim-binder-proc integrated LINUX_RUN` starts
 the property service and the binder daemon in one process. It does not
-take a root argument, so it cannot be pointed at the seeded root.
+take a root argument, so it cannot be pointed at the seeded root. The
+server creates the property area and removes it when it stops. A later
+run, including one after the server was killed, removes an area only
+when `property-area-owner-root` beside that root says this server
+created it. A seeded area has no such file and still fails with
+`integrated root already had a property area`. Do not delete the area
+by hand between rounds.
 Original `service check manager` starts first and must stay up with
 `property_info` open and no completed `/dev/binder` open. Original
 servicemanager then `SetProperty`s `servicemanager.ready=true`. The
@@ -469,14 +475,22 @@ cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
 ./target/release/bionic-smoke --prepare-servicemanager
 ./target/release/bionic-smoke --prepare-integrated
 ./target/release/aim-binder-proc integrated ./target/release/linux-run
+./target/release/aim-binder-proc integrated ./target/release/linux-run
 ./target/release/aim-binder-proc android ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
 ./target/release/aim-binder-proc libbinder ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
 ```
 
-`git rev-parse HEAD` has to be the commit that prints the trace blocks
-and adds `integrated`. The property command is the regression whose log
-now has to contain the trace. The integrated command is the new matrix.
-The last two commands are the seeded-root regressions.
+`git rev-parse HEAD` has to be the commit that removes the property
+area on server exit. Run `integrated` twice with no `prepare` and no
+`rm` between them. Both rounds have to print `integrated ok`. The
+property command is the regression whose log has to contain the trace.
+The last two commands are the seeded-root regressions and do not count
+as the integrated matrix. `Cargo.lock` already pins `zlib-rs` 0.6.8
+(`b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112`),
+which `flate2`'s `rust_backend` feature needs. `cargo build --locked`
+downloads that crate into the local registry when it is not there yet.
+`--locked` does not rewrite the lock. A later `--offline` build uses
+the cached crate.
 
 ## Original init probe
 
@@ -491,24 +505,36 @@ any of those calls is unmeasured.
 
 `bionic-smoke --prepare-init` copies the bionic root and adds original
 `/system/bin/init` (interpreter `/system/bin/bootstrap/linker64`) plus
-init's direct `DT_NEEDED` libraries. It does not write a property area.
+the transitive `DT_NEEDED` closure, not only the direct entries. The
+`6d5f448` probe stopped after the direct set: `libext2_uuid.so` was
+missing, needed by `libext4_utils.so`. Provenance lists each copied
+path and its sha256. The root still has no property area.
 `bionic-smoke --init LINUX_RUN` runs that binary for at most eight
-seconds, then prints the pid, exit, stdout, stderr, and
-`init-probe: first observation:`. `init-probe: not a boot` is required.
-There is no `init ok`. A line that only repeats the 2026-09-27 syscall
-list is not the observation.
+seconds. Guest stdout and stderr are files, so a full pipe cannot stall
+the guest or the harness. The full trace is
+`_build/redroid-16-init/init-probe.txt`. The process stdout is the
+observation, the pid, and that path. `init-probe: not a boot` is
+required. There is no `init ok` unless the trace contains
+`init first stage started!`. A line that only repeats the 2026-09-27
+syscall list is not the observation. Commit `6d5f448` on this M4 did
+not reach main: the first failed syscall was `prctl(PR_SET_VMA)`
+EINVAL on a 4 KiB-aligned address, the process continued, and the
+linker then exited because `libext2_uuid.so` was absent.
 
 ```sh
 ./target/release/bionic-smoke --prepare-init
-./target/release/bionic-smoke --init ./target/release/linux-run
+./target/release/bionic-smoke --init ./target/release/linux-run >"$PWD/_build/redroid-16-init/harness.stdout" 2>"$PWD/_build/redroid-16-init/harness.stderr"
 ```
 
-Do not pass `--fetch`. The log has to include `host sysname=Darwin
-machine=arm64` and `pagesize=16384`, the `----- init pid=N -----`
-blocks, and `init-probe: first observation:`. Admission errno 2 is a
-harness failure, not an init result. This is not ART. The vDSO
-eight-try fallback is still unmeasured. `property_contexts` are still
-the default context.
+Do not pass `--fetch`. Do not pipe the probe into another program.
+`harness.stdout` has to include `host sysname=Darwin machine=arm64`
+and `pagesize=16384`, `init-probe: trace file`, and
+`init-probe: first observation:`. `init-probe.txt` has to include the
+`----- init pid=N -----` blocks and the same observation.
+Admission errno 2 is a harness failure, not an init result. This is
+not ART. The vDSO eight-try fallback is still unmeasured.
+`property_contexts` are still the default context. Identity denial is
+still only the host socket test.
 
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.
