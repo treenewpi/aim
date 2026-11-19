@@ -33,7 +33,7 @@ pub const LIBBINDER_SHA256: &str =
 pub const LIBBINDER_NDK_SHA256: &str =
     "3eed4eb5a9adba460f510abd749559fb499f8d95aed84cdbe50c55cb722d79c6";
 /// Generated guest that calls that library. Not an image file.
-pub const PROBE_SHA256: &str = "534870e72befe36ebfe57880e635718ac4af46267d91dcb4e3c10beebd97663a";
+pub const PROBE_SHA256: &str = "3f9489b1edb76c7d8d64ed4d5e92f6425c09c54b006259c6206d662276d873e9";
 pub const PLAT_SEPOLICY_SHA256: &str =
     "c3390caf754eb7924b638c9f1a156336e80391fae12afbccb56ba01faa790883";
 pub const LIBDL_ANDROID_SHA256: &str =

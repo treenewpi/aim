@@ -11,6 +11,11 @@
  * interpreter /system/bin/linker64, -nostdlib -nostartfiles,
  * libbinder_ndk.so and the apex libc.so). The Mac harness does not
  * compile it.
+ *
+ * stdout is a pipe, so bionic fully buffers it. _start then uses
+ * exit_group, which does not flush. On dd8d4fb the caller still exited 0
+ * after BR_REPLY: fstat(1), an anonymous mmap for the buffer, then
+ * exit_group(0), and no write of fd 1. main flushes before returning.
  */
 
 typedef int binder_status_t;
@@ -102,8 +107,14 @@ static int call(const char *name) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 3 && strcmp(argv[1], "serve") == 0) return serve(argv[2]);
-    if (argc == 3 && strcmp(argv[1], "call") == 0) return call(argv[2]);
-    printf("usage: libbinder-ping serve NAME | call NAME\n");
-    return 2;
+    int rc;
+    if (argc == 3 && strcmp(argv[1], "serve") == 0) rc = serve(argv[2]);
+    else if (argc == 3 && strcmp(argv[1], "call") == 0) rc = call(argv[2]);
+    else {
+        printf("usage: libbinder-ping serve NAME | call NAME\n");
+        rc = 2;
+    }
+    /* exit_group does not flush. The reply line has to reach the pipe. */
+    fflush(0);
+    return rc;
 }

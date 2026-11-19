@@ -128,8 +128,9 @@ the client. It does not treat the wait as a successful lookup.
 `system/bin/libbinder-ping`, which calls the original `libbinder_ndk.so`
 to `addService` and to transact. The probe is not an image file and not
 the synthetic PIE. A second guest prints the Parcel result and both
-pids. After the server exits, the original `service check` reports the
-name missing.
+pids. Its stdout is a pipe, so the probe flushes before `exit_group`;
+a `BR_REPLY` with an empty stdout is not that result. After the server
+exits, the original `service check` reports the name missing.
 A Linux staging of those files is not the run, and neither is a Linux
 VM or container on the Mac. Acceptance is the Mac command in
 [mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host

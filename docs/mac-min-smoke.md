@@ -235,7 +235,28 @@ original image file and not the synthetic binder PIE. It calls
 still only the test root. It is not a property service. This is not a
 reDroid boot.
 
-Re-run `--prepare-servicemanager` so the root contains the new files.
+Commit `dd8d4fb32dab7fee10ab859b9a05c48a4e640a27` was run on the same M4
+(macOS 26.5.1, Darwin 25.5.0, arm64, 16 KiB pages, Rust 1.88). The
+original `android` matrix passed once. `libbinder` exited 1. Before
+addService, `service check dev.aim.ping` printed `Service dev.aim.ping:
+not found` (pid 90483, exit 0, open and `BR_REPLY`). The server pid
+90486 printed `serving dev.aim.ping pid=90486` and stayed up. After
+addService, `service check` printed `Service dev.aim.ping: found` (pid
+90489, exit 0, open and `BR_REPLY`). The caller pid 90492 exited 0 with
+empty stdout. Its trace has `BR_REPLY`, then `fstat(1)`, an anonymous
+`mmap`, then `exit_group(0)`, and no `write` or `writev` of fd 1. A
+bounded repro of caller 90569 did the same while servicemanager 90563
+and server 90566 stayed up. The server's own `fflush` had produced
+`write(1, …, 31)`. `exit_group` does not flush bionic's fully buffered
+pipe stdout, so the reply line stayed in the buffer. `BR_REPLY` without
+that line is not a pass. The death checks did not run. The log archive
+is `71c05b89b2217ff57078f4a7cc51d4cbf3c9d73e162fc8c1be6ff41b41d8b517`.
+
+The probe's `main` now calls `fflush` before returning to that
+`exit_group`. The printed text is still the ints read from the Parcel
+and `getpid`. The pass list below is unchanged. Re-run
+`--prepare-servicemanager`: the installed probe hash is
+`3f9489b1edb76c7d8d64ed4d5e92f6425c09c54b006259c6206d662276d873e9`.
 Do not pass `--fetch`.
 
 ```sh
