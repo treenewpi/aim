@@ -507,8 +507,13 @@ any of those calls is unmeasured.
 `/system/bin/init` (interpreter `/system/bin/bootstrap/linker64`) plus
 the transitive `DT_NEEDED` closure, not only the direct entries. The
 `6d5f448` probe stopped after the direct set: `libext2_uuid.so` was
-missing, needed by `libext4_utils.so`. Provenance lists each copied
-path and its sha256. The root still has no property area.
+missing, needed by `libext4_utils.so`. It also copies the layer's
+SELinux property-context files (`system/etc/selinux/plat_property_contexts`
+and the other `PropertyInit` paths when the layer has them) and a `/dev`
+directory. When the layer has no `dev` entry, the directory is an empty
+mount point. Provenance lists each copied path and its sha256, and
+records device nodes under `dev/` that were left in the layer.
+`dev/__properties__` is not copied. The root still has no property area.
 `bionic-smoke --init LINUX_RUN` runs that binary for at most eight
 seconds. Guest stdout and stderr are files, so a full pipe cannot stall
 the guest or the harness. With `--trace`, `linux-run` duplicates stderr
@@ -520,11 +525,9 @@ stderr file is that trace. The full report is
 observation, the pid, and that path. `init-probe: not a boot` is
 required. There is no `init ok` unless the trace contains
 `init first stage started!`. A line that only repeats the 2026-09-27
-syscall list is not the observation. Commit `90882eb` on macmini
-(Darwin 25.5.0) did not reach main: `PR_SET_VMA` returned EBADF for
-`0x80004c5000` length `0x13000` and `0x80002f9000` length `0x1000`, the
-process continued, and the trace stopped at the enter of `dup3` onto
-fd 2. The guest exit status was 6. `libext2_uuid.so` was present.
+syscall list is not the observation. Commit `372d08ff` on macmini
+(Darwin 25.5.0) named those `.bss` ranges, kept the trace past `dup3`
+of fd 2, and exited 6 from `PropertyInit` (see below).
 
 ```sh
 ./target/release/bionic-smoke --prepare-init
@@ -541,8 +544,13 @@ the `dup3` that replaces fd 2. `harness.stdout` also prints
 `----- init pid=N -----` blocks and the same observation.
 Admission errno 2 is a harness failure, not an init result. This is
 not ART. The vDSO eight-try fallback is still unmeasured.
-`property_contexts` are still the default context. Identity denial is
-still only the host socket test.
+Commit `372d08ff` on macmini (Darwin 25.5.0) reached `PropertyInit` and
+exited 6: `mkdir("/dev/__properties__")` returned ENOENT, the platform
+property contexts were absent, and `rt_tgsigqueueinfo` delivered
+SIGABRT. The trace's last line was `exit_group(0x6)`. The compatibility
+property service still uses its default string context. The init probe's
+contexts are the layer's files once `--prepare-init` has copied them.
+Identity denial is still only the host socket test.
 
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.

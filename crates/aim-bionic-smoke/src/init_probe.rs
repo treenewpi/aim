@@ -35,11 +35,43 @@ pub fn init_root() -> PathBuf {
         .join("root")
 }
 
+/// Files `PropertyInit` reads before it serializes property info. The
+/// platform file is the one Android 16 opens first. The others are copied
+/// only when the pinned layer contains them. None of these bytes are
+/// written here.
+const CONTEXT_FILES: &[&str] = &[
+    "system/etc/selinux/plat_property_contexts",
+    "system_ext/etc/selinux/system_ext_property_contexts",
+    "vendor/etc/selinux/vendor_property_contexts",
+    "product/etc/selinux/product_property_contexts",
+    "odm/etc/selinux/odm_property_contexts",
+    "plat_property_contexts",
+    "system_ext_property_contexts",
+    "vendor_property_contexts",
+    "product_property_contexts",
+    "odm_property_contexts",
+];
+
+/// `access` of the platform file decides the branch. The root fallback is
+/// the recovery layout. At least one of them has to come from the layer.
+const REQUIRED_CONTEXTS: &[&str] = &[
+    "system/etc/selinux/plat_property_contexts",
+    "plat_property_contexts",
+];
+
+struct LayerRootFiles {
+    contexts: Vec<String>,
+    dev_from_layer: bool,
+    dev_copied: Vec<String>,
+    dev_skipped: Vec<String>,
+}
+
 /// Copy the bionic root and add original init plus the libraries its
 /// transitive `DT_NEEDED` closure asks for. The measured Mac stop was
 /// `libext2_uuid.so`, needed by `libext4_utils.so`, which is not a direct
-/// dependency of init. Does not write a property area or an init.rc that
-/// would make init look successful.
+/// dependency of init. Also copies the layer's SELinux property-context
+/// files and a `/dev` directory. Does not author a property area, a
+/// context file, or an init.rc that would make init look successful.
 pub fn prepare_init() -> Result<PathBuf, String> {
     let layer = require_layer()?;
     let bionic = guest_root();
@@ -74,19 +106,25 @@ pub fn prepare_init() -> Result<PathBuf, String> {
     for lib in &info.needed {
         super::manager::resolve_lib(&root, lib)?;
     }
+    let root_files = extract_root_files(&layer, &root)?;
     if root.join("dev/__properties__").exists() {
         return Err("init probe root must not contain a property area".into());
     }
-    write_provenance(&root, &layer, &copied)?;
+    if !root.join("dev").is_dir() {
+        return Err("init probe root has no /dev directory".into());
+    }
+    write_provenance(&root, &layer, &copied, &root_files)?;
     for name in ["init-guest.stdout", "init-guest.stderr", "init-probe.txt"] {
         if let Some(parent) = root.parent() {
             let _ = fs::remove_file(parent.join(name));
         }
     }
     println!(
-        "bionic-smoke: original init root {} copied {} closure libraries (staged, not executed)",
+        "bionic-smoke: original init root {} copied {} closure libraries, {} property context files, dev from layer {} (staged, not executed)",
         root.display(),
-        copied.len()
+        copied.len(),
+        root_files.contexts.len(),
+        root_files.dev_from_layer
     );
     println!("bionic-smoke: init-probe is an observation, not a boot");
     Ok(root)
@@ -224,11 +262,139 @@ fn scan_wanted(
     Ok(found)
 }
 
-fn write_provenance(root: &Path, layer: &Path, copied: &[String]) -> Result<(), String> {
+/// `372d08ff` on macmini reached Android 16 `PropertyInit` and aborted.
+/// `mkdir("/dev/__properties__", 0711)` returned ENOENT because `/dev` was
+/// not a directory (`/dev/null` still opens: it is a host device node).
+/// `access("/system/etc/selinux/plat_property_contexts")` and the fallback
+/// `open("/plat_property_contexts")` returned ENOENT, so init never wrote
+/// `property_info` and `LOG(FATAL)` delivered SIGABRT to itself. Those
+/// context files are copied from the layer. `/dev` is the layer's
+/// directory when the layer has one, otherwise an empty mount point.
+/// `dev/__properties__` is not copied and is not created.
+fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, String> {
+    let file = File::open(layer).map_err(|e| format!("open {}: {e}", layer.display()))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read layer tar: {e}"))?;
+    let mut contexts = Vec::new();
+    let mut dev_from_layer = false;
+    let mut dev_copied = Vec::new();
+    let mut dev_skipped = Vec::new();
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let raw = entry
+            .path()
+            .map_err(|e| format!("tar path: {e}"))?
+            .into_owned();
+        let name = tar_rel(&raw);
+        if property_area_rel(&name) {
+            continue;
+        }
+        if context_rel(&name) {
+            let dest = root.join(&name);
+            if !dest.exists() {
+                write_entry(&mut entry, &dest)?;
+            }
+            contexts.push(name);
+            continue;
+        }
+        if !dev_rel(&name) {
+            continue;
+        }
+        dev_from_layer = true;
+        let kind = entry.header().entry_type();
+        let dest = root.join(&name);
+        if kind.is_dir() {
+            fs::create_dir_all(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+            let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
+            set_mode(&dest, mode)?;
+            continue;
+        }
+        if kind.is_file() || kind.is_symlink() {
+            if !dest.exists() {
+                write_entry(&mut entry, &dest)?;
+            }
+            dev_copied.push(name);
+            continue;
+        }
+        dev_skipped.push(name);
+    }
+    contexts.sort();
+    contexts.dedup();
+    dev_copied.sort();
+    dev_skipped.sort();
+    if !REQUIRED_CONTEXTS
+        .iter()
+        .any(|rel| root.join(rel).exists())
+    {
+        return Err(
+            "layer has neither system/etc/selinux/plat_property_contexts nor plat_property_contexts; refusing to invent property contexts"
+                .into(),
+        );
+    }
+    let dev = root.join("dev");
+    if !dev.is_dir() {
+        fs::create_dir_all(&dev).map_err(|e| format!("mkdir {}: {e}", dev.display()))?;
+        set_mode(&dev, 0o755)?;
+    }
+    Ok(LayerRootFiles {
+        contexts,
+        dev_from_layer,
+        dev_copied,
+        dev_skipped,
+    })
+}
+
+fn tar_rel(raw: &Path) -> String {
+    let text = raw.to_string_lossy();
+    text.trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn property_area_rel(name: &str) -> bool {
+    name == "dev/__properties__" || name.starts_with("dev/__properties__/")
+}
+
+fn dev_rel(name: &str) -> bool {
+    name == "dev" || name.starts_with("dev/")
+}
+
+fn context_rel(name: &str) -> bool {
+    CONTEXT_FILES.contains(&name)
+}
+
+fn write_provenance(
+    root: &Path,
+    layer: &Path,
+    copied: &[String],
+    root_files: &LayerRootFiles,
+) -> Result<(), String> {
     let mut libraries = String::new();
     for rel in copied {
         let hash = sha256_file(&root.join(rel))?;
         libraries.push_str(&format!("copied {rel} sha256 {hash}\n"));
+    }
+    let mut contexts = String::new();
+    for rel in &root_files.contexts {
+        let hash = sha256_file(&root.join(rel))?;
+        contexts.push_str(&format!("property_context {rel} sha256 {hash}\n"));
+    }
+    let dev = if root_files.dev_from_layer {
+        "from-layer"
+    } else {
+        "empty-mountpoint"
+    };
+    let mut dev_files = String::new();
+    for rel in &root_files.dev_copied {
+        let hash = sha256_file(&root.join(rel))?;
+        dev_files.push_str(&format!("dev_file {rel} sha256 {hash}\n"));
+    }
+    let mut skipped = String::new();
+    for rel in &root_files.dev_skipped {
+        skipped.push_str(&format!("dev_node_not_copied {rel}\n"));
     }
     let text = format!(
         "kind original-init-probe\n\
@@ -239,9 +405,16 @@ fn write_provenance(root: &Path, layer: &Path, copied: &[String]) -> Result<(), 
          interpreter /system/bin/bootstrap/linker64\n\
          closure transitive-dt-needed\n\
          {libraries}\
+         {contexts}\
+         dev_directory {dev}\n\
+         {dev_files}\
+         {skipped}\
+         dev_property_area_not_copied true\n\
          servicemanager_ready_not_seeded true\n\
+         property_area_not_seeded true\n\
          measured_6d5f448_stop libext2_uuid.so needed by libext4_utils.so\n\
          measured_90882eb_prctl_set_vma EBADF on bss 0x80004c5000/0x13000 and 0x80002f9000/0x1000\n\
+         measured_372d08f_stop PropertyInit SIGABRT after mkdir /dev/__properties__ ENOENT and plat_property_contexts ENOENT\n\
          file_vma_ends_on_4kib_guest_page true\n\
          syscall_trace_is_not_guest_fd_2 true\n\
          prctl_set_vma_uses_4kib_guest_granule true\n\
@@ -434,7 +607,26 @@ fn first_failed_leave(stderr: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::first_observation;
+    use super::{context_rel, dev_rel, first_observation, property_area_rel, tar_rel};
+
+    #[test]
+    fn property_contexts_are_the_layer_paths_and_the_property_area_is_excluded() {
+        assert!(context_rel("system/etc/selinux/plat_property_contexts"));
+        assert!(context_rel("plat_property_contexts"));
+        assert!(!context_rel("system/etc/selinux/plat_file_contexts"));
+        assert!(!context_rel("dev/__properties__/property_info"));
+        assert!(dev_rel("dev"));
+        assert!(dev_rel("dev/null"));
+        assert!(property_area_rel("dev/__properties__"));
+        assert!(property_area_rel("dev/__properties__/property_info"));
+        assert!(!property_area_rel("dev"));
+        assert!(!property_area_rel("dev/null"));
+        assert_eq!(
+            tar_rel(std::path::Path::new("./dev/__properties__/")),
+            "dev/__properties__"
+        );
+    }
+
 
     #[test]
     fn observation_names_the_trace_line_and_not_a_historical_syscall() {
