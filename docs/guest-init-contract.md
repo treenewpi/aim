@@ -504,12 +504,13 @@ in the guest or passed by a service's `file` line.
 That list is the 2026-09-27 `linux-run`. It is not a trace of today's
 `/system/bin/init`. Those three calls are dispatched now, and original
 servicemanager has since reached `main` on the Mac. The 2026-11-19
-macmini probe of `/system/bin/init` (commit `372d08ff`) kept the syscall
-trace after `dup3` of fd 2, named the anonymous `.bss` ranges, and then
-exited 6 from `PropertyInit`: `/dev` was missing, so
-`mkdir("/dev/__properties__")` returned ENOENT, and
-`plat_property_contexts` was missing, so init aborted with SIGABRT.
-The probe root copies those context files and a `/dev` directory from
-the pinned layer. See [boot-status.md](boot-status.md).
+macmini probe of `/system/bin/init` (commit `14a42a5`) kept the syscall
+trace after `dup3` of fd 2, named the anonymous `.bss` ranges, and
+exited 6 from `MountExtraFilesystems` after `PropertyInit` had created
+`property_info`. Guest stdio is `/dev/null`, so a missing
+`init first stage started!` is not evidence that `main` was skipped.
+The probe root copies the layer's property contexts and a `/dev`
+directory, and adds the `/bootstrap-apex` and `/linkerconfig` mount
+points plus an empty `/dev/kmsg` marker. See [boot-status.md](boot-status.md).
 
 The current state of the boot is in [boot-status.md](boot-status.md).

@@ -59,11 +59,20 @@ const REQUIRED_CONTEXTS: &[&str] = &[
     "plat_property_contexts",
 ];
 
+/// Directories `MountExtraFilesystems` mounts tmpfs on. `/apex` is already
+/// in the bionic root. The other two are not, and a missing directory makes
+/// `mount` return ENOENT, which that function's `CHECKCALL` aborts on.
+const MOUNTPOINTS: &[&str] = &["bootstrap-apex", "linkerconfig"];
+
 struct LayerRootFiles {
     contexts: Vec<String>,
     dev_from_layer: bool,
     dev_copied: Vec<String>,
     dev_skipped: Vec<String>,
+    /// `(name, source)`. `source` is `present`, `empty-mountpoint`, or
+    /// `empty-mountpoint layer-entry`. Children of a layer entry are not copied.
+    mountpoints: Vec<(String, &'static str)>,
+    kmsg_marker: bool,
 }
 
 /// Copy the bionic root and add original init plus the libraries its
@@ -119,12 +128,19 @@ pub fn prepare_init() -> Result<PathBuf, String> {
             let _ = fs::remove_file(parent.join(name));
         }
     }
+    let mounts: Vec<String> = root_files
+        .mountpoints
+        .iter()
+        .map(|(name, source)| format!("{name}={source}"))
+        .collect();
     println!(
-        "bionic-smoke: original init root {} copied {} closure libraries, {} property context files, dev from layer {} (staged, not executed)",
+        "bionic-smoke: original init root {} copied {} closure libraries, {} property context files, dev from layer {}, mountpoints {}, kernel log marker {} (staged, not executed)",
         root.display(),
         copied.len(),
         root_files.contexts.len(),
-        root_files.dev_from_layer
+        root_files.dev_from_layer,
+        mounts.join(","),
+        root_files.kmsg_marker
     );
     println!("bionic-smoke: init-probe is an observation, not a boot");
     Ok(root)
@@ -262,15 +278,21 @@ fn scan_wanted(
     Ok(found)
 }
 
-/// `372d08ff` on macmini reached Android 16 `PropertyInit` and aborted.
-/// `mkdir("/dev/__properties__", 0711)` returned ENOENT because `/dev` was
-/// not a directory (`/dev/null` still opens: it is a host device node).
-/// `access("/system/etc/selinux/plat_property_contexts")` and the fallback
-/// `open("/plat_property_contexts")` returned ENOENT, so init never wrote
-/// `property_info` and `LOG(FATAL)` delivered SIGABRT to itself. Those
-/// context files are copied from the layer. `/dev` is the layer's
-/// directory when the layer has one, otherwise an empty mount point.
-/// `dev/__properties__` is not copied and is not created.
+/// `372d08ff` aborted in `PropertyInit` because `/dev` and the property
+/// contexts were absent. `14a42a5` copied both; init wrote `property_info`
+/// itself and then aborted in `MountExtraFilesystems`. That function
+/// mounts tmpfs on `/apex` (the bionic root already has it), and, when
+/// `/system/bin/recovery` is absent, on `/bootstrap-apex` and then on
+/// `/linkerconfig`. A missing directory is ENOENT, and `CHECKCALL` turns
+/// that into SIGABRT. Those two directories are created here, from a
+/// layer directory entry when the layer has one and as an empty mount
+/// point otherwise. Their children are not copied: init covers them with
+/// tmpfs. `dev/__properties__` is still not copied and not created.
+///
+/// The layer's `/dev/kmsg` is a device node, which is not copied. The
+/// syscall layer's ring adopts an empty regular file at that path, the
+/// same marker guest-init creates. Init's `LOG` goes there after it
+/// points stdio at `/dev/null`.
 fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, String> {
     let file = File::open(layer).map_err(|e| format!("open {}: {e}", layer.display()))?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -281,6 +303,7 @@ fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, Strin
     let mut dev_from_layer = false;
     let mut dev_copied = Vec::new();
     let mut dev_skipped = Vec::new();
+    let mut layer_mount_dirs = BTreeSet::new();
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let raw = entry
@@ -297,6 +320,10 @@ fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, Strin
                 write_entry(&mut entry, &dest)?;
             }
             contexts.push(name);
+            continue;
+        }
+        if mountpoint_rel(&name) && entry.header().entry_type().is_dir() {
+            layer_mount_dirs.insert(name);
             continue;
         }
         if !dev_rel(&name) {
@@ -338,11 +365,41 @@ fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, Strin
         fs::create_dir_all(&dev).map_err(|e| format!("mkdir {}: {e}", dev.display()))?;
         set_mode(&dev, 0o755)?;
     }
+    let mut mountpoints = Vec::new();
+    for name in MOUNTPOINTS {
+        let dest = root.join(name);
+        let source = if dest.is_dir() {
+            "present"
+        } else if dest.exists() {
+            return Err(format!("{name} exists and is not a directory"));
+        } else if layer_mount_dirs.contains(*name) {
+            "empty-mountpoint layer-entry"
+        } else {
+            "empty-mountpoint"
+        };
+        if !dest.exists() {
+            fs::create_dir_all(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+            set_mode(&dest, 0o755)?;
+        }
+        mountpoints.push(((*name).to_string(), source));
+    }
+    let kmsg = root.join("dev/kmsg");
+    let kmsg_marker = if kmsg.is_file() {
+        false
+    } else if kmsg.exists() {
+        return Err("dev/kmsg exists and is not a regular file".into());
+    } else {
+        fs::write(&kmsg, b"").map_err(|e| format!("create {}: {e}", kmsg.display()))?;
+        set_mode(&kmsg, 0o644)?;
+        true
+    };
     Ok(LayerRootFiles {
         contexts,
         dev_from_layer,
         dev_copied,
         dev_skipped,
+        mountpoints,
+        kmsg_marker,
     })
 }
 
@@ -364,6 +421,10 @@ fn dev_rel(name: &str) -> bool {
 
 fn context_rel(name: &str) -> bool {
     CONTEXT_FILES.contains(&name)
+}
+
+fn mountpoint_rel(name: &str) -> bool {
+    MOUNTPOINTS.contains(&name)
 }
 
 fn write_provenance(
@@ -396,6 +457,15 @@ fn write_provenance(
     for rel in &root_files.dev_skipped {
         skipped.push_str(&format!("dev_node_not_copied {rel}\n"));
     }
+    let mut mounts = String::new();
+    for (name, source) in &root_files.mountpoints {
+        mounts.push_str(&format!("mountpoint {name} {source}\n"));
+    }
+    let kmsg = if root_files.kmsg_marker {
+        "kernel_log_marker dev/kmsg empty-regular-file\n"
+    } else {
+        "kernel_log_marker dev/kmsg already-regular-file\n"
+    };
     let text = format!(
         "kind original-init-probe\n\
          layer {}\n\
@@ -409,12 +479,15 @@ fn write_provenance(
          dev_directory {dev}\n\
          {dev_files}\
          {skipped}\
+         {mounts}\
+         {kmsg}\
          dev_property_area_not_copied true\n\
          servicemanager_ready_not_seeded true\n\
          property_area_not_seeded true\n\
          measured_6d5f448_stop libext2_uuid.so needed by libext4_utils.so\n\
          measured_90882eb_prctl_set_vma EBADF on bss 0x80004c5000/0x13000 and 0x80002f9000/0x1000\n\
          measured_372d08f_stop PropertyInit SIGABRT after mkdir /dev/__properties__ ENOENT and plat_property_contexts ENOENT\n\
+         measured_14a42a5_stop MountExtraFilesystems CHECKCALL of tmpfs on /bootstrap-apex ENOENT after /apex mounted and access /system/bin/recovery ENOENT\n\
          file_vma_ends_on_4kib_guest_page true\n\
          syscall_trace_is_not_guest_fd_2 true\n\
          prctl_set_vma_uses_4kib_guest_granule true\n\
@@ -535,7 +608,12 @@ fn read_lossy(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Classify a trace without treating a historical syscall list as the cause.
+/// Classify a trace. The first negative syscall leave is reported on its
+/// own: init survives the early `newfstatat("/dev/__properties__")` ENOENT.
+/// A stage is named only from a log line or from `PropertyInit` creating
+/// `property_info`. Guest stdio is `/dev/null` before those logs, so a
+/// missing `init first stage started!` is not evidence about `main`.
+/// There is no `init ok` here.
 pub(crate) fn first_observation(
     stdout: &str,
     stderr: &str,
@@ -546,41 +624,121 @@ pub(crate) fn first_observation(
     {
         return "admission failed before the guest was loaded".into();
     }
-    let main = stdout.contains("init first stage started!")
-        || stderr.contains("init first stage started!");
-    let failed = first_failed_leave(stderr);
-    let linker = linker_stop(stdout).or_else(|| linker_stop(stderr));
-    let mut text = match (main, failed, timed_out) {
-        (true, Some(line), timeout) => format!(
-            "reached main log \"init first stage started!\"; timed_out={timeout}; first failed syscall {line}"
-        ),
-        (true, None, true) => {
-            "reached main log \"init first stage started!\" and was still running at the bound"
-                .into()
+    let mut text = stage_from(stdout, stderr);
+    match first_failed_leave(stderr) {
+        Some(line) => {
+            text.push_str("; first failed syscall (survived; not the stop) ");
+            text.push_str(&line);
         }
-        (true, None, false) => {
-            format!("reached main log \"init first stage started!\"; exit={exit_code:?}")
-        }
-        (false, Some(line), timeout) => {
-            format!("did not reach main; timed_out={timeout}; first failed syscall {line}")
-        }
-        (false, None, true) => {
-            let last = stderr
-                .lines()
-                .rev()
-                .find(|line| line.starts_with("[linux] ") || line.starts_with("[linux-abi] "))
-                .unwrap_or("(no trace line)");
-            format!("did not reach main; still running at the bound; last trace {last}")
-        }
-        (false, None, false) => {
-            format!("did not reach main; exit={exit_code:?}; no failed syscall leave")
-        }
-    };
-    if let Some(line) = linker {
+        None => text.push_str("; first failed syscall none"),
+    }
+    if let Some(line) = abort_leave(stderr) {
+        text.push_str("; abort ");
+        text.push_str(&line);
+    }
+    if let Some(line) = kmsg_before_abort(stderr) {
+        text.push_str("; kmsg before abort ");
+        text.push_str(&line);
+    }
+    if timed_out {
+        let last = stderr
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("[linux] ") || line.starts_with("[linux-abi] "))
+            .unwrap_or("(no trace line)");
+        text.push_str("; still running at the bound; last trace ");
+        text.push_str(last);
+    } else {
+        text.push_str(&format!("; exit={exit_code:?}"));
+    }
+    if let Some(line) = linker_stop(stdout).or_else(|| linker_stop(stderr)) {
         text.push_str("; linker: ");
         text.push_str(&line);
     }
     text
+}
+
+fn stage_from(stdout: &str, stderr: &str) -> String {
+    let second = stdout.contains("init second stage started!")
+        || stderr.contains("init second stage started!");
+    let first = stdout.contains("init first stage started!")
+        || stderr.contains("init first stage started!");
+    if second {
+        return "stage second: log \"init second stage started!\"".into();
+    }
+    if created_property_info(stderr) {
+        return "stage second: PropertyInit created /dev/__properties__/property_info".into();
+    }
+    if first {
+        return "stage first: log \"init first stage started!\"".into();
+    }
+    "stage unconfirmed".into()
+}
+
+/// `open`/`openat` of `property_info` with `O_CREAT` and a nonnegative
+/// result. `SecondStageMain` is what calls `PropertyInit`.
+fn created_property_info(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let Some(rest) = line.strip_prefix("[linux] ") else {
+            return false;
+        };
+        if !rest.contains(" leave]") {
+            return false;
+        }
+        let Some((call, result)) = rest.rsplit_once(" = ") else {
+            return false;
+        };
+        let token = result.split_whitespace().next().unwrap_or("");
+        if token.is_empty() || token.starts_with('-') {
+            return false;
+        }
+        if !call.starts_with("openat(") && !call.starts_with("open(") {
+            return false;
+        }
+        let Some(path_at) = call.find("\"/dev/__properties__/property_info\"") else {
+            return false;
+        };
+        let after = &call[path_at + "\"/dev/__properties__/property_info\"".len()..];
+        let after = after.trim_start_matches([',', ' ']);
+        let flags = after
+            .split([',', ')'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        parse_u64(flags).is_ok_and(|flags| flags & 0x40 != 0)
+    })
+}
+
+fn parse_u64(text: &str) -> Result<u64, ()> {
+    if let Some(hex) = text.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|_| ())
+    } else {
+        text.parse().map_err(|_| ())
+    }
+}
+
+fn abort_leave(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| {
+            line.starts_with("[linux] rt_tgsigqueueinfo(")
+                && line.contains(" leave]")
+                && line.contains(" = 0")
+        })
+        .map(str::to_string)
+}
+
+fn kmsg_before_abort(stderr: &str) -> Option<String> {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let abort_at = lines.iter().rposition(|line| {
+        line.starts_with("[linux] rt_tgsigqueueinfo(") && line.contains(" leave]")
+    })?;
+    lines[..abort_at]
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("[kmsg] "))
+        .map(|line| (*line).to_string())
 }
 
 fn linker_stop(text: &str) -> Option<String> {
@@ -607,7 +765,9 @@ fn first_failed_leave(stderr: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_rel, dev_rel, first_observation, property_area_rel, tar_rel};
+    use super::{
+        context_rel, dev_rel, first_observation, mountpoint_rel, property_area_rel, tar_rel,
+    };
 
     #[test]
     fn property_contexts_are_the_layer_paths_and_the_property_area_is_excluded() {
@@ -625,8 +785,11 @@ mod tests {
             tar_rel(std::path::Path::new("./dev/__properties__/")),
             "dev/__properties__"
         );
+        assert!(mountpoint_rel("bootstrap-apex"));
+        assert!(mountpoint_rel("linkerconfig"));
+        assert!(!mountpoint_rel("apex"));
+        assert!(!mountpoint_rel("dev/__properties__"));
     }
-
 
     #[test]
     fn observation_names_the_trace_line_and_not_a_historical_syscall() {
@@ -635,21 +798,46 @@ mod tests {
 [linux] mremap(0x1, 0x1000, 0x2000, 0x1, 0x0) = -38 (ENOSYS) [pid=9 tid=9 call=2 leave]
 ";
         let text = first_observation("", trace, Some(127), false);
-        assert!(text.contains("did not reach main"));
+        assert!(text.contains("stage unconfirmed"));
+        assert!(!text.contains("did not reach main"));
         assert!(text.contains("mremap"));
         assert!(text.contains("-38"));
+        assert!(text.contains("survived; not the stop"));
         assert!(!text.contains("rt_tgsigqueueinfo"));
+        assert!(!text.contains("init ok"));
         let started = first_observation("init first stage started!\n", trace, None, true);
-        assert!(started.contains("reached main log"));
-        assert!(started.contains("timed_out=true"));
+        assert!(started.contains("stage first: log \"init first stage started!\""));
+        assert!(started.contains("still running at the bound"));
+        assert!(!started.contains("did not reach main"));
+        let second = "\
+[linux] newfstatat(-100, \"/dev/__properties__\", 0x1, 0x0) = -2 (ENOENT) [pid=9 tid=9 call=66 leave]
+[linux] openat(-100, \"/dev/__properties__/property_info\", 0x88241, 0x1b6) = 3 [pid=9 tid=9 call=2366 leave]
+[kmsg] level=0 mount(\"tmpfs\", \"/bootstrap-apex\", \"tmpfs\", MS_NOEXEC | MS_NOSUID | MS_NODEV, \"mode=0755,uid=0,gid=0\") failed: No such file or directory
+[linux] rt_tgsigqueueinfo(0x16e82, 0x16e82, 0x6, 0x8005e84000) = 0 [pid=9 tid=9 call=5933 leave]
+[linux] exit_group(0x6) [pid=9 tid=9 call=5934 enter]
+";
+        let reached = first_observation("", second, Some(6), false);
+        assert!(reached.contains(
+            "stage second: PropertyInit created /dev/__properties__/property_info"
+        ));
+        assert!(reached.contains("call=66"));
+        assert!(reached.contains("survived; not the stop"));
+        assert!(reached.contains("abort "));
+        assert!(reached.contains("rt_tgsigqueueinfo"));
+        assert!(reached.contains("kmsg before abort"));
+        assert!(reached.contains("bootstrap-apex"));
+        assert!(!reached.contains("did not reach main"));
+        assert!(!reached.contains("init ok"));
+        let logged = first_observation("", "init second stage started!\n", Some(0), false);
+        assert!(logged.contains("stage second: log \"init second stage started!\""));
         let stopped = first_observation(
             "",
             "linker: CANNOT LINK EXECUTABLE \"/system/bin/init\": library \"libext2_uuid.so\" not found: needed by /system/lib64/libext4_utils.so\n",
             Some(1),
             false,
         );
-        assert!(stopped.contains("did not reach main"));
+        assert!(stopped.contains("stage unconfirmed"));
         assert!(stopped.contains("libext2_uuid.so"));
-        assert!(stopped.contains("no failed syscall leave"));
+        assert!(stopped.contains("first failed syscall none"));
     }
 }
