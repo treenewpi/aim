@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use aim_bionic_smoke::{
-    execute, fetch, prepare, prepare_property, require_layer, run_property, DIFF_ID, LAYER_DIGEST,
-    LAYER_SIZE, MANIFEST_DIGEST, REPOSITORY, TAG,
+    execute, fetch, prepare, prepare_init, prepare_integrated, prepare_property, require_layer,
+    run_init, run_property, DIFF_ID, LAYER_DIGEST, LAYER_SIZE, MANIFEST_DIGEST, REPOSITORY, TAG,
 };
 
 fn main() -> ExitCode {
@@ -31,7 +31,10 @@ fn run() -> Result<(), String> {
     let mut prepare_only = false;
     let mut prepare_manager = false;
     let mut prepare_property_root = false;
+    let mut prepare_integrated_root = false;
+    let mut prepare_init_root = false;
     let mut property: Option<PathBuf> = None;
+    let mut init_probe: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--linux-run" => {
@@ -43,8 +46,13 @@ fn run() -> Result<(), String> {
             "--prepare" => prepare_only = true,
             "--prepare-servicemanager" => prepare_manager = true,
             "--prepare-property" => prepare_property_root = true,
+            "--prepare-integrated" => prepare_integrated_root = true,
+            "--prepare-init" => prepare_init_root = true,
             "--property" => {
                 property = Some(PathBuf::from(args.next().ok_or("--property needs linux-run")?));
+            }
+            "--init" => {
+                init_probe = Some(PathBuf::from(args.next().ok_or("--init needs linux-run")?));
             }
             "--help" | "-h" => {
                 println!(
@@ -55,6 +63,9 @@ usage: bionic-smoke --linux-run PATH
        bionic-smoke --prepare-servicemanager
        bionic-smoke --prepare-property
        bionic-smoke --property LINUX_RUN
+       bionic-smoke --prepare-integrated
+       bionic-smoke --prepare-init
+       bionic-smoke --init LINUX_RUN
 
 Pinned image: {REPOSITORY}:{TAG}
   manifest {MANIFEST_DIGEST}
@@ -72,6 +83,16 @@ copy of the bionic root, plus generated system/bin/property-wait. It does
 not write servicemanager.ready. --property starts the property socket and
 runs those programs. That command is not accepted until a real Apple
 Silicon Mac runs it.
+--prepare-integrated copies the servicemanager root, deletes its
+generated servicemanager.ready area, and adds original getprop. The
+android and libbinder roots stay seeded. aim-binder-proc integrated
+starts the property service and the binder daemon, starts the original
+service client first, then the original servicemanager. Ready has to
+come from that servicemanager's SetProperty.
+--prepare-init stages original /system/bin/init and the libraries it
+needs. --init runs it for at most eight seconds and prints the trace.
+init-probe: not a boot is the result. A historical list of mremap,
+SOCK_SEQPACKET, and rt_tgsigqueueinfo is not that observation.
 Acceptance of that stage is a real Apple Silicon Mac running them under
 linux-run on XNU. A Linux compile, unit test, this staging, a Linux VM,
 or a Linux container is not that run. A Mac log has to include the host
@@ -86,15 +107,39 @@ the transaction text from the original service binary."
     }
     if linux_run.is_none()
         && property.is_none()
+        && init_probe.is_none()
         && !prepare_only
         && !prepare_manager
         && !prepare_property_root
+        && !prepare_integrated_root
+        && !prepare_init_root
         && !do_fetch
     {
         return Err(
-            "pass --fetch, --prepare, --prepare-servicemanager, --prepare-property, --property PATH, or --linux-run PATH; --help prints the pinned digest"
+            "pass --fetch, --prepare, --prepare-servicemanager, --prepare-property, --prepare-integrated, --prepare-init, --property PATH, --init PATH, or --linux-run PATH; --help prints the pinned digest"
                 .into(),
         );
+    }
+    if prepare_integrated_root {
+        if prepare_only {
+            let layer = if do_fetch { fetch()? } else { require_layer()? };
+            prepare(&layer)?;
+        }
+        prepare_integrated()?;
+        return Ok(());
+    }
+    if prepare_init_root || init_probe.is_some() {
+        if prepare_init_root || prepare_only {
+            let layer = if do_fetch { fetch()? } else { require_layer()? };
+            if prepare_only {
+                prepare(&layer)?;
+            }
+            prepare_init()?;
+        }
+        if let Some(linux_run) = init_probe {
+            run_init(&linux_run)?;
+        }
+        return Ok(());
     }
     if prepare_property_root || property.is_some() {
         if prepare_only || prepare_property_root {

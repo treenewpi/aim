@@ -8,6 +8,7 @@ description = "Stage original reDroid linker64 and toybox and run them under lin
 
 [dependencies]
 aim-android-init = { path = "../aim-android-init" }
+aim-binder-driver = { path = "../aim-binder-driver" }
 aim-paths = { path = "../aim-paths" }
 libc.workspace = true
 android-image-extract = { path = "../../tools/android-image-extract" }

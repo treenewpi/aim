@@ -18,8 +18,12 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+mod init_probe;
+mod integrated;
 mod manager;
 mod property;
+pub use init_probe::{init_root, prepare_init, run_init};
+pub use integrated::{integrated_root, prepare_integrated, run_integrated};
 pub use manager::{binder_device_opened, prepare_manager};
 pub use property::{prepare_property, property_root, run_property};
 

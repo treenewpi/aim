@@ -118,6 +118,7 @@ name = "aim-binder-host"
 version = "0.1.0"
 dependencies = [
  "aim-binder-driver",
+ "aim-bionic-smoke",
  "aim-elf-smoke",
  "aim-storage",
  "libc",
@@ -128,6 +129,7 @@ name = "aim-bionic-smoke"
 version = "0.1.0"
 dependencies = [
  "aim-android-init",
+ "aim-binder-driver",
  "aim-paths",
  "android-image-extract",
  "flate2",

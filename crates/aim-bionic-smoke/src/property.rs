@@ -53,9 +53,14 @@ pub const PROPERTY_WAIT_SHA256: &str =
     "3b87daaaa4a695ae72321641fc36320d0ad0e26d42068d4506a68072801a319d";
 
 const PROPERTY_WAIT: &[u8] = include_bytes!("../probe/property-wait");
-const READY: &str = "servicemanager.ready";
+pub(crate) const READY: &str = "servicemanager.ready";
 const VERSION: &str = "ro.property_service.version";
-const SHELL: &str = "uid\t2000\ngid\t2000\nseclabel\tu:r:shell:s0\n";
+pub(crate) const SHELL: &str = "uid\t2000\ngid\t2000\nseclabel\tu:r:shell:s0\n";
+/// The identity the android and libbinder commands already give the
+/// original servicemanager. The integrated matrix uses the same text so
+/// the property server records that peer, not a shell set.
+pub(crate) const SERVICEMANAGER_IDENTITY: &str =
+    "uid\t1000\ngid\t1000\ngroups\t1000 3009\nseclabel\tu:r:servicemanager:s0\n";
 
 pub fn property_root() -> PathBuf {
     super::stage_dir()
@@ -113,6 +118,10 @@ pub fn prepare_property() -> Result<PathBuf, String> {
         "bionic-smoke: this root has no servicemanager.ready value; acceptance is a real Apple Silicon Mac"
     );
     Ok(root)
+}
+
+pub(crate) fn install_property_clients(layer: &Path, root: &Path) -> Result<(), String> {
+    extract_clients(layer, root)
 }
 
 fn extract_clients(layer: &Path, root: &Path) -> Result<(), String> {
@@ -743,7 +752,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
         return blocker("ready was present at start", &server.log());
     }
     let mut before = guest(linux_run, &root, &["/system/bin/getprop", READY])?;
-    let (code, out, err) = finish(&mut before, Duration::from_secs(25));
+    let (code, out, err) = take("getprop-before", &mut before, Duration::from_secs(25));
     println!(
         "property-service: getprop before pid={} exit={code:?} stdout={out:?}",
         before.child.id()
@@ -772,15 +781,23 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     if !wait_parked(&mut waiter, Duration::from_secs(25))? {
         let err = stderr_of(&waiter);
         let out = stdout_of(&waiter);
+        emit_guest("property-wait-not-parked", waiter_pid, None, &out, &err);
         return blocker(
             "property-wait was not parked in futex before setprop",
             &format!("stdout={out:?}\n{err}"),
         );
     }
+    emit_guest(
+        "property-wait-parked",
+        waiter_pid,
+        None,
+        &stdout_of(&waiter),
+        &stderr_of(&waiter),
+    );
     println!("property-service: waiter pid={waiter_pid} parked");
     let mut set = guest(linux_run, &root, &["/system/bin/setprop", READY, "true"])?;
     let set_pid = set.child.id();
-    let (set_code, set_out, set_err) = finish(&mut set, Duration::from_secs(25));
+    let (set_code, set_out, set_err) = take("setprop-ready", &mut set, Duration::from_secs(25));
     println!("property-service: setprop pid={set_pid} exit={set_code:?} stdout={set_out:?}");
     if set_code != Some(0) {
         return blocker("setprop servicemanager.ready true failed", &format!("{set_out}\n{set_err}\n{}", server.log()));
@@ -800,7 +817,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
             &format!("value={:?}\n{}", server.get(READY), server.log()),
         );
     }
-    let (wait_code, wait_out, wait_err) = finish(&mut waiter, Duration::from_secs(20));
+    let (wait_code, wait_out, wait_err) = take("property-wait", &mut waiter, Duration::from_secs(20));
     println!("property-service: waiter exit={wait_code:?} stdout={wait_out:?}");
     if wait_code != Some(0) || wait_out != "property wait: servicemanager.ready=true\n" {
         return blocker(
@@ -813,7 +830,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     }
     let mut after = guest(linux_run, &root, &["/system/bin/getprop", READY])?;
     let after_pid = after.child.id();
-    let (after_code, after_out, after_err) = finish(&mut after, Duration::from_secs(25));
+    let (after_code, after_out, after_err) = take("getprop-after", &mut after, Duration::from_secs(25));
     println!("property-service: getprop after pid={after_pid} exit={after_code:?} stdout={after_out:?}");
     if after_code != Some(0) || after_out != "true\n" {
         return blocker("getprop after setprop did not print true", &format!("stdout={after_out:?}\n{after_err}"));
@@ -823,7 +840,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
     }
     let mut ro = guest(linux_run, &root, &["/system/bin/setprop", VERSION, "9"])?;
     let ro_pid = ro.child.id();
-    let (ro_code, ro_out, ro_err) = finish(&mut ro, Duration::from_secs(25));
+    let (ro_code, ro_out, ro_err) = take("setprop-ro", &mut ro, Duration::from_secs(25));
     println!("property-service: ro setprop pid={ro_pid} exit={ro_code:?} stdout={ro_out:?}");
     if ro_code == Some(0) || server.get(VERSION).as_deref() != Some("2") {
         return blocker(
@@ -832,7 +849,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
         );
     }
     let mut version = guest(linux_run, &root, &["/system/bin/getprop", VERSION])?;
-    let (ver_code, ver_out, ver_err) = finish(&mut version, Duration::from_secs(25));
+    let (ver_code, ver_out, ver_err) = take("getprop-version", &mut version, Duration::from_secs(25));
     println!("property-service: getprop version exit={ver_code:?} stdout={ver_out:?}");
     if ver_code != Some(0) || ver_out != "2\n" {
         return blocker(
@@ -841,7 +858,7 @@ pub fn run_property(linux_run: &Path) -> Result<(), String> {
         );
     }
     let mut unset = guest(linux_run, &root, &["/system/bin/getprop", "debug.aim.unset"])?;
-    let (unset_code, unset_out, unset_err) = finish(&mut unset, Duration::from_secs(25));
+    let (unset_code, unset_out, unset_err) = take("getprop-unset", &mut unset, Duration::from_secs(25));
     println!("property-service: getprop unset exit={unset_code:?} stdout={unset_out:?}");
     if unset_code != Some(0) || unset_out.contains("true") || unset_out.contains("set-me") {
         return blocker(
@@ -864,24 +881,42 @@ fn blocker(why: &str, detail: &str) -> Result<(), String> {
     Err(format!("property-service: first blocker: {why}\n{detail}"))
 }
 
-fn linux_run_command(linux_run: &Path, root: &Path, args: &[&str]) -> Command {
+/// Build a `linux-run` command. No `--by-pid`: linux-run creates
+/// `aim-pidns-<pid>`, starts its watcher, and that watcher writes
+/// `posix-control-owner`. The identity text is published into that table
+/// by linux-run, not by this process.
+pub(crate) fn launch_command(
+    linux_run: &Path,
+    root: &Path,
+    identity: &str,
+    binder: Option<&str>,
+    args: &[&str],
+) -> Command {
     let mut command = Command::new(linux_run);
-    // No `--by-pid`: linux-run creates `aim-pidns-<pid>`, starts its watcher,
-    // and that watcher writes `posix-control-owner`. The identity text is
-    // published into that table by linux-run, not by this process.
     command
         .arg("--no-cache")
         .arg("--trace")
         .arg("--root")
-        .arg(root)
-        .arg("--identity-text")
-        .arg(SHELL)
-        .args(args);
+        .arg(root);
+    if let Some(name) = binder {
+        command.arg("--binder").arg(name);
+    }
+    command.arg("--identity-text").arg(identity).args(args);
     command
 }
 
 fn guest(linux_run: &Path, root: &Path, args: &[&str]) -> Result<Guest, String> {
-    let mut child = linux_run_command(linux_run, root, args);
+    launch(linux_run, root, SHELL, None, args)
+}
+
+pub(crate) fn launch(
+    linux_run: &Path,
+    root: &Path,
+    identity: &str,
+    binder: Option<&str>,
+    args: &[&str],
+) -> Result<Guest, String> {
+    let mut child = launch_command(linux_run, root, identity, binder, args);
     child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child
         .spawn()
@@ -927,8 +962,8 @@ fn guest(linux_run: &Path, root: &Path, args: &[&str]) -> Result<Guest, String> 
     })
 }
 
-struct Guest {
-    child: Child,
+pub(crate) struct Guest {
+    pub(crate) child: Child,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
     readers: Vec<JoinHandle<()>>,
@@ -944,15 +979,15 @@ impl Drop for Guest {
     }
 }
 
-fn stdout_of(guest: &Guest) -> String {
+pub(crate) fn stdout_of(guest: &Guest) -> String {
     guest.stdout.lock().expect("stdout").clone()
 }
 
-fn stderr_of(guest: &Guest) -> String {
+pub(crate) fn stderr_of(guest: &Guest) -> String {
     guest.stderr.lock().expect("stderr").clone()
 }
 
-fn finish(guest: &mut Guest, limit: Duration) -> (Option<i32>, String, String) {
+pub(crate) fn finish(guest: &mut Guest, limit: Duration) -> (Option<i32>, String, String) {
     let start = Instant::now();
     let code = loop {
         match guest.child.try_wait() {
@@ -997,7 +1032,89 @@ fn wait_parked(guest: &mut Guest, limit: Duration) -> Result<bool, String> {
     }
 }
 
-fn opened(stderr: &str, path: &str) -> bool {
+fn take(
+    role: &str,
+    guest: &mut Guest,
+    limit: Duration,
+) -> (Option<i32>, String, String) {
+    let pid = guest.child.id();
+    let (code, out, err) = finish(guest, limit);
+    emit_guest(role, pid, code, &out, &err);
+    (code, out, err)
+}
+
+/// The success path prints the guest's own stdout, stderr, and the
+/// `linux-run` trace. A count line is not a substitute for that text.
+pub(crate) fn emit_guest(
+    role: &str,
+    pid: u32,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) {
+    println!("----- {role} pid={pid} exit={exit_code:?} stdout -----");
+    print!("{stdout}");
+    if !stdout.is_empty() && !stdout.ends_with('\n') {
+        println!();
+    }
+    println!("----- {role} pid={pid} stderr -----");
+    print!("{stderr}");
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        println!();
+    }
+    println!("----- end {role} pid={pid} -----");
+    let counts = trace_counts(stderr);
+    println!(
+        "property-trace {role} pid={pid} exit={exit_code:?} property_info_open={} connect_ok={} futex_enter={} futex_leave={} binder_open={}",
+        counts.property_info_open,
+        counts.connect_ok,
+        counts.futex_enter,
+        counts.futex_leave,
+        counts.binder_open
+    );
+}
+
+pub(crate) struct TraceCounts {
+    pub property_info_open: u32,
+    pub connect_ok: u32,
+    pub futex_enter: u32,
+    pub futex_leave: u32,
+    pub binder_open: u32,
+}
+
+pub(crate) fn trace_counts(stderr: &str) -> TraceCounts {
+    let mut counts = TraceCounts {
+        property_info_open: 0,
+        connect_ok: 0,
+        futex_enter: 0,
+        futex_leave: 0,
+        binder_open: 0,
+    };
+    for line in stderr.lines() {
+        if line.starts_with("[linux] openat(")
+            && line.contains("\"/dev/__properties__/property_info\"")
+            && line.contains(" leave]")
+            && leave_ok(line)
+        {
+            counts.property_info_open += 1;
+        }
+        if line.starts_with("[linux] connect(") && line.contains(" leave]") && leave_ok(line) {
+            counts.connect_ok += 1;
+        }
+        if line.starts_with("[linux] futex(") && line.contains(" enter]") {
+            counts.futex_enter += 1;
+        }
+        if line.starts_with("[linux] futex(") && line.contains(" leave]") {
+            counts.futex_leave += 1;
+        }
+        if super::binder_device_opened(line) {
+            counts.binder_open += 1;
+        }
+    }
+    counts
+}
+
+pub(crate) fn opened(stderr: &str, path: &str) -> bool {
     let quoted = format!("\"{path}\"");
     stderr.lines().any(|line| {
         line.starts_with("[linux] openat(")
@@ -1038,7 +1155,7 @@ pub(crate) fn futex_parked(stderr: &str) -> bool {
     enters > leaves
 }
 
-fn print_host() {
+pub(crate) fn print_host() {
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     unsafe { libc::uname(&mut uts) };
     let text = |bytes: &[libc::c_char]| {
@@ -1094,9 +1211,11 @@ mod tests {
         assert!(connect_ok(
             "[linux] connect(0x3, 0x1, 0x6e) = 0 [pid=4 tid=4 call=3 leave]\n"
         ));
-        let args: Vec<String> = linux_run_command(
+        let args: Vec<String> = launch_command(
             Path::new("linux-run"),
             Path::new("root"),
+            SHELL,
+            None,
             &["/system/bin/getprop", READY],
         )
         .get_args()
@@ -1104,6 +1223,31 @@ mod tests {
         .collect();
         assert!(args.iter().any(|arg| arg == "--identity-text"));
         assert!(!args.iter().any(|arg| arg == "--by-pid"));
+        assert!(!args.iter().any(|arg| arg == "--binder"));
+        let sm: Vec<String> = launch_command(
+            Path::new("linux-run"),
+            Path::new("root"),
+            SERVICEMANAGER_IDENTITY,
+            Some("dev.aim.integrated.1"),
+            &["/system/bin/servicemanager"],
+        )
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(sm.windows(2).any(|pair| pair == ["--binder", "dev.aim.integrated.1"]));
+        assert!(sm.iter().any(|arg| arg.contains("u:r:servicemanager:s0")));
+        assert!(!sm.iter().any(|arg| arg == "--by-pid"));
+        let counts = trace_counts(
+            "[linux] openat(-100, \"/dev/__properties__/property_info\", 0x0, 0x0) = 3 [pid=1 tid=1 call=2 leave]\n\
+             [linux] futex(0x1, 0x80, 0x1, 0x0) [pid=1 tid=1 call=3 enter]\n\
+             [linux] connect(0x4, 0x1, 0x6e) = 0 [pid=4 tid=4 call=4 leave]\n\
+             [linux] openat(-100, \"/dev/binder\", 0x80002, 0x0) = 5 [pid=1 tid=1 call=5 leave]\n",
+        );
+        assert_eq!(counts.property_info_open, 1);
+        assert_eq!(counts.futex_enter, 1);
+        assert_eq!(counts.futex_leave, 0);
+        assert_eq!(counts.connect_ok, 1);
+        assert_eq!(counts.binder_open, 1);
     }
 
     #[test]

@@ -18,6 +18,7 @@ name = "aim-binder-proc"
 path = "src/bin/aim-binder-proc.rs"
 
 [dependencies]
+aim-bionic-smoke = { path = "../aim-bionic-smoke" }
 aim-storage = { path = "../aim-storage" }
 aim-binder-driver = { path = "../aim-binder-driver" }
 aim-elf-smoke = { path = "../aim-elf-smoke" }

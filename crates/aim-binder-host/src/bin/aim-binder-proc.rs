@@ -75,12 +75,14 @@ fn main() -> ExitCode {
         Some("guest") => guest_orchestrate(args.next(), args.next()),
         Some("android") => android_orchestrate(args.next(), args.next()),
         Some("libbinder") => libbinder_orchestrate(args.next(), args.next()),
+        Some("integrated") => integrated_orchestrate(args.next()),
         _ => {
             eprintln!(
                 "usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]\n       \
                  aim-binder-proc guest LINUX_RUN GUEST\n       \
                  aim-binder-proc android LINUX_RUN ROOT\n       \
-                 aim-binder-proc libbinder LINUX_RUN ROOT"
+                 aim-binder-proc libbinder LINUX_RUN ROOT\n       \
+                 aim-binder-proc integrated LINUX_RUN"
             );
             ExitCode::from(2)
         }
@@ -1092,6 +1094,30 @@ fn print_host() {
         );
     } else {
         println!("host uname_ok={named} pagesize_ok={page_ok} pagesize={page}");
+    }
+}
+
+/// Original servicemanager publishes `servicemanager.ready` through the
+/// property service. The client is already waiting. The static ready area
+/// used by `android` and `libbinder` is not on this root.
+fn integrated_orchestrate(linux_run: Option<String>) -> ExitCode {
+    let Some(linux_run) = linux_run else {
+        eprintln!("usage: aim-binder-proc integrated LINUX_RUN");
+        return ExitCode::from(2);
+    };
+    raise_nofile(true);
+    let name = format!("dev.aim.integrated.{}", std::process::id());
+    if let Err(error) = Server::start(&name) {
+        eprintln!("integrated: first blocker: daemon did not check in {name}: {error}");
+        return ExitCode::from(1);
+    }
+    println!("integrated daemon pid={} name={name}", std::process::id());
+    match aim_bionic_smoke::run_integrated(Path::new(&linux_run), &name) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
     }
 }
 

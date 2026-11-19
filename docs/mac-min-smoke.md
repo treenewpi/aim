@@ -416,6 +416,100 @@ value nobody sent is the blocker. Linux unit tests drive the socket
 from the host. They are not this run. The vDSO eight-try fallback is
 still unmeasured. This is not ART and not a reDroid boot.
 
+Commit `fa2c7f24806e9e8edda33b907b9f9316f240ff59` passed this property
+matrix twice on the same M4 (macOS 26.5.1, Darwin 25.5.0, arm64, 16 KiB
+pages, Rust 1.88). Harness pids 91500 and 91522 exited 0. Round one:
+waiter 91504, setprop 91507 uid 2000 `u:r:shell:s0` reply 0, getprop
+91510 printed `true`. Round two: waiter 91526, setprop 91529, getprop
+91532. `ro.property_service.version` setprop exited 1 with reply 11 and
+the value stayed `2`. `getprop debug.aim.unset` printed only a newline.
+`android` and `libbinder` each passed one round on their static ready
+roots. Targeted tests were 9 pass. The log archive is
+`ee17d419eae2d0cc024c78cddc02e60b551a6e401806aa9f8d47dd1152a40441`.
+The harness checked `property_info`, `connect`, and `futex` enter >
+leave internally. The saved stdout is the summary lines only, and the
+harness stderr is empty, so those trace lines are not in the archive.
+A later property run has to print, for every guest, `----- ROLE pid=N
+exit=... stdout -----`, the stderr trace, `----- end ROLE pid=N -----`,
+and `property-trace ROLE ... property_info_open= connect_ok=
+futex_enter= futex_leave= binder_open=`. The summary line is not a
+substitute. Identity denial is still only the host socket test.
+
+## Integrated servicemanager
+
+`android` and `libbinder` keep the generated `servicemanager.ready=true`
+area. `bionic-smoke --prepare-integrated` copies that root to
+`_build/redroid-16-integrated/root`, deletes `dev/__properties__`, and
+adds original `getprop`. `aim-binder-proc integrated LINUX_RUN` starts
+the property service and the binder daemon in one process. It does not
+take a root argument, so it cannot be pointed at the seeded root.
+Original `service check manager` starts first and must stay up with
+`property_info` open and no completed `/dev/binder` open. Original
+servicemanager then `SetProperty`s `servicemanager.ready=true`. The
+server line has to name that servicemanager pid, uid 1000,
+`u:r:servicemanager:s0`, and `reply=0`. The same client then prints
+`Service manager: found` with `BR_REPLY`. A later `getprop` prints
+`true`. `libbinder-ping` on that same servicemanager prints
+`binder reply: value=2` with the two guest pids. Every guest's stdout
+and stderr are printed in the `-----` blocks. `integrated: first
+blocker:` is not a pass. `integrated ok` is not ART and not a boot.
+`property_contexts` stay the default string context. Do not pass
+`--fetch`. `TMPDIR` has to stay short enough for the daemon socket.
+
+```sh
+git fetch origin cursor/binder-fd-elf-smoke-602d
+git checkout cursor/binder-fd-elf-smoke-602d
+git rev-parse HEAD
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+./target/release/bionic-smoke --prepare
+./target/release/bionic-smoke --prepare-property
+./target/release/bionic-smoke --property ./target/release/linux-run
+./target/release/bionic-smoke --prepare-servicemanager
+./target/release/bionic-smoke --prepare-integrated
+./target/release/aim-binder-proc integrated ./target/release/linux-run
+./target/release/aim-binder-proc android ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
+./target/release/aim-binder-proc libbinder ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
+```
+
+`git rev-parse HEAD` has to be the commit that prints the trace blocks
+and adds `integrated`. The property command is the regression whose log
+now has to contain the trace. The integrated command is the new matrix.
+The last two commands are the seeded-root regressions.
+
+## Original init probe
+
+`docs/guest-init-contract.md` section 10 (2026-09-27) says an older
+`linux-run` stopped `linkerconfig`, `servicemanager`, and `logd` inside
+`linker64` before `main`, and names `mremap`, `SOCK_SEQPACKET`, and
+`rt_tgsigqueueinfo`. That is not a trace of `/system/bin/init` on this
+Mac. Current source dispatches those three calls. Original
+servicemanager and `service` have since reached `main` on this Mac, so
+linker64-before-main is not their current blocker. Whether init hits
+any of those calls is unmeasured.
+
+`bionic-smoke --prepare-init` copies the bionic root and adds original
+`/system/bin/init` (interpreter `/system/bin/bootstrap/linker64`) plus
+init's direct `DT_NEEDED` libraries. It does not write a property area.
+`bionic-smoke --init LINUX_RUN` runs that binary for at most eight
+seconds, then prints the pid, exit, stdout, stderr, and
+`init-probe: first observation:`. `init-probe: not a boot` is required.
+There is no `init ok`. A line that only repeats the 2026-09-27 syscall
+list is not the observation.
+
+```sh
+./target/release/bionic-smoke --prepare-init
+./target/release/bionic-smoke --init ./target/release/linux-run
+```
+
+Do not pass `--fetch`. The log has to include `host sysname=Darwin
+machine=arm64` and `pagesize=16384`, the `----- init pid=N -----`
+blocks, and `init-probe: first observation:`. Admission errno 2 is a
+harness failure, not an init result. This is not ART. The vDSO
+eight-try fallback is still unmeasured. `property_contexts` are still
+the default context.
+
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.
 The fallback branch itself is taken only when the commpage offset
