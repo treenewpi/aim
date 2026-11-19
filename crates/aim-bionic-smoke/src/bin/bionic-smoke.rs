@@ -55,7 +55,10 @@ Pinned image: {REPOSITORY}:{TAG}
 This is the reDroid Android 16 64-bit image, not the Play Store image.
 It does not boot reDroid.
 --prepare-servicemanager only stages the original servicemanager and
-service binaries. It does not register a service or run a transaction.
+service binaries, plus a generated /dev/__properties__ where
+servicemanager.ready is true. That value lets the original client leave
+WaitForProperty. It is not a binder result and it does not register a
+service or run a transaction.
 Acceptance of that stage is a real Apple Silicon Mac running them under
 linux-run on XNU. A Linux compile, unit test, this staging, a Linux VM,
 or a Linux container is not that run. A Mac log has to include the host

@@ -13,8 +13,11 @@
 //! `ioctl`. The trace gate is the completed leave line
 //! `openat(-100, "/dev/binder", ...) = fd`, not the path string.
 //! `android LINUX_RUN ROOT` runs the original reDroid `servicemanager`
-//! and `service` from that root. It prints their stdout and stops at the
-//! first real failure. Acceptance is that run on Apple Silicon macOS/XNU,
+//! and `service` from that root. The root's generated
+//! `servicemanager.ready` property lets the original client finish its
+//! wait and open the driver; the harness still requires the driver's
+//! result and the client's own text. It prints their stdout and stops at
+//! the first real failure. Acceptance is that run on Apple Silicon macOS/XNU,
 //! with the host platform, page size, commit, pids, exit codes, and the
 //! original transaction text. A Linux run is not that result. The
 //! host-only subcommands stay as they are.

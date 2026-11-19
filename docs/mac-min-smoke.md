@@ -135,8 +135,12 @@ mode `0700` returns errno 13 before the ELF is read.
 `bionic-smoke --prepare-servicemanager` copies the audited bionic root
 and adds the original `servicemanager`, `service`, `libbinder.so`, and
 the rest of that `DT_NEEDED` closure from the pinned layer. Those bytes
-stay the layer's. `linkerconfig/ld.config.txt` is generated. Staging
-does not execute either program. `aim-binder-proc android` is the run:
+stay the layer's. `linkerconfig/ld.config.txt` is generated.
+`dev/__properties__` is generated too, with `servicemanager.ready=true`,
+because the original `service` waits for that value before it opens
+`/dev/binder`. The area is bionic's property format. It is not a binder
+result, and the original binaries are not modified. Staging does not
+execute either program. `aim-binder-proc android` is the run:
 one binder daemon, then the original `service check manager` with no
 context manager, then the original `servicemanager`, then `service
 list`, `service check manager`, and `service check servicemanager`.
@@ -183,8 +187,21 @@ process:
 
 `android-servicemanager: first blocker:` is not a pass. Keep that
 command's pid, exit code, stdout, and stderr; that is the next Mac
-input. This is still not ART or a reDroid boot. Linux tests of the
-staging tool do not satisfy this section.
+input. A harness deadline is the observation window. It is not a fix
+for a guest that never returns. This is still not ART or a reDroid
+boot. Linux tests of the staging tool do not satisfy this section.
+
+Commit `681b331` on this branch was run on an M4, macOS 26.5.1
+(25F80), Darwin 25.5.0, 16 KiB pages. Staging hashes matched. With no
+context manager, original `service check manager` produced no stdout
+and no completed `openat` of `/dev/binder`. The main thread stayed in
+the anonymous vDSO at `0x80049f50b8` (`mrs x12, S3_4_C15_C10_6`) and
+`0x80049f50bc` (the second load of the commpage timebase offset). The
+caller was `android::base::WaitForProperty` via bionic
+`clock_gettime`. The following commit bounds that retry and then uses
+the `clock_gettime` syscall. The same vDSO is mapped for every guest,
+so earlier Mac results for guests that call `clock_gettime` were not
+re-run after this change and are not a new acceptance of it.
 
 ## Synthetic ELF
 

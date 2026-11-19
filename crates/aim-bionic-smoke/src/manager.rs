@@ -3,10 +3,15 @@
 //!
 //! The binaries, libraries, VINTF manifests and SELinux texts are the
 //! layer's bytes. `linkerconfig/ld.config.txt` is generated, because
-//! reDroid leaves `/linkerconfig` empty until init runs. This does not
-//! execute either program and it does not register a service. Staging on
-//! Linux is not acceptance: only a later run of the original binaries
-//! under `linux-run` on Apple Silicon macOS counts.
+//! reDroid leaves `/linkerconfig` empty until init runs. `dev/__properties__`
+//! is also generated: the original `service` waits in
+//! `android::base::WaitForProperty("servicemanager.ready", "true")` before
+//! it opens `/dev/binder`, and this root has no init to publish that
+//! value. The area is the bionic format, and the value is `true` so that
+//! wait returns. It is not a binder result and not a claim that
+//! servicemanager has registered. This does not execute either program.
+//! Staging on Linux is not acceptance: only a later run of the original
+//! binaries under `linux-run` on Apple Silicon macOS counts.
 
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
@@ -98,6 +103,7 @@ pub fn prepare_manager() -> Result<PathBuf, String> {
     copy_apex_libdl(&root)?;
     let config = root.join("linkerconfig/ld.config.txt");
     fs::write(&config, linker_config()).map_err(|e| e.to_string())?;
+    write_ready_property(&root)?;
     audit(&root)?;
     write_provenance(&root, &layer)?;
     println!(
@@ -317,6 +323,49 @@ fn check_hash(root: &Path, rel: &str, expect: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Bionic's `/dev/__properties__` with one value, so the original client's
+/// `WaitForProperty` can observe it. The files are generated.
+pub const READY_PROPERTY: &str = "servicemanager.ready";
+const READY_CONTEXT: &str = "u:object_r:default_prop:s0";
+
+fn write_ready_property(root: &Path) -> Result<(), String> {
+    use aim_android_init::props::{NoWake, PropertyAreas, PropertyInfoEntry, build_trie};
+
+    let info = build_trie(
+        &[PropertyInfoEntry::new(
+            READY_PROPERTY,
+            READY_CONTEXT,
+            "bool",
+            true,
+        )],
+        READY_CONTEXT,
+        "string",
+    )?;
+    let areas = PropertyAreas::new(info.clone())?;
+    areas
+        .add(READY_PROPERTY, b"true", &NoWake)
+        .map_err(|error| format!("{READY_PROPERTY}: {error:?}"))?;
+    if areas.get(READY_PROPERTY).as_deref() != Some("true") {
+        return Err("generated servicemanager.ready did not read back as true".into());
+    }
+    let dir = root.join("dev/__properties__");
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    set_mode(&dir, 0o755)?;
+    let write = |name: &str, bytes: &[u8]| -> Result<(), String> {
+        let path = dir.join(name);
+        fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        set_mode(&path, 0o444)?;
+        Ok(())
+    };
+    write("property_info", &info)?;
+    let area = areas
+        .area(READY_CONTEXT)
+        .ok_or("ready context has no property area")?;
+    write(READY_CONTEXT, &area.bytes())?;
+    write("properties_serial", &areas.serial_area().bytes())?;
+    Ok(())
+}
+
 fn write_provenance(root: &Path, layer: &Path) -> Result<(), String> {
     let mut text = format!(
         "kind original-servicemanager-root\n\
@@ -331,6 +380,8 @@ fn write_provenance(root: &Path, layer: &Path) -> Result<(), String> {
          bootstrap_linker_sha256 {BOOTSTRAP_LINKER_SHA256}\n\
          libdl_android_sha256 {LIBDL_ANDROID_SHA256}\n\
          generated linkerconfig/ld.config.txt\n\
+         generated dev/__properties__ servicemanager.ready=true\n\
+         generated_property_is_not_a_binder_result true\n\
          selinux_texts original plat_sepolicy.cil and service contexts\n\
          selinux_decisions the existing permissive runtime, not a policy loaded from this root\n\
          acceptance_platform apple-silicon-macos-xnu\n\
@@ -392,6 +443,18 @@ mod tests {
         }
         assert!(linker_config().contains("not an original image file"));
         assert!(linker_config().contains("/system/lib64"));
+        let dir = std::env::temp_dir().join(format!("aim-ready-prop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_ready_property(&dir).unwrap();
+        let prop = dir.join("dev/__properties__");
+        let bytes = fs::read(prop.join(READY_CONTEXT)).unwrap();
+        let reader = aim_android_init::props::PropAreaReader::new(&bytes).unwrap();
+        let info = reader.find(READY_PROPERTY).unwrap();
+        assert_eq!(reader.read(info).unwrap().value, "true");
+        assert!(prop.join("property_info").is_file());
+        assert!(prop.join("properties_serial").is_file());
+        let _ = fs::remove_dir_all(&dir);
         assert!(!binder_device_opened(
             "openat(\"/dev/binder\"\n[linux] ioctl(0x3, 0x1, 0x2)\n"
         ));
@@ -425,5 +488,18 @@ mod tests {
         assert!(note.contains("not_synthetic_pie true"));
         assert!(note.contains("executed false"));
         assert!(note.contains("linux_stage_is_not_acceptance true"));
+        assert!(note.contains("generated dev/__properties__ servicemanager.ready=true"));
+        let ready = fs::read(root.join("dev/__properties__").join(READY_CONTEXT)).unwrap();
+        let reader = aim_android_init::props::PropAreaReader::new(&ready).unwrap();
+        let found = reader.find(READY_PROPERTY).unwrap();
+        assert_eq!(reader.read(found).unwrap().value, "true");
+        assert_eq!(
+            sha256_file(&root.join("system/bin/service")).unwrap(),
+            SERVICE_SHA256
+        );
+        assert_eq!(
+            sha256_file(&root.join("system/bin/servicemanager")).unwrap(),
+            SERVICEMANAGER_SHA256
+        );
     }
 }

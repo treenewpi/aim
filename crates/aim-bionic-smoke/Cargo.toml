@@ -7,6 +7,7 @@ publish = false
 description = "Stage original reDroid linker64 and toybox and run them under linux-run"
 
 [dependencies]
+aim-android-init = { path = "../aim-android-init" }
 aim-paths = { path = "../aim-paths" }
 android-image-extract = { path = "../../tools/android-image-extract" }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }

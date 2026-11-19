@@ -116,6 +116,11 @@ prints the directory fd (`AT_FDCWD`) first; a path substring is not a
 pass. The original `servicemanager` and `service` binaries from the
 pinned reDroid layer are the next guest on that path
 (`bionic-smoke --prepare-servicemanager`, then `aim-binder-proc android`).
+The staged root adds a generated `servicemanager.ready=true` property
+area so the original client can leave `WaitForProperty` and open
+`/dev/binder`. The vDSO's commpage timebase retry is bounded and then
+takes the `clock_gettime` syscall; an open retry never returned on the
+M4 sample of that client. Neither change is a binder result.
 A Linux staging of those files is not the run, and neither is a Linux
 VM or container on the Mac. Acceptance is the Mac command in
 [mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host
