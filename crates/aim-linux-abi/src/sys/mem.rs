@@ -1833,10 +1833,48 @@ pub(super) fn allocate(len: u64) -> Result<u64, i64> {
     arena::map_anon(len, libc::PROT_READ | libc::PROT_WRITE)
 }
 
+fn host_page_aligned(addr: u64, len: u64) -> bool {
+    addr & (PAGE - 1) == 0 && len & (PAGE - 1) == 0
+}
+
+/// Run `write` on `[lo, lo+len)` without remapping that span. A 16 KiB
+/// `MAP_FIXED` would also clear the rest of the host page, which is how
+/// call 2371 turned Scudo's 4 KiB `MADV_DONTNEED` into a zero chunk header
+/// at `0x81af1ed6c0`.
+fn write_guest_bytes(lo: u64, len: u64, region_prot: i32, write: impl FnOnce() -> i64) -> i64 {
+    let mut cur = lo;
+    let end = lo + len;
+    let mut widened = Vec::new();
+    while cur < end {
+        let host = cur & !(PAGE - 1);
+        let prot = page_prot(host).unwrap_or(region_prot as u32);
+        if prot & libc::PROT_WRITE as u32 == 0 {
+            let result = host_mprotect(host, PAGE, (prot | libc::PROT_WRITE as u32) as i32);
+            if result < 0 {
+                for (host, prot) in widened.iter().rev() {
+                    host_mprotect(*host, PAGE, *prot as i32);
+                }
+                return result;
+            }
+            widened.push((host, prot));
+        }
+        cur = host + PAGE;
+    }
+    let written = write();
+    for (host, prot) in widened.iter().rev() {
+        let result = host_mprotect(*host, PAGE, *prot as i32);
+        if result < 0 {
+            return result;
+        }
+    }
+    written
+}
+
 /// Linux MADV_DONTNEED on private memory must read back zeros (anonymous)
 /// or the file's contents (file-backed); Darwin's does not guarantee it.
-/// Replace each private, non-executable piece with fresh memory of the
-/// same protection. Shared mappings keep their contents, as on Linux.
+/// A whole 16 KiB host page is replaced. A 4 KiB guest page is written in
+/// place so the other slices of that host page stay. Shared mappings keep
+/// their contents, as on Linux.
 fn discard_private(addr: u64, len: u64) -> i64 {
     for r in vmmap::regions(addr, addr + len) {
         let prot = r.prot as i32 & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
@@ -1844,6 +1882,39 @@ fn discard_private(addr: u64, len: u64) -> i64 {
             continue;
         }
         let (lo, n) = (r.start, r.end - r.start);
+        if !host_page_aligned(lo, n) {
+            let result = if r.file.is_none() {
+                // SAFETY: `lo` is inside a mapped private region. Absent
+                // 4 KiB slices stay readable until the whole host page goes.
+                write_guest_bytes(lo, n, prot, || unsafe {
+                    std::ptr::write_bytes(lo as *mut u8, 0, n as usize);
+                    0
+                })
+            } else {
+                let Some((path, _, _)) = &r.file else {
+                    continue;
+                };
+                let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+                    continue;
+                };
+                // SAFETY: reopening the region's own backing file.
+                let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    continue;
+                }
+                let offset = copies::find(lo).map_or(r.offset, |(_, off)| off);
+                let filled = write_guest_bytes(lo, n, prot, || {
+                    populate(lo, n, fd, offset).map_or_else(|error| error, |_| 0)
+                });
+                // SAFETY: our temporary fd.
+                unsafe { libc::close(fd) };
+                filled
+            };
+            if result < 0 {
+                return result;
+            }
+            continue;
+        }
         let fresh = match &r.file {
             Some((path, _, _)) => {
                 let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
@@ -1923,7 +1994,16 @@ fn refill_copy(lo: u64, n: u64, prot: i32) -> Result<(), i64> {
 }
 
 pub fn madvise(a: [u64; 6]) -> i64 {
-    let Some(len) = a[1].checked_add(PAGE - 1).map(|n| n & !(PAGE - 1)) else {
+    let advice = a[2];
+    // Bionic and Scudo discard 4 KiB pages (`GUEST_PAGE`). Rounding a
+    // 4 KiB `MADV_DONTNEED` up to the 16 KiB host page zeros live chunks
+    // on the following slices. `MADV_WILLNEED` stays on the host page.
+    let granule = if matches!(advice, MADV_DONTNEED | MADV_REMOVE) {
+        GUEST_PAGE
+    } else {
+        PAGE
+    };
+    let Some(len) = a[1].checked_add(granule - 1).map(|n| n & !(granule - 1)) else {
         return -(EINVAL as i64);
     };
     if a[0].checked_add(len).is_none() {
@@ -1934,9 +2014,9 @@ pub fn madvise(a: [u64; 6]) -> i64 {
     if super::verity_pager::failed_range(a[0], len) {
         return -(errno::EIO as i64);
     }
-    let (addr, advice) = (a[0], a[2]);
+    let (addr, advice) = (a[0], advice);
     super::verity_pager::wait_pending(addr, len);
-    if addr & (PAGE - 1) != 0 {
+    if addr & (granule - 1) != 0 {
         return -(EINVAL as i64);
     }
     match advice {
@@ -2856,5 +2936,57 @@ mod tests {
             libc::munmap(ptr, PAGE as usize);
         }
         assert_eq!(madvise([0, PAGE, MADV_WILLNEED, 0, 0, 0]), -(ENOMEM as i64));
+    }
+
+    #[test]
+    fn dontneed_discards_one_guest_page_and_leaves_the_rest() {
+        let bytes = 3 * PAGE as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let raw = ptr as u64;
+        let start = (raw + PAGE - 1) & !(PAGE - 1);
+        assert!(start + PAGE <= raw + bytes as u64);
+        let slice = |at, n| unsafe { std::slice::from_raw_parts(at as *const u8, n) };
+        let fill = |at, n| unsafe { std::ptr::write_bytes(at as *mut u8, 0x5a, n) };
+        fill(start, PAGE as usize);
+        assert_eq!(
+            madvise([start, GUEST_PAGE, MADV_DONTNEED, 0, 0, 0]),
+            0,
+            "a 4 KiB discard at a 16 KiB boundary"
+        );
+        assert!(slice(start, GUEST_PAGE as usize).iter().all(|b| *b == 0));
+        assert!(
+            slice(start + GUEST_PAGE, (PAGE - GUEST_PAGE) as usize)
+                .iter()
+                .all(|b| *b == 0x5a),
+            "the other slices of the host page stay"
+        );
+        fill(start, PAGE as usize);
+        assert_eq!(
+            madvise([start + GUEST_PAGE, GUEST_PAGE, MADV_DONTNEED, 0, 0, 0]),
+            0,
+            "a 4 KiB-aligned address is a valid guest page"
+        );
+        assert!(slice(start, GUEST_PAGE as usize).iter().all(|b| *b == 0x5a));
+        assert!(
+            slice(start + GUEST_PAGE, GUEST_PAGE as usize)
+                .iter()
+                .all(|b| *b == 0)
+        );
+        assert!(
+            slice(start + 2 * GUEST_PAGE, (PAGE - 2 * GUEST_PAGE) as usize)
+                .iter()
+                .all(|b| *b == 0x5a)
+        );
+        unsafe { libc::munmap(ptr, bytes) };
     }
 }

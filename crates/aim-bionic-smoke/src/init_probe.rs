@@ -492,6 +492,7 @@ fn write_provenance(
          measured_372d08f_stop PropertyInit SIGABRT after mkdir /dev/__properties__ ENOENT and plat_property_contexts ENOENT\n\
          measured_14a42a5_stop MountExtraFilesystems CHECKCALL of tmpfs on /bootstrap-apex ENOENT after /apex mounted and access /system/bin/recovery ENOENT\n\
          measured_a6e5306_stop second stage logged; property contexts read; no property_info; no mount after umount2 of /debug_ramdisk; writev(fd 2)=149 payload not in that trace\n\
+         measured_88f3d34_stop Scudo zero chunk header at untagged 0x81af1ed6c0 after madvise(0x81af1ec000, 0x1000) was rounded to 16KiB\n\
          file_vma_ends_on_4kib_guest_page true\n\
          syscall_trace_is_not_guest_fd_2 true\n\
          prctl_set_vma_uses_4kib_guest_granule true\n\

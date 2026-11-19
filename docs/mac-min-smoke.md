@@ -541,10 +541,9 @@ itself the fatal. A `[linux-trace] stdio` line is a bounded copy of a
 write to guest fd 0, 1, or 2, with the pid, tid, call number, iov
 lengths, and the syscall's return value. A line that only repeats
 the 2026-09-27 syscall list is not the observation.
-Commit `a6e5306` on macmini (Darwin 25.5.0) printed both stage logs
-to `[kmsg]`, kept the trace past `dup3` of fd 2, and exited 6 at
-call 2384 before `property_info` and before any second-stage `mount`
-(see below).
+Commit `88f3d34` on macmini (Darwin 25.5.0) captured the fd 2 abort
+text and exited 6 at call 2384 before `property_info` and before any
+second-stage `mount` (see below).
 
 ```sh
 ./target/release/bionic-smoke --prepare-init
@@ -565,24 +564,24 @@ the copy stopped at 512 bytes. `harness.stdout` also prints
 `----- init pid=N -----` blocks and the same observation.
 Admission errno 2 is a harness failure, not an init result. This is
 not ART. The vDSO eight-try fallback is still unmeasured.
-Commit `a6e5306` on macmini (Darwin 25.5.0) printed
-`init first stage started!` and `init second stage started!` to
-`[kmsg]`. Guest pid 94730 exited 6, not timed out. The last trace
+Commit `88f3d34` on macmini (Darwin 25.5.0) printed both stage logs
+to `[kmsg]`. Guest pid 95275 exited 6, not timed out. The last trace
 line was `exit_group(0x6)` at call 2384. The first failed syscall
 was the survived call 66 ENOENT. The last `[kmsg]` line is
 `Failed to umount /debug_ramdisk: Invalid argument` and is not the
 fatal. After that umount, init read both property context files and
 did not create `property_info`. There is no `mount` after call 2263,
-so `/bootstrap-apex` was not the observed stop. The abort text was
-`writev(fd 2)` returning 149 at call 2376; fd 2 is `/dev/null` and
-those bytes were not captured. The next trace records that payload.
-`/bootstrap-apex` is an empty layer-entry directory.
-`/linkerconfig` is the bionic root's directory and still contains
-`ld.config.txt`, which the linker opened. The compatibility property
-service still uses its default string context. The init probe's
-contexts are the layer's files. Creating `property_info` is not that
-service and is not a boot. Identity denial is still only the host
-socket test. The stdio payload line has not been measured.
+so `/bootstrap-apex` was not the observed stop. Call 2376 `writev` of
+fd 2 returned 149 and the trace recorded the whole payload, with no
+`partial` or `truncated` mark. The text is Scudo's zero chunk header
+at `0x2000081af1ed6c0`. The untagged address `0x81af1ed6c0` is in the
+guest page after `madvise(0x81af1ec000, 0x1000, MADV_DONTNEED)` at
+call 2371. That discard was rounded up to 16 KiB. `MADV_DONTNEED` now
+uses the 4 KiB guest page, and a partial host page is zeroed in place.
+The next run has not measured that fix. `/linkerconfig` still contains
+`ld.config.txt`. The init probe's contexts are the layer's files.
+Creating `property_info` is not the property service and is not a
+boot. Identity denial is still only the host socket test.
 
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.
