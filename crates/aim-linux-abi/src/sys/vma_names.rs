@@ -282,8 +282,10 @@ mod tests {
 
     #[test]
     fn four_kib_slices_inside_a_host_page_are_a_name_span() {
-        // Measured on the M4 init probe: the mapping existed, and the
-        // 16 KiB alignment check was the EINVAL.
+        // Alignment only. `0x8004ce9000` was EINVAL under a 16 KiB check and
+        // returned 0 once the granule was 4 KiB. `0x80004c5000` and
+        // `0x80002f9000` are the same kind of span; 90882eb returned EBADF
+        // because the host-page file note covered the anonymous `.bss`.
         assert_eq!(
             name_span(0x8004_ce90_00, 0x8000),
             Ok((0x8004_ce90_00, 0x8004_cf10_00))

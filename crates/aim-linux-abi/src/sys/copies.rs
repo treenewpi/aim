@@ -83,6 +83,39 @@ pub fn find(addr: u64) -> Option<(Copy, u64)> {
     (addr < c.end).then(|| (c.clone(), c.offset + (addr - s)))
 }
 
+/// `[lo, hi)` cut at copy boundaries. `Some` is the file-backed piece and
+/// the file offset of its start. `None` is a gap: anonymous, including the
+/// ELF `.bss` that starts on the next 4 KiB page after the file bytes.
+pub fn covered(lo: u64, hi: u64) -> Vec<(u64, u64, Option<(Copy, u64)>)> {
+    if lo >= hi {
+        return Vec::new();
+    }
+    let m = COPIES.lock().unwrap();
+    let mut out = Vec::new();
+    let mut cur = lo;
+    let from = m
+        .range(..lo)
+        .next_back()
+        .filter(|(_, c)| c.end > lo)
+        .map_or(lo, |(&s, _)| s);
+    for (&key, c) in m.range(from..hi) {
+        let start = key.max(lo);
+        let end = c.end.min(hi);
+        if start >= end {
+            continue;
+        }
+        if start > cur {
+            out.push((cur, start, None));
+        }
+        out.push((start, end, Some((c.clone(), c.offset + (start - key)))));
+        cur = end;
+    }
+    if cur < hi {
+        out.push((cur, hi, None));
+    }
+    out
+}
+
 /// mremap moved `[old, old+len)` to `new`.
 pub fn moved(old: u64, new: u64, len: u64) {
     let parts: Vec<(u64, Copy)> = {
@@ -138,4 +171,48 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
         )
     });
     COPIES.lock().unwrap().extend(v);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn bss_on_the_next_guest_page_is_not_a_file_copy() {
+        // Measured init PR_SET_VMA ranges. The file VMA ends where bionic's
+        // 4 KiB PAGE_END(filesz) ends. Naming starts there.
+        let path = Path::new("/system/bin/init");
+        note_file(
+            0x8000_4c40_00,
+            0x1000,
+            path,
+            "/system/bin/init",
+            0x4c_4000,
+            (1, 2),
+        );
+        note_file(
+            0x8000_2f80_00,
+            0x1000,
+            path,
+            "/system/bin/init",
+            0x2f_8000,
+            (1, 2),
+        );
+        assert!(
+            covered(0x8000_4c50_00, 0x8000_4d80_00)
+                .iter()
+                .all(|(_, _, copy)| copy.is_none())
+        );
+        assert!(
+            covered(0x8000_2f90_00, 0x8000_2fa0_00)
+                .iter()
+                .all(|(_, _, copy)| copy.is_none())
+        );
+        let across = covered(0x8000_4c40_00, 0x8000_4c60_00);
+        assert!(across[0].2.is_some());
+        assert!(across[1].2.is_none());
+        assert_eq!(across[0].1, 0x8000_4c50_00);
+        forget(0x8000_2f80_00, 0x8000_4d80_00);
+    }
 }

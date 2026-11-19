@@ -607,11 +607,15 @@ pub(super) fn vmas_in(lo: u64, hi: u64) -> Vec<Vma> {
             dev = d;
             ino = i;
             name = n;
-        } else if let Some((c, off)) = super::copies::find(r.start) {
-            offset = off;
-            dev = c.dev;
-            ino = c.ino;
-            name = c.guest;
+        } else if super::copies::covered(r.start, r.end)
+            .iter()
+            .any(|(_, _, copy)| copy.is_some())
+        {
+            // The Darwin entry can run from the file bytes into the
+            // anonymous `.bss`. Only the recorded file extent is a file.
+            // The rest can take `PR_SET_VMA_ANON_NAME`.
+            push_copy_split(&mut out, &r, &perms);
+            continue;
         } else if r.start < stack.hi && stack.lo < r.end && prot != 0 {
             name = "[stack]".into();
         } else if let Some(n) = crate::vdso::name_of(r.start) {
@@ -677,6 +681,79 @@ pub(super) fn vmas_in(lo: u64, hi: u64) -> Vec<Vma> {
         }
     }
     out
+}
+
+/// One Darwin entry that holds both a copied file and anonymous bytes.
+fn push_copy_split(out: &mut Vec<Vma>, r: &vmmap::Region, perms: &str) {
+    let pages = (r.end - r.start) / super::mem::PAGE;
+    let share = |start: u64, end: u64| r.usage.share((end - start) / super::mem::PAGE, pages);
+    let line_of = |start: u64, end: u64, offset: u64, dev: u64, ino: u64, name: &str| {
+        let mut line = format!(
+            "{start:08x}-{end:08x} {perms} {offset:08x} {:02x}:{:02x} {ino}",
+            (dev >> 24) & 0xff,
+            dev & 0xff_ffff
+        );
+        if !name.is_empty() {
+            push_name(&mut line, name);
+        }
+        line.push('\n');
+        line
+    };
+    for (start, end, copy) in super::copies::covered(r.start, r.end) {
+        if let Some((c, offset)) = copy {
+            let piece = vmmap::Region {
+                start,
+                end,
+                prot: r.prot,
+                shared: r.shared,
+                offset,
+                file: None,
+                usage: share(start, end),
+            };
+            out.push(Vma {
+                line: line_of(start, end, offset, c.dev, c.ino, &c.guest),
+                region: piece,
+                name: c.guest,
+                file: c.ino != 0,
+                shmem: false,
+            });
+            continue;
+        }
+        let named = super::vma_names::pieces(start, end);
+        let anon = |start: u64, end: u64| vmmap::Region {
+            start,
+            end,
+            prot: r.prot,
+            shared: r.shared,
+            offset: 0,
+            file: None,
+            usage: share(start, end),
+        };
+        if named.iter().all(|(_, _, n)| n.is_none()) {
+            out.push(Vma {
+                line: line_of(start, end, 0, 0, 0, ""),
+                region: anon(start, end),
+                name: String::new(),
+                file: false,
+                shmem: false,
+            });
+            continue;
+        }
+        for (start, end, n) in named {
+            let name = match n {
+                Some(n) if r.shared => format!("[anon_shmem:{n}]"),
+                Some(n) => format!("[anon:{n}]"),
+                None => String::new(),
+            };
+            out.push(Vma {
+                line: line_of(start, end, 0, 0, 0, &name),
+                region: anon(start, end),
+                name,
+                file: false,
+                shmem: false,
+            });
+        }
+    }
 }
 
 /// A mapping's name after its `maps` line, from column 73 on.

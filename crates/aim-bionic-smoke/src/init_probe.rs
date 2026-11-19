@@ -241,7 +241,9 @@ fn write_provenance(root: &Path, layer: &Path, copied: &[String]) -> Result<(), 
          {libraries}\
          servicemanager_ready_not_seeded true\n\
          measured_6d5f448_stop libext2_uuid.so needed by libext4_utils.so\n\
-         measured_6d5f448_prctl_set_vma EINVAL on 4KiB-aligned address inside 16KiB page\n\
+         measured_90882eb_prctl_set_vma EBADF on bss 0x80004c5000/0x13000 and 0x80002f9000/0x1000\n\
+         file_vma_ends_on_4kib_guest_page true\n\
+         syscall_trace_is_not_guest_fd_2 true\n\
          prctl_set_vma_uses_4kib_guest_granule true\n\
          historical_2026_09_27_linker_stops_are_not_this_measurement true\n\
          mremap_seqpacket_rt_tgsigqueueinfo_were_not_the_measured_stop true\n\
@@ -303,6 +305,15 @@ pub fn run_init(linux_run: &Path) -> Result<(), String> {
     ));
     report.push_str("init-probe: not a boot\n");
     fs::write(&report_path, &report).map_err(|e| format!("write {}: {e}", report_path.display()))?;
+    let last_trace = err
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[linux] ") || line.starts_with("[linux-abi] "))
+        .unwrap_or("(no trace line)");
+    println!(
+        "init-probe: syscall trace is the diagnostics descriptor, not guest fd 2"
+    );
+    println!("init-probe: last trace: {last_trace}");
     println!("init-probe: trace file {}", report_path.display());
     println!("init-probe: guest stdout {}", stdout_path.display());
     println!("init-probe: guest stderr {}", stderr_path.display());

@@ -718,9 +718,15 @@ the remaining original daemons use, evdev, and memfd/ashmem.
   4 KiB guest granule bionic names, the same granule `mprotect` accepts
   inside a 16 KiB host page. A 16 KiB-only alignment check returned
   EINVAL for the linker's slice at `0x8004ce9000` length `0x8000` and
-  the process continued. A start that is not 4 KiB aligned, a bad name,
-  a file or memfd mapping, and a hole still fail. Sorting heaps by
-  those names is still open (#1581).
+  the process continued. On `90882eb` the same call returned 0, and
+  `0x80004c5000` length `0x13000` and `0x80002f9000` length `0x1000`
+  returned EBADF: the load-time file note was rounded to the host page,
+  so the anonymous `.bss` in that page was classified as a file. The
+  file extent now ends on the 4 KiB page after the file bytes, and a
+  Darwin entry that continues into the `.bss` is split there. A start
+  that is not 4 KiB aligned, a bad name, a real file or memfd mapping,
+  and a hole still fail. Sorting heaps by those names is still open
+  (#1581).
 - **Answered "unsupported" (Android falls back):** cgroup v1 controllers
   other than `blkio`, `cpu` and `cpuset`, the other namespaces, SELinux enforcement (permissive), userfaultfd (ART
   uses its copying collector) and BINDER_FREEZE.

@@ -43,7 +43,8 @@ const USAGE: &str = "usage: linux-run [OPTIONS] PROGRAM [ARGS...]
   --vulkan DIR           host Vulkan library (MoltenVK) for the Vulkan driver
   --display SOCKET       display server (aim-display) for the composer
                          and input (/dev/input)
-  --trace                log every syscall
+  --trace                log every syscall on a duplicate of stderr, so a
+                         guest that replaces fd 2 keeps the log
   --stdio-null           the guest's stdin, stdout and stderr are /dev/null
                          (as init gives services); the layer's own messages
                          still go to the original stderr
@@ -394,6 +395,18 @@ fn main() {
     if let Some(v) = &vulkan {
         aim_host_vulkan::set_library_dir(v);
         runtime_args.extend([cstring("--vulkan"), cstring(v.as_os_str().as_bytes())]);
+    }
+    if trace && diag_fd.is_none() {
+        match aim_linux_abi::diag::detach_from_stdio() {
+            Ok(fd) => {
+                diag_fd = Some(fd);
+                aim_linux_abi::diag!("[linux-abi] diagnostics fd {fd} is not guest stderr");
+            }
+            Err(error) => {
+                eprintln!("linux-run: diagnostics descriptor: {error}");
+                std::process::exit(127);
+            }
+        }
     }
     aim_host_audio::set_log_fd(aim_linux_abi::diag::log_fd());
     aim_host_camera::set_log_fd(aim_linux_abi::diag::log_fd());

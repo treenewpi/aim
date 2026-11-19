@@ -503,9 +503,9 @@ in the guest or passed by a service's `file` line.
 
 That list is the 2026-09-27 `linux-run`. It is not a trace of today's
 `/system/bin/init`. Those three calls are dispatched now, and original
-servicemanager has since reached `main` on the Mac. The 2026-11-19 M4
-probe of `/system/bin/init` (commit `6d5f448`) stopped on
-`prctl(PR_SET_VMA)` EINVAL for a 4 KiB slice and then on a missing
-`libext2_uuid.so`. See [boot-status.md](boot-status.md).
+servicemanager has since reached `main` on the Mac. The 2026-11-19
+macmini probe of `/system/bin/init` (commit `90882eb`) returned EBADF
+from `prctl(PR_SET_VMA)` on two `.bss` ranges and then lost the trace
+when init pointed fd 2 at `/dev/null`. See [boot-status.md](boot-status.md).
 
 The current state of the boot is in [boot-status.md](boot-status.md).

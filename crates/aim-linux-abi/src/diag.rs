@@ -2,8 +2,9 @@
 //! The host signal handlers themselves are `sys::signal`'s.
 //!
 //! The layer's own messages ([`diag!`](crate::diag)) go to the diagnostics
-//! descriptor: stderr, or with `--stdio-null` a hidden copy of it, so that
-//! the guest's stdio can be `/dev/null` as init gives services.
+//! descriptor. `--trace` and `--stdio-null` keep that descriptor a duplicate
+//! of the original stderr, so the guest can point fd 2 at `/dev/null` (as
+//! init does) without dropping the syscall trace.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
@@ -44,6 +45,20 @@ pub(crate) fn retain_exec_fd() -> Result<(), crate::errno::Errno> {
         return Err(crate::errno::last());
     }
     Ok(())
+}
+
+/// Duplicate stderr and send layer messages there. The guest can replace
+/// fd 2 (`dup3` onto `/dev/null`, as init does) without taking the syscall
+/// trace with it. The duplicate is the same open file, so the trace stays
+/// in the stderr capture until that replacement, and after it.
+pub fn detach_from_stdio() -> std::io::Result<i32> {
+    // SAFETY: duplicating this process's stderr.
+    let fd = unsafe { libc::fcntl(2, libc::F_DUPFD, crate::sys::fdtab::hidden_base()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    keep_log_fd(fd);
+    Ok(fd)
 }
 
 /// `--stdio-null`: keep stderr as the (hidden, exec-surviving)

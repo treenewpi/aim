@@ -511,15 +511,20 @@ missing, needed by `libext4_utils.so`. Provenance lists each copied
 path and its sha256. The root still has no property area.
 `bionic-smoke --init LINUX_RUN` runs that binary for at most eight
 seconds. Guest stdout and stderr are files, so a full pipe cannot stall
-the guest or the harness. The full trace is
+the guest or the harness. With `--trace`, `linux-run` duplicates stderr
+onto a hidden diagnostics descriptor before the guest runs. Init's
+`dup3` of fd 2 onto `/dev/null` replaces guest stderr and leaves that
+descriptor on the stderr file, so the syscall trace continues. The
+stderr file is that trace. The full report is
 `_build/redroid-16-init/init-probe.txt`. The process stdout is the
 observation, the pid, and that path. `init-probe: not a boot` is
 required. There is no `init ok` unless the trace contains
 `init first stage started!`. A line that only repeats the 2026-09-27
-syscall list is not the observation. Commit `6d5f448` on this M4 did
-not reach main: the first failed syscall was `prctl(PR_SET_VMA)`
-EINVAL on a 4 KiB-aligned address, the process continued, and the
-linker then exited because `libext2_uuid.so` was absent.
+syscall list is not the observation. Commit `90882eb` on macmini
+(Darwin 25.5.0) did not reach main: `PR_SET_VMA` returned EBADF for
+`0x80004c5000` length `0x13000` and `0x80002f9000` length `0x1000`, the
+process continued, and the trace stopped at the enter of `dup3` onto
+fd 2. The guest exit status was 6. `libext2_uuid.so` was present.
 
 ```sh
 ./target/release/bionic-smoke --prepare-init
@@ -528,8 +533,11 @@ linker then exited because `libext2_uuid.so` was absent.
 
 Do not pass `--fetch`. Do not pipe the probe into another program.
 `harness.stdout` has to include `host sysname=Darwin machine=arm64`
-and `pagesize=16384`, `init-probe: trace file`, and
-`init-probe: first observation:`. `init-probe.txt` has to include the
+and `pagesize=16384`, `init-probe: syscall trace is the diagnostics descriptor`,
+`init-probe: trace file`, and `init-probe: first observation:`.
+`init-guest.stderr` has to include `diagnostics fd` and a leave line for
+the `dup3` that replaces fd 2. `harness.stdout` also prints
+`init-probe: last trace:`. `init-probe.txt` has to include the
 `----- init pid=N -----` blocks and the same observation.
 Admission errno 2 is a harness failure, not an init result. This is
 not ART. The vDSO eight-try fallback is still unmeasured.
