@@ -5,45 +5,44 @@ aim-guest-init on the syscall layer (ADR 0012, tracking #153). Update it
 with every boot-relevant change: the table, the date and the run it came
 from.
 
-Original `/system/bin/init` on macmini (commit `14a42a5`, macOS 26.5.1,
-Darwin 25.5.0, arm64, 16 KiB pages, Rust 1.88) reached second-stage
-`PropertyInit` and then `MountExtraFilesystems`. Guest pid 93826 exited
-6, `timed_out=false`. Guest stdio is `/dev/null`, so the absence of
-`init first stage started!` does not show that `main` was skipped; the
-earlier "did not reach main" wording is withdrawn. Positive evidence of
-second stage: init opened and read the layer's
-`plat_property_contexts` and `vendor_property_contexts`, created
-`/dev/__properties__/property_info` itself (`open` `O_CREAT` at call
-2366, `write` of `0x18068` at call 2369, later `mmap` of that file), and
-then ran the `UmountSecondStageRes` plus `MountExtraFilesystems`
-sequence. `PR_SET_VMA` returned 0 for the `.bss` ranges `90882eb` had
-reported as EBADF (`0x80004c5000` length `0x13000` at calls 16 and
-1182, `0x80002f9000` length `0x1000` at calls 89 and 1255). The syscall
-trace is the diagnostics descriptor. `dup3` onto fd 2 left (calls 1092
-and 2224). The last trace line is `exit_group(0x6)` at call 5934. The
-first failed syscall, which the process survived, is
+Original `/system/bin/init` on macmini (commit `a6e5306`, macOS 26.5.1,
+Darwin 25.5.0, arm64, 16 KiB pages, Rust 1.88) printed
+`init first stage started!` and `init second stage started!` into the
+`/dev/kmsg` marker. Those lines are on the diagnostics descriptor as
+`[kmsg]`. Second stage is confirmed. Guest pid 94730 exited 6,
+`timed_out=false`. This is not a boot and there is no `init ok`. The
+first failed syscall, which the process survived, is still
 `newfstatat("/dev/__properties__")` returning ENOENT at call 66.
 `prctl(PR_SET_TAGGED_ADDR_CTRL)` still returns EINVAL and the process
-continues. The exit is `MountExtraFilesystems`: `umount2` returned
-EINVAL at call 5923 (`UmountSecondStageRes` logs that and continues),
-`mount` of tmpfs with flags `0xe` returned 0 at call 5924 (`/apex`
-exists in the probe root), `faccessat("/system/bin/recovery")` returned
-ENOENT at call 5925 so `NeedsTwoMountNamespaces` is true, and the next
-`mount` with the same flags returned ENOENT at call 5926 because
-`/bootstrap-apex` is not a directory. `CHECKCALL` then `PLOG(FATAL)`s,
-`rt_tgsigqueueinfo` of signal 6 returned 0 at call 5933, and
-`exit_group(6)` follows. Missing `build.prop` opens earlier in
-`PropertyLoadBootDefaults` are warnings, not this abort. The probe root
-now also has empty `/bootstrap-apex` and `/linkerconfig` mount points
-(provenance records `layer-entry` when the tar has that directory;
-children are not copied) and an empty regular `/dev/kmsg` so the
-syscall layer's ring can record init's log.
-A guest write to that ring is copied to the diagnostics descriptor.
-`mount` of a missing path still returns ENOENT. The root still has no
-seeded property area and no hand-written context. Creating
-`property_info` is the metadata path, not the original property service,
-and this is not a boot. No init run after the mount-point directories
-has been measured (2026-11-19).
+continues. `PR_SET_VMA` returned 0 for the `.bss` ranges. `dup3` onto
+fd 2 left (calls 1092 and 2241). The last trace line is
+`exit_group(0x6)` at call 2384. The last `[kmsg]` line, `Failed to
+umount /debug_ramdisk: Invalid argument`, is the `umount2` at call
+2263 and is not the fatal. After it, init read the layer's
+`plat_property_contexts` and `vendor_property_contexts`. It did not
+create `/dev/__properties__/property_info`. There is no `mount` after
+that `umount2`, so this run does not show `/bootstrap-apex` or
+`SelabelInitialize`. The abort is `writev` of fd 2 returning 149 at
+call 2376 (fd 2 is `/dev/null`), then `mmap` of `0xa6`,
+`rt_tgsigqueueinfo` of signal 6 at call 2383, and `exit_group(6)`.
+The 149 bytes were not in that trace. A trace now copies a bounded
+prefix of a write to guest fd 0, 1, or 2 onto the diagnostics
+descriptor, with the pid, tid, call number, iov lengths, and the
+syscall's own return value. A fault, an overlong length, or a short
+write does not change that return value. A copy past 512 bytes is
+marked `truncated cap=512`. That copy has not been measured on macmini.
+`/bootstrap-apex` in the probe root is an empty directory because the
+layer tar has that directory entry; its children are not copied.
+`/linkerconfig` was already present, still contains `ld.config.txt`,
+and the linker opened that file (call 95). It is left in place.
+`/dev/kmsg` is an empty regular file, not the original character
+device. The two property contexts still match the layer hashes. The
+root still has no seeded property area and no hand-written context.
+Creating `property_info` is the metadata path, not the original
+property service. `mount` of a missing path still returns ENOENT.
+The `14a42a5` run reached `MountExtraFilesystems` and stopped on a
+missing `/bootstrap-apex`; `a6e5306` stopped earlier, during the
+property-context load (2026-11-19).
 
 The rebuilt libart compiles ART's original `metrics/statsd.cc` and the Android
 `libodrstatslog` with `statslog_art`/`statslog_odrefresh`, generated by the

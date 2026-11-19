@@ -1245,6 +1245,254 @@ fn iovs(ptr: u64, n: u64) -> Result<Vec<libc::iovec>, i64> {
         })
         .collect())
 }
+
+/// Bytes of one stdio payload copied onto the diagnostics descriptor.
+const STDIO_CAPTURE_CAP: usize = 512;
+const STDIO_LENS_SHOWN: usize = 16;
+
+struct StdioCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    partial: bool,
+    not_written: bool,
+    unreadable: bool,
+}
+
+/// How many bytes of a completed write to copy. `returned` is the syscall
+/// result and is never rewritten from this account.
+fn stdio_capture_limits(requested: u64, returned: i64) -> (usize, bool, bool, bool) {
+    if returned > 0 {
+        let written = returned as u64;
+        let available = written.min(requested);
+        let truncated = available > STDIO_CAPTURE_CAP as u64;
+        let partial = written < requested;
+        (
+            available.min(STDIO_CAPTURE_CAP as u64) as usize,
+            truncated,
+            partial,
+            false,
+        )
+    } else {
+        (
+            requested.min(STDIO_CAPTURE_CAP as u64) as usize,
+            requested > STDIO_CAPTURE_CAP as u64,
+            false,
+            true,
+        )
+    }
+}
+
+fn read_capped(address: u64, length: usize) -> Result<Vec<u8>, ()> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    super::user_memory::read_exact(address, length).map_err(|_| ())
+}
+
+fn capture_linear(address: u64, requested: u64, returned: i64) -> StdioCapture {
+    let (count, truncated, partial, not_written) = stdio_capture_limits(requested, returned);
+    match read_capped(address, count) {
+        Ok(bytes) => StdioCapture {
+            bytes,
+            truncated,
+            partial,
+            not_written,
+            unreadable: false,
+        },
+        Err(()) => StdioCapture {
+            bytes: Vec::new(),
+            truncated,
+            partial,
+            not_written,
+            unreadable: true,
+        },
+    }
+}
+
+fn capture_iov(vectors: &[libc::iovec], requested: u64, returned: i64) -> StdioCapture {
+    let (count, truncated, partial, not_written) = stdio_capture_limits(requested, returned);
+    let mut bytes = Vec::new();
+    let mut left = count;
+    let mut unreadable = false;
+    for vector in vectors {
+        if left == 0 {
+            break;
+        }
+        let take = vector.iov_len.min(left);
+        if take == 0 {
+            continue;
+        }
+        match read_capped(vector.iov_base as u64, take) {
+            Ok(part) => {
+                bytes.extend_from_slice(&part);
+                left -= take;
+            }
+            Err(()) => {
+                unreadable = true;
+                break;
+            }
+        }
+    }
+    StdioCapture {
+        bytes,
+        truncated,
+        partial,
+        not_written,
+        unreadable,
+    }
+}
+
+fn escape_stdio(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out
+}
+
+fn format_stdio_capture(
+    kind: &str,
+    fd: i32,
+    iov_count: usize,
+    lens: &[u64],
+    lens_truncated: bool,
+    saturated: bool,
+    requested: u64,
+    returned: i64,
+    captured: &StdioCapture,
+) -> String {
+    let mut line = format!("[linux-trace] stdio {kind} fd={fd} iov={iov_count} lens=");
+    for (index, len) in lens.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        line.push_str(&len.to_string());
+    }
+    if lens_truncated {
+        line.push_str(",...");
+    }
+    line.push_str(&format!(" requested={requested} returned={returned}"));
+    if saturated {
+        line.push_str(" requested-saturated");
+    }
+    if captured.partial {
+        line.push_str(" partial");
+    }
+    if captured.not_written {
+        line.push_str(" not-written");
+    }
+    if captured.truncated {
+        line.push_str(&format!(" truncated cap={STDIO_CAPTURE_CAP}"));
+    }
+    if captured.unreadable {
+        line.push_str(" unreadable");
+    }
+    line.push_str(&format!(
+        " captured={} payload=\"{}\"",
+        captured.bytes.len(),
+        escape_stdio(&captured.bytes)
+    ));
+    line
+}
+
+/// Bounded copy of a guest write to fd 0, 1, or 2 for the syscall trace.
+/// The syscall result is an input. This reads guest memory after the call
+/// and does not change that result, the descriptor, or the bytes written.
+pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    stdio_write_note(super::tracing(), nr, a, returned)
+}
+
+fn stdio_write_note(enabled: bool, nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let fd = a[0] as i32;
+    if !(0..=2).contains(&fd) {
+        return None;
+    }
+    let kind = match nr {
+        64 => "write",
+        66 => "writev",
+        68 => "pwrite64",
+        70 => "pwritev",
+        287 => "pwritev2",
+        _ => return None,
+    };
+    if matches!(nr, 64 | 68) {
+        let requested = a[2];
+        if requested == 0 && returned <= 0 {
+            return None;
+        }
+        let captured = capture_linear(a[1], requested, returned);
+        return Some(format_stdio_capture(
+            kind,
+            fd,
+            1,
+            &[requested],
+            false,
+            false,
+            requested,
+            returned,
+            &captured,
+        ));
+    }
+    let count = a[2];
+    if count == 0 && returned <= 0 {
+        return None;
+    }
+    if count > 1024 {
+        return Some(format!(
+            "[linux-trace] stdio {kind} fd={fd} iov_count={count} <iov count not captured> returned={returned}"
+        ));
+    }
+    let vectors = match iovs(a[1], count) {
+        Ok(vectors) => vectors,
+        Err(_) => {
+            return Some(format!(
+                "[linux-trace] stdio {kind} fd={fd} iov_count={count} <iov unreadable> returned={returned}"
+            ));
+        }
+    };
+    let mut requested: u64 = 0;
+    let mut saturated = false;
+    let mut lens = Vec::with_capacity(vectors.len());
+    for vector in &vectors {
+        let len = vector.iov_len as u64;
+        lens.push(len);
+        match requested.checked_add(len) {
+            Some(sum) => requested = sum,
+            None => {
+                saturated = true;
+                requested = u64::MAX;
+            }
+        }
+    }
+    if requested == 0 && returned <= 0 {
+        return None;
+    }
+    let lens_truncated = lens.len() > STDIO_LENS_SHOWN;
+    let shown = &lens[..lens.len().min(STDIO_LENS_SHOWN)];
+    let captured = capture_iov(&vectors, requested, returned);
+    Some(format_stdio_capture(
+        kind,
+        fd,
+        lens.len(),
+        shown,
+        lens_truncated,
+        saturated,
+        requested,
+        returned,
+        &captured,
+    ))
+}
 /// `positioned`: the transfer is at a given offset, not the file's.
 fn prepare_iov(
     pin: &fdtab::Pinned,
@@ -4155,5 +4403,166 @@ mod read_only_map_tests {
         assert_eq!(super::openat(args(1)), -(errno::EROFS as i64));
         assert_eq!(std::fs::read(apex.join("payload")).unwrap(), b"original");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stdio_trace_tests {
+    use super::*;
+
+    #[test]
+    fn stdio_capture_is_bounded_and_does_not_invent_a_payload() {
+        let exact = StdioCapture {
+            bytes: b"FATAL example".to_vec(),
+            truncated: false,
+            partial: false,
+            not_written: false,
+            unreadable: false,
+        };
+        let line = format_stdio_capture(
+            "writev",
+            2,
+            4,
+            &[12, 1, 100, 36],
+            false,
+            false,
+            149,
+            149,
+            &exact,
+        );
+        assert!(line.contains("fd=2"));
+        assert!(line.contains("iov=4"));
+        assert!(line.contains("lens=12,1,100,36"));
+        assert!(line.contains("requested=149"));
+        assert!(line.contains("returned=149"));
+        assert!(line.contains("captured=13"));
+        assert!(line.contains("payload=\"FATAL example\""));
+        assert!(!line.contains("truncated"));
+        assert!(!line.contains("partial"));
+        assert!(!line.contains("not-written"));
+
+        let mut long = StdioCapture {
+            bytes: vec![b'A'; STDIO_CAPTURE_CAP],
+            truncated: true,
+            partial: false,
+            not_written: false,
+            unreadable: false,
+        };
+        let truncated =
+            format_stdio_capture("writev", 2, 1, &[600], false, false, 600, 600, &long);
+        assert!(truncated.contains("truncated cap=512"));
+        assert!(truncated.contains("captured=512"));
+        assert!(!truncated.contains(&"A".repeat(513)));
+
+        long.partial = true;
+        long.bytes.truncate(100);
+        long.truncated = false;
+        let partial =
+            format_stdio_capture("write", 1, 1, &[149], false, false, 149, 100, &long);
+        assert!(partial.contains("partial"));
+        assert!(partial.contains("returned=100"));
+        assert!(partial.contains("captured=100"));
+
+        let failed = StdioCapture {
+            bytes: b"attempt".to_vec(),
+            truncated: false,
+            partial: false,
+            not_written: true,
+            unreadable: false,
+        };
+        let not_written =
+            format_stdio_capture("writev", 2, 1, &[7], false, false, 7, -2, &failed);
+        assert!(not_written.contains("not-written"));
+        assert!(not_written.contains("returned=-2"));
+        assert!(not_written.contains("payload=\"attempt\""));
+
+        let broken = StdioCapture {
+            bytes: b"pre".to_vec(),
+            truncated: false,
+            partial: true,
+            not_written: false,
+            unreadable: true,
+        };
+        let unreadable =
+            format_stdio_capture("writev", 2, 2, &[4, 10], false, false, 14, 14, &broken);
+        assert!(unreadable.contains("unreadable"));
+        assert!(unreadable.contains("payload=\"pre\""));
+        assert!(unreadable.contains("captured=3"));
+
+        let escaped = escape_stdio(b"a\\b\"\n\t\x00\xff");
+        assert_eq!(escaped, "a\\\\b\\\"\\n\\t\\x00\\xff");
+
+        assert!(stdio_write_note(false, 66, &[2, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 66, &[3, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 63, &[2, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 64, &[2, 0, 0, 0, 0, 0], 0).is_none());
+        let refused = stdio_write_note(true, 66, &[2, 0, 1, 0, 0, 0], 149).unwrap();
+        assert!(refused.contains("<iov unreadable>"));
+        assert!(refused.contains("returned=149"));
+        assert!(refused.contains("fd=2"));
+        let huge = stdio_write_note(true, 66, &[2, 0, 1025, 0, 0, 0], 149).unwrap();
+        assert!(huge.contains("<iov count not captured>"));
+        assert!(huge.contains("returned=149"));
+        let overlong = stdio_write_note(true, 64, &[2, 0, 1u64 << 40, 0, 0, 0], 4).unwrap();
+        assert!(overlong.contains("unreadable"));
+        assert!(overlong.contains("partial"));
+        assert!(overlong.contains("returned=4"));
+        assert!(overlong.contains("requested=1099511627776"));
+        assert!(!overlong.contains("truncated"));
+    }
+
+    #[test]
+    fn stdio_capture_reads_the_written_prefix_only() {
+        if fdtab::isolated_kernel_test(
+            "sys::fs::stdio_trace_tests::stdio_capture_reads_the_written_prefix_only",
+        ) {
+            return;
+        }
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let payload = b"FATAL example\n";
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), page.cast::<u8>(), payload.len());
+        }
+        let iov = page as u64 + 256;
+        unsafe {
+            std::ptr::write_unaligned(iov as *mut u64, page as u64);
+            std::ptr::write_unaligned((iov + 8) as *mut u64, payload.len() as u64);
+            // A second vector whose length would be fatal to allocate, and a
+            // third whose address is not mapped. The copy stops at the cap
+            // and at the fault.
+            std::ptr::write_unaligned((iov + 16) as *mut u64, page as u64);
+            std::ptr::write_unaligned((iov + 24) as *mut u64, 1u64 << 40);
+        }
+        let note = stdio_write_note(true, 66, &[2, iov, 2, 0, 0, 0], payload.len() as i64).unwrap();
+        assert!(note.contains("payload=\"FATAL example\\n\""));
+        assert!(note.contains("captured=14"));
+        assert!(note.contains("partial"));
+        assert!(note.contains("lens=14,1099511627776"));
+        assert!(!note.contains("requested-saturated"));
+        assert!(!note.contains("truncated"));
+        let short = stdio_write_note(true, 66, &[2, iov, 1, 0, 0, 0], 5).unwrap();
+        assert!(short.contains("partial"));
+        assert!(short.contains("returned=5"));
+        assert!(short.contains("payload=\"FATAL\""));
+        assert!(short.contains("captured=5"));
+        unsafe {
+            std::ptr::write_unaligned((iov + 16) as *mut u64, 0u64);
+            std::ptr::write_unaligned((iov + 24) as *mut u64, 10u64);
+        }
+        let broken = stdio_write_note(true, 66, &[2, iov, 2, 0, 0, 0], 24).unwrap();
+        assert!(broken.contains("unreadable"));
+        assert!(broken.contains("payload=\"FATAL example\\n\""));
+        assert!(broken.contains("captured=14"));
+        assert_eq!(unsafe { libc::munmap(page, 4096) }, 0);
     }
 }

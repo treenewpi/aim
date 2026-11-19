@@ -536,11 +536,15 @@ names a stage only from that log, from `init second stage started!`,
 or from `PropertyInit` creating `property_info`, and otherwise says
 the stage is unconfirmed. The first failed syscall stays in the
 observation and is not the stop. A `[kmsg]` line is a write init made
-to `/dev/kmsg`, copied onto the diagnostics descriptor. A line that
-only repeats the 2026-09-27 syscall list is not the observation.
-Commit `14a42a5` on macmini (Darwin 25.5.0) named those `.bss` ranges,
-kept the trace past `dup3` of fd 2, completed `PropertyInit`, and
-exited 6 from `MountExtraFilesystems` (see below).
+to `/dev/kmsg`, copied onto the diagnostics descriptor. It is not by
+itself the fatal. A `[linux-trace] stdio` line is a bounded copy of a
+write to guest fd 0, 1, or 2, with the pid, tid, call number, iov
+lengths, and the syscall's return value. A line that only repeats
+the 2026-09-27 syscall list is not the observation.
+Commit `a6e5306` on macmini (Darwin 25.5.0) printed both stage logs
+to `[kmsg]`, kept the trace past `dup3` of fd 2, and exited 6 at
+call 2384 before `property_info` and before any second-stage `mount`
+(see below).
 
 ```sh
 ./target/release/bionic-smoke --prepare-init
@@ -552,22 +556,33 @@ Do not pass `--fetch`. Do not pipe the probe into another program.
 and `pagesize=16384`, `init-probe: syscall trace is the diagnostics descriptor`,
 `init-probe: trace file`, and `init-probe: first observation:`.
 `init-guest.stderr` has to include `diagnostics fd` and a leave line for
-the `dup3` that replaces fd 2. `harness.stdout` also prints
+the `dup3` that replaces fd 2. When that trace reaches the fd 2
+`writev`, it also has a `[linux-trace] stdio writev` line for that
+call: `fd=2`, `returned=` equal to the following leave result, the
+iov lengths, and `payload=`. `truncated cap=512` is present only when
+the copy stopped at 512 bytes. `harness.stdout` also prints
 `init-probe: last trace:`. `init-probe.txt` has to include the
 `----- init pid=N -----` blocks and the same observation.
 Admission errno 2 is a harness failure, not an init result. This is
 not ART. The vDSO eight-try fallback is still unmeasured.
-Commit `14a42a5` on macmini (Darwin 25.5.0) completed `PropertyInit`
-and exited 6 in `MountExtraFilesystems`: tmpfs on `/apex` returned 0,
-`access("/system/bin/recovery")` returned ENOENT, and tmpfs on the
-missing `/bootstrap-apex` returned ENOENT. `rt_tgsigqueueinfo` then
-delivered SIGABRT. The trace's last line was `exit_group(0x6)` at call
-5934. The first failed syscall was the survived call 66 ENOENT. The
-compatibility property service still uses its default string context.
-The init probe's contexts are the layer's files. Creating
-`property_info` is not that service and is not a boot. Identity denial
-is still only the host socket test. No run with the mount-point
-directories or the `/dev/kmsg` marker has been measured.
+Commit `a6e5306` on macmini (Darwin 25.5.0) printed
+`init first stage started!` and `init second stage started!` to
+`[kmsg]`. Guest pid 94730 exited 6, not timed out. The last trace
+line was `exit_group(0x6)` at call 2384. The first failed syscall
+was the survived call 66 ENOENT. The last `[kmsg]` line is
+`Failed to umount /debug_ramdisk: Invalid argument` and is not the
+fatal. After that umount, init read both property context files and
+did not create `property_info`. There is no `mount` after call 2263,
+so `/bootstrap-apex` was not the observed stop. The abort text was
+`writev(fd 2)` returning 149 at call 2376; fd 2 is `/dev/null` and
+those bytes were not captured. The next trace records that payload.
+`/bootstrap-apex` is an empty layer-entry directory.
+`/linkerconfig` is the bionic root's directory and still contains
+`ld.config.txt`, which the linker opened. The compatibility property
+service still uses its default string context. The init probe's
+contexts are the layer's files. Creating `property_info` is not that
+service and is not a boot. Identity denial is still only the host
+socket test. The stdio payload line has not been measured.
 
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.

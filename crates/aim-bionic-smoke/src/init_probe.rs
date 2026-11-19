@@ -368,6 +368,9 @@ fn extract_root_files(layer: &Path, root: &Path) -> Result<LayerRootFiles, Strin
     let mut mountpoints = Vec::new();
     for name in MOUNTPOINTS {
         let dest = root.join(name);
+        // An existing directory stays, including `/linkerconfig` from the
+        // bionic root. That directory holds `ld.config.txt`, which the
+        // linker opens. `present` records it; the files are not removed.
         let source = if dest.is_dir() {
             "present"
         } else if dest.exists() {
@@ -488,6 +491,7 @@ fn write_provenance(
          measured_90882eb_prctl_set_vma EBADF on bss 0x80004c5000/0x13000 and 0x80002f9000/0x1000\n\
          measured_372d08f_stop PropertyInit SIGABRT after mkdir /dev/__properties__ ENOENT and plat_property_contexts ENOENT\n\
          measured_14a42a5_stop MountExtraFilesystems CHECKCALL of tmpfs on /bootstrap-apex ENOENT after /apex mounted and access /system/bin/recovery ENOENT\n\
+         measured_a6e5306_stop second stage logged; property contexts read; no property_info; no mount after umount2 of /debug_ramdisk; writev(fd 2)=149 payload not in that trace\n\
          file_vma_ends_on_4kib_guest_page true\n\
          syscall_trace_is_not_guest_fd_2 true\n\
          prctl_set_vma_uses_4kib_guest_granule true\n\
@@ -613,6 +617,8 @@ fn read_lossy(path: &Path) -> Result<String, String> {
 /// A stage is named only from a log line or from `PropertyInit` creating
 /// `property_info`. Guest stdio is `/dev/null` before those logs, so a
 /// missing `init first stage started!` is not evidence about `main`.
+/// The last `[kmsg]` line before SIGABRT is recorded as that line, not as
+/// the fatal. A `[linux-trace] stdio` line is the captured fd 0/1/2 write.
 /// There is no `init ok` here.
 pub(crate) fn first_observation(
     stdout: &str,
@@ -637,7 +643,11 @@ pub(crate) fn first_observation(
         text.push_str(&line);
     }
     if let Some(line) = kmsg_before_abort(stderr) {
-        text.push_str("; kmsg before abort ");
+        text.push_str("; last kmsg before abort ");
+        text.push_str(&line);
+    }
+    if let Some(line) = stdio_before_abort(stderr) {
+        text.push_str("; stdio before abort ");
         text.push_str(&line);
     }
     if timed_out {
@@ -730,6 +740,14 @@ fn abort_leave(stderr: &str) -> Option<String> {
 }
 
 fn kmsg_before_abort(stderr: &str) -> Option<String> {
+    line_before_abort(stderr, "[kmsg] ")
+}
+
+fn stdio_before_abort(stderr: &str) -> Option<String> {
+    line_before_abort(stderr, "[linux-trace] stdio ")
+}
+
+fn line_before_abort(stderr: &str, prefix: &str) -> Option<String> {
     let lines: Vec<&str> = stderr.lines().collect();
     let abort_at = lines.iter().rposition(|line| {
         line.starts_with("[linux] rt_tgsigqueueinfo(") && line.contains(" leave]")
@@ -737,7 +755,7 @@ fn kmsg_before_abort(stderr: &str) -> Option<String> {
     lines[..abort_at]
         .iter()
         .rev()
-        .find(|line| line.starts_with("[kmsg] "))
+        .find(|line| line.starts_with(prefix))
         .map(|line| (*line).to_string())
 }
 
@@ -813,6 +831,7 @@ mod tests {
 [linux] newfstatat(-100, \"/dev/__properties__\", 0x1, 0x0) = -2 (ENOENT) [pid=9 tid=9 call=66 leave]
 [linux] openat(-100, \"/dev/__properties__/property_info\", 0x88241, 0x1b6) = 3 [pid=9 tid=9 call=2366 leave]
 [kmsg] level=0 mount(\"tmpfs\", \"/bootstrap-apex\", \"tmpfs\", MS_NOEXEC | MS_NOSUID | MS_NODEV, \"mode=0755,uid=0,gid=0\") failed: No such file or directory
+[linux-trace] stdio writev fd=2 iov=1 lens=13 requested=13 returned=13 captured=13 payload=\"FATAL example\" [pid=9 tid=9 call=5932]
 [linux] rt_tgsigqueueinfo(0x16e82, 0x16e82, 0x6, 0x8005e84000) = 0 [pid=9 tid=9 call=5933 leave]
 [linux] exit_group(0x6) [pid=9 tid=9 call=5934 enter]
 ";
@@ -824,7 +843,9 @@ mod tests {
         assert!(reached.contains("survived; not the stop"));
         assert!(reached.contains("abort "));
         assert!(reached.contains("rt_tgsigqueueinfo"));
-        assert!(reached.contains("kmsg before abort"));
+        assert!(reached.contains("last kmsg before abort"));
+        assert!(reached.contains("stdio before abort"));
+        assert!(reached.contains("FATAL example"));
         assert!(reached.contains("bootstrap-apex"));
         assert!(!reached.contains("did not reach main"));
         assert!(!reached.contains("init ok"));

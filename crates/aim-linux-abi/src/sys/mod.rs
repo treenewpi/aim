@@ -263,6 +263,11 @@ pub fn dispatch(ctx: &mut GuestContext) {
         r = -(error as i64);
     }
     if let Some((pid, tid, call)) = trace {
+        // After the call: a bounded copy of a write to guest fd 0, 1, or 2.
+        // `r` is already the syscall result and is not assigned here.
+        if let Some(payload) = fs::trace_stdio_write(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+        }
         if (-4095..0).contains(&r) {
             crate::diag!(
                 "{line} = -{} ({}) [pid={pid} tid={tid} call={call} leave]",
