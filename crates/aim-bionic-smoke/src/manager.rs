@@ -1,0 +1,429 @@
+//! Stage the original `servicemanager` and `service` client from the pinned
+//! reDroid layer into their own root.
+//!
+//! The binaries, libraries, VINTF manifests and SELinux texts are the
+//! layer's bytes. `linkerconfig/ld.config.txt` is generated, because
+//! reDroid leaves `/linkerconfig` empty until init runs. This does not
+//! execute either program and it does not register a service. Staging on
+//! Linux is not acceptance: only a later run of the original binaries
+//! under `linux-run` on Apple Silicon macOS counts.
+
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use super::{
+    guest_file, guest_root, read_elf, require_layer, set_mode, sha256_file, write_entry,
+    LINKER_GUEST, LINKER_SHA256,
+};
+
+pub const SERVICEMANAGER_SHA256: &str =
+    "a48b209c2bcd81acf20bd9ce481c3e017c21270da596bf09658680ec0b0fe14e";
+pub const SERVICE_SHA256: &str = "16d982757fd2c5bfa68ac63ca2b9f9d456bceea6b7c1228f9237a761d12f7d06";
+pub const BOOTSTRAP_LINKER_SHA256: &str =
+    "85284627f597726c152445292fd89d63895cd12d80ed97b3d97256da2db8a8ec";
+pub const LIBBINDER_SHA256: &str =
+    "988b365aa7f0907942bf0685956ab86089c6304302f9013fcb2016efe18aa401";
+pub const PLAT_SEPOLICY_SHA256: &str =
+    "c3390caf754eb7924b638c9f1a156336e80391fae12afbccb56ba01faa790883";
+pub const LIBDL_ANDROID_SHA256: &str =
+    "739c5716653bcff6700501d98f576957fc299e4f2483c3ad2bd1c0f641e96422";
+
+const EXACT: &[&str] = &[
+    "system/bin/servicemanager",
+    "system/bin/service",
+    "system/bin/bootstrap/linker64",
+    "system/lib64/libbase.so",
+    "system/lib64/libvintf.so",
+    "system/lib64/libcutils.so",
+    "system/lib64/liblog.so",
+    "system/lib64/libselinux.so",
+    "system/lib64/libperfetto_c.so",
+    "system/lib64/libbinder.so",
+    "system/lib64/libutils.so",
+    "system/lib64/libc++.so",
+    "system/lib64/libtinyxml2.so",
+    "system/lib64/libz.so",
+    "system/lib64/libpcre2.so",
+    "system/lib64/libpackagelistparser.so",
+    "system/lib64/libapexsupport.so",
+    "system/lib64/libvndksupport.so",
+    "system/lib64/libdl_android.so",
+    "system/etc/init/servicemanager.rc",
+    "system/etc/selinux/plat_sepolicy.cil",
+    "system/etc/selinux/plat_service_contexts",
+    "system/etc/selinux/plat_file_contexts",
+];
+
+/// Generated linker config. Not a file from the image.
+pub fn linker_config() -> &'static str {
+    "\
+# generated for the original servicemanager root; not an original image file
+dir.default = /system/bin
+dir.default = /apex/com.android.runtime/bin
+[default]
+namespace.default.isolated = false
+namespace.default.search.paths = /system/lib64:/apex/com.android.runtime/lib64/bionic
+"
+}
+
+pub fn manager_root() -> PathBuf {
+    super::stage_dir()
+        .parent()
+        .expect("redroid stage")
+        .join("redroid-16-servicemanager")
+        .join("root")
+}
+
+/// Copy the audited bionic root and add the original servicemanager closure.
+pub fn prepare_manager() -> Result<PathBuf, String> {
+    let layer = require_layer()?;
+    let bionic = guest_root();
+    let linker = guest_file(&bionic, LINKER_GUEST).map_err(|_| {
+        format!(
+            "bionic root {} has no linker64; run bionic-smoke --prepare first",
+            bionic.display()
+        )
+    })?;
+    if sha256_file(&linker)? != LINKER_SHA256 {
+        return Err("bionic root linker64 is not the pinned file".into());
+    }
+    let root = manager_root();
+    if root.exists() {
+        fs::remove_dir_all(&root).map_err(|e| format!("remove {}: {e}", root.display()))?;
+    }
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    copy_tree(&bionic, &root)?;
+    extract_originals(&layer, &root)?;
+    copy_apex_libdl(&root)?;
+    let config = root.join("linkerconfig/ld.config.txt");
+    fs::write(&config, linker_config()).map_err(|e| e.to_string())?;
+    audit(&root)?;
+    write_provenance(&root, &layer)?;
+    println!(
+        "bionic-smoke: original servicemanager root {} (staged, not executed)",
+        root.display()
+    );
+    println!(
+        "bionic-smoke: acceptance is a real Apple Silicon Mac running this root under linux-run; this staging is not that run"
+    );
+    Ok(root)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let dest = to.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_symlink() {
+            let target = fs::read_link(entry.path()).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&dest);
+            std::os::unix::fs::symlink(&target, &dest)
+                .map_err(|e| format!("symlink {} -> {}: {e}", dest.display(), target.display()))?;
+        } else if kind.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else if kind.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::copy(entry.path(), &dest).map_err(|e| format!("copy {}: {e}", dest.display()))?;
+            let mode = entry
+                .metadata()
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            set_mode(&dest, mode)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_originals(layer: &Path, root: &Path) -> Result<(), String> {
+    let mut found = vec![false; EXACT.len()];
+    let file = File::open(layer).map_err(|e| format!("open {}: {e}", layer.display()))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read layer tar: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let raw = entry
+            .path()
+            .map_err(|e| format!("tar path: {e}"))?
+            .into_owned();
+        let name = raw.to_string_lossy().trim_start_matches("./").to_string();
+        let take = EXACT.iter().position(|item| *item == name).is_some()
+            || name.starts_with("system/etc/vintf/");
+        if !take {
+            continue;
+        }
+        if let Some(index) = EXACT.iter().position(|item| *item == name) {
+            found[index] = true;
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            continue;
+        }
+        write_entry(&mut entry, &root.join(&name))?;
+    }
+    let missing: Vec<_> = EXACT
+        .iter()
+        .zip(found.iter())
+        .filter(|(_, ok)| !**ok)
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("layer is missing {missing:?}"));
+    }
+    for bin in [
+        "system/bin/servicemanager",
+        "system/bin/service",
+        "system/bin/bootstrap/linker64",
+    ] {
+        let path = root.join(bin);
+        let mode = fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            set_mode(&path, mode | 0o755)?;
+        }
+    }
+    Ok(())
+}
+
+fn audit(root: &Path) -> Result<(), String> {
+    check_hash(root, "system/bin/servicemanager", SERVICEMANAGER_SHA256)?;
+    check_hash(root, "system/bin/service", SERVICE_SHA256)?;
+    check_hash(
+        root,
+        "system/bin/bootstrap/linker64",
+        BOOTSTRAP_LINKER_SHA256,
+    )?;
+    check_hash(root, "system/lib64/libbinder.so", LIBBINDER_SHA256)?;
+    check_hash(
+        root,
+        "system/etc/selinux/plat_sepolicy.cil",
+        PLAT_SEPOLICY_SHA256,
+    )?;
+    let libdl = guest_file(root, "/system/lib64/libdl_android.so")?;
+    let digest = sha256_file(&libdl)?;
+    if digest != LIBDL_ANDROID_SHA256 {
+        return Err(format!(
+            "libdl_android.so sha256 {digest} != {LIBDL_ANDROID_SHA256}"
+        ));
+    }
+    let bionic_linker = guest_file(root, LINKER_GUEST)?;
+    if sha256_file(&bionic_linker)? != LINKER_SHA256 {
+        return Err("servicemanager root lost the pinned apex linker64".into());
+    }
+    let sm =
+        read_elf(&fs::read(root.join("system/bin/servicemanager")).map_err(|e| e.to_string())?)?;
+    if sm.interp.as_deref() != Some("/system/bin/bootstrap/linker64") {
+        return Err(format!("servicemanager interpreter {:?}", sm.interp));
+    }
+    let service = read_elf(&fs::read(root.join("system/bin/service")).map_err(|e| e.to_string())?)?;
+    if service.interp.as_deref() != Some("/system/bin/linker64") {
+        return Err(format!("service interpreter {:?}", service.interp));
+    }
+    require_arm64(&sm, "servicemanager")?;
+    require_arm64(&service, "service")?;
+    let mut queue = sm.needed.clone();
+    queue.extend(service.needed.iter().cloned());
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(lib) = queue.pop() {
+        if !seen.insert(lib.clone()) {
+            continue;
+        }
+        let path = resolve_lib(root, &lib)?;
+        if lib == "libc.so" && !path.ends_with("apex/com.android.runtime/lib64/bionic/libc.so") {
+            return Err(format!("libc.so resolved to {}", path.display()));
+        }
+        let info = read_elf(&fs::read(&path).map_err(|e| e.to_string())?)?;
+        require_arm64(&info, &lib)?;
+        queue.extend(info.needed);
+    }
+    let config =
+        fs::read_to_string(root.join("linkerconfig/ld.config.txt")).map_err(|e| e.to_string())?;
+    if config != linker_config() {
+        return Err("linker config is not the generated servicemanager text".into());
+    }
+    Ok(())
+}
+
+/// `system/lib64/libdl_android.so` is the layer's symlink into the runtime
+/// apex. The bionic stage does not unpack that file.
+fn copy_apex_libdl(root: &Path) -> Result<(), String> {
+    let apex = super::stage_dir().join("original/com.android.runtime.apex");
+    let source = android_image_extract::source::FileSource::open(&apex)
+        .map_err(|e| format!("open runtime apex: {e}"))?;
+    android_image_extract::apex::with_payload(&source, |manifest, tree, format| {
+        if manifest.name != "com.android.runtime" || format != "ext4" {
+            return Err(android_image_extract::invalid(
+                "runtime apex is not the pinned payload".to_string(),
+            ));
+        }
+        let rel = "lib64/bionic/libdl_android.so";
+        let id = android_image_extract::tree::lookup(tree, rel)
+            .map_err(|e| android_image_extract::invalid(e.to_string()))?
+            .ok_or_else(|| android_image_extract::invalid("apex missing libdl_android.so"))?;
+        let bytes = android_image_extract::tree::read_file(tree, id, 32 << 20)
+            .map_err(|e| android_image_extract::invalid(e.to_string()))?;
+        let to = root.join("apex/com.android.runtime").join(rel);
+        fs::create_dir_all(to.parent().unwrap())
+            .map_err(|e| android_image_extract::invalid(e.to_string()))?;
+        fs::write(&to, bytes).map_err(|e| android_image_extract::invalid(e.to_string()))?;
+        let node = tree
+            .node(id)
+            .map_err(|e| android_image_extract::invalid(e.to_string()))?;
+        set_mode(&to, node.mode & 0o777).map_err(android_image_extract::invalid)?;
+        Ok(())
+    })
+    .map_err(|e| format!("runtime apex libdl_android: {e}"))
+}
+
+fn resolve_lib(root: &Path, lib: &str) -> Result<PathBuf, String> {
+    for dir in ["/system/lib64", "/apex/com.android.runtime/lib64/bionic"] {
+        if let Ok(path) = guest_file(root, &format!("{dir}/{lib}")) {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "NEEDED {lib} is not in /system/lib64 or the runtime apex"
+    ))
+}
+
+fn require_arm64(info: &super::ElfInfo, what: &str) -> Result<(), String> {
+    if info.machine != 183 {
+        return Err(format!("{what} machine {}", info.machine));
+    }
+    if info
+        .aligns
+        .iter()
+        .any(|align| *align != 0 && *align < 16384)
+    {
+        return Err(format!("{what} align {:?}", info.aligns));
+    }
+    Ok(())
+}
+
+fn check_hash(root: &Path, rel: &str, expect: &str) -> Result<(), String> {
+    let hash = sha256_file(&root.join(rel))?;
+    if hash != expect {
+        return Err(format!("{rel} sha256 {hash} != {expect}"));
+    }
+    Ok(())
+}
+
+fn write_provenance(root: &Path, layer: &Path) -> Result<(), String> {
+    let mut text = format!(
+        "kind original-servicemanager-root\n\
+         layer {}\n\
+         layer_bytes {}\n\
+         not_play_store true\n\
+         not_redroid_boot true\n\
+         not_synthetic_pie true\n\
+         servicemanager_sha256 {SERVICEMANAGER_SHA256}\n\
+         service_sha256 {SERVICE_SHA256}\n\
+         libbinder_sha256 {LIBBINDER_SHA256}\n\
+         bootstrap_linker_sha256 {BOOTSTRAP_LINKER_SHA256}\n\
+         libdl_android_sha256 {LIBDL_ANDROID_SHA256}\n\
+         generated linkerconfig/ld.config.txt\n\
+         selinux_texts original plat_sepolicy.cil and service contexts\n\
+         selinux_decisions the existing permissive runtime, not a policy loaded from this root\n\
+         acceptance_platform apple-silicon-macos-xnu\n\
+         linux_stage_is_not_acceptance true\n",
+        layer.display(),
+        super::LAYER_SIZE
+    );
+    text.push_str("executed false\n");
+    let path = root
+        .parent()
+        .ok_or("manager root has no parent")?
+        .join("provenance.txt");
+    fs::write(path, text).map_err(|e| e.to_string())
+}
+
+/// A completed `openat` of `/dev/binder` whose result is a file descriptor.
+/// A path mentioned anywhere else, or an open that returned an errno, is
+/// not an open.
+pub fn binder_device_opened(stderr: &str) -> bool {
+    for line in stderr.lines() {
+        let Some(rest) = line.strip_prefix("[linux] openat(") else {
+            continue;
+        };
+        if !rest.ends_with(" leave]") || !rest.contains("\"/dev/binder\"") {
+            continue;
+        }
+        let Some((_, result)) = rest.rsplit_once(" = ") else {
+            continue;
+        };
+        let token = result.split_whitespace().next().unwrap_or("");
+        if token.starts_with('-') {
+            continue;
+        }
+        if token.parse::<u32>().is_ok() {
+            let args = rest.split(" = ").next().unwrap_or("");
+            if args.contains("\"/dev/binder\"") && !args.contains("\"/dev/binder/") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pins_and_generated_config_are_marked() {
+        for hash in [
+            SERVICEMANAGER_SHA256,
+            SERVICE_SHA256,
+            BOOTSTRAP_LINKER_SHA256,
+            LIBBINDER_SHA256,
+            PLAT_SEPOLICY_SHA256,
+            LIBDL_ANDROID_SHA256,
+        ] {
+            assert_eq!(hash.len(), 64);
+        }
+        assert!(linker_config().contains("not an original image file"));
+        assert!(linker_config().contains("/system/lib64"));
+        assert!(!binder_device_opened(
+            "openat(\"/dev/binder\"\n[linux] ioctl(0x3, 0x1, 0x2)\n"
+        ));
+        assert!(!binder_device_opened(
+            "[linux] openat(-100, \"/dev/binder\", 0x80002, 0x0) = -13 (EACCES) [pid=1 tid=1 call=0 leave]"
+        ));
+        assert!(binder_device_opened(
+            "[linux] openat(-100, \"/dev/binder\", 0x80002, 0x0) = 3 [pid=1 tid=1 call=0 leave]"
+        ));
+        assert!(!binder_device_opened(
+            "[linux] openat(-100, \"/dev/binderfs/hwbinder\", 0x80002, 0x0) = 3 [pid=1 tid=1 call=0 leave]"
+        ));
+    }
+
+    #[test]
+    fn original_closure_matches_the_pinned_layer() {
+        if !super::super::layer_path().is_file() || !guest_root().join("apex").is_dir() {
+            aim_paths::skip(
+                "pinned reDroid layer or the prepared bionic root is absent; not executed",
+            );
+            return;
+        }
+        let before = sha256_file(&guest_file(&guest_root(), LINKER_GUEST).unwrap()).unwrap();
+        let root = prepare_manager().unwrap();
+        let after = sha256_file(&guest_file(&guest_root(), LINKER_GUEST).unwrap()).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before, LINKER_SHA256);
+        assert!(root.join("system/bin/servicemanager").is_file());
+        assert!(root.join("system/etc/vintf/manifest.xml").is_file());
+        let note = fs::read_to_string(root.parent().unwrap().join("provenance.txt")).unwrap();
+        assert!(note.contains("not_synthetic_pie true"));
+        assert!(note.contains("executed false"));
+        assert!(note.contains("linux_stage_is_not_acceptance true"));
+    }
+}

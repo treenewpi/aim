@@ -11,7 +11,12 @@
 //! `linux-run` processes execute a synthetic AArch64 PIE (not an Android
 //! library) that reaches the same daemon through `openat`, `mmap` and
 //! `ioctl`. The trace gate is the completed leave line
-//! `openat(-100, "/dev/binder", ...) = fd`, not the path string. The
+//! `openat(-100, "/dev/binder", ...) = fd`, not the path string.
+//! `android LINUX_RUN ROOT` runs the original reDroid `servicemanager`
+//! and `service` from that root. It prints their stdout and stops at the
+//! first real failure. Acceptance is that run on Apple Silicon macOS/XNU,
+//! with the host platform, page size, commit, pids, exit codes, and the
+//! original transaction text. A Linux run is not that result. The
 //! host-only subcommands stay as they are.
 //!
 //! An ioctl that is still blocked after 15s exits 101. This process raises
@@ -22,7 +27,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use aim_binder_driver::uapi::*;
@@ -60,9 +65,12 @@ fn main() -> ExitCode {
         Some("absent") => absent(&need(&mut args)),
         Some("dead") => dead(&need(&mut args)),
         Some("guest") => guest_orchestrate(args.next(), args.next()),
+        Some("android") => android_orchestrate(args.next(), args.next()),
         _ => {
             eprintln!(
-                "usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]\n       aim-binder-proc guest LINUX_RUN GUEST"
+                "usage: aim-binder-proc [daemon|serve|call|absent|dead NAME]\n       \
+                 aim-binder-proc guest LINUX_RUN GUEST\n       \
+                 aim-binder-proc android LINUX_RUN ROOT"
             );
             ExitCode::from(2)
         }
@@ -928,6 +936,318 @@ fn write_read(file: &BinderFile, write: &[u8], read: bool) -> Result<Vec<u8>, Er
 fn cmd(out: &mut Vec<u8>, code: u32, payload: &[u8]) {
     out.extend_from_slice(&code.to_le_bytes());
     out.extend_from_slice(payload);
+}
+
+/// Same leave-line predicate as `aim_bionic_smoke::binder_device_opened`.
+/// A completed `openat` of `/dev/binder` whose result is a file descriptor.
+fn binder_device_opened(stderr: &str) -> bool {
+    for line in stderr.lines() {
+        let Some(rest) = line.strip_prefix("[linux] openat(") else {
+            continue;
+        };
+        if !rest.ends_with(" leave]") || !rest.contains("\"/dev/binder\"") {
+            continue;
+        }
+        let Some((_, result)) = rest.rsplit_once(" = ") else {
+            continue;
+        };
+        let token = result.split_whitespace().next().unwrap_or("");
+        if token.starts_with('-') {
+            continue;
+        }
+        if token.parse::<u32>().is_ok() {
+            let args = rest.split(" = ").next().unwrap_or("");
+            if args.contains("\"/dev/binder\"") && !args.contains("\"/dev/binder/") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn print_host() {
+    let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
+    let named = unsafe { libc::uname(&mut uts) } == 0;
+    let field = |bytes: &[libc::c_char]| -> String {
+        let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u8, bytes.len()) };
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    };
+    let mut page: u64 = 0;
+    let mut len = std::mem::size_of_val(&page);
+    let page_ok = unsafe {
+        libc::sysctlbyname(
+            b"hw.pagesize\0".as_ptr() as *const libc::c_char,
+            &mut page as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    if named && page_ok {
+        println!(
+            "host sysname={} release={} version={} machine={} pagesize={page}",
+            field(&uts.sysname),
+            field(&uts.release),
+            field(&uts.version),
+            field(&uts.machine)
+        );
+    } else {
+        println!("host uname_ok={named} pagesize_ok={page_ok} pagesize={page}");
+    }
+}
+
+fn android_orchestrate(linux_run: Option<String>, root: Option<String>) -> ExitCode {
+    let (Some(linux_run), Some(root)) = (linux_run, root) else {
+        eprintln!("usage: aim-binder-proc android LINUX_RUN ROOT");
+        return ExitCode::from(2);
+    };
+    let linux_run = PathBuf::from(linux_run);
+    let root = PathBuf::from(root);
+    if !linux_run.is_file() || !root.join("system/bin/servicemanager").is_file() {
+        eprintln!(
+            "aim-binder-proc android: missing {} or {}/system/bin/servicemanager",
+            linux_run.display(),
+            root.display()
+        );
+        return ExitCode::from(2);
+    }
+    raise_nofile(true);
+    println!("android-servicemanager original-binary not-synthetic");
+    print_host();
+    let exe = std::env::current_exe().unwrap_or_else(|error| {
+        eprintln!("aim-binder-proc: current_exe: {error}");
+        std::process::exit(1);
+    });
+    let name = format!("dev.aim.servicemanager.{}", std::process::id());
+    let mut kids = Kids::default();
+    kids.push(spawn(&exe, &["daemon", &name]));
+    let daemon_pid = kids.pids[0];
+    if !wait_until(Duration::from_secs(5), || Client::connect(&name).is_some()) {
+        eprintln!("android-servicemanager: first blocker: daemon did not check in {name}");
+        return ExitCode::from(1);
+    }
+    let shell = "uid\t2000\ngid\t2000\nseclabel\tu:r:shell:s0\n";
+    let (absent_code, absent_out, absent_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "check", "manager"],
+        Duration::from_secs(20),
+    );
+    println!(
+        "----- service check manager without a context manager exit={absent_code:?} -----\n{absent_out}----- stderr -----\n{absent_err}----- end -----"
+    );
+    if !absent_out.contains("Unable to get default service manager")
+        || !binder_device_opened(&absent_err)
+    {
+        eprintln!(
+            "android-servicemanager: first blocker: service check did not reach a live driver and report no context manager"
+        );
+        return ExitCode::from(1);
+    }
+    let sm_id = "uid\t1000\ngid\t1000\ngroups\t1000 3009\nseclabel\tu:r:servicemanager:s0\n";
+    let mut sm = spawn_android(
+        &linux_run,
+        &root,
+        &name,
+        sm_id,
+        &["/system/bin/servicemanager"],
+    );
+    let sm_pid = sm.child.id();
+    let opened = wait_until(Duration::from_secs(20), || {
+        sm.child.try_wait().ok().flatten().is_some() || binder_device_opened(&sm.stderr())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let opened = opened || binder_device_opened(&sm.stderr());
+    let exited = sm.child.try_wait().ok().flatten().is_some();
+    if exited || !opened {
+        let _ = sm.child.kill();
+        let status = sm.child.wait().ok();
+        let why = if exited {
+            "servicemanager exited"
+        } else {
+            "servicemanager produced no completed openat of /dev/binder within 20s"
+        };
+        eprintln!(
+            "android-servicemanager: first blocker: {why} pid={sm_pid} status={status:?}\n{}\n{}",
+            sm.stdout(),
+            sm.stderr()
+        );
+        return ExitCode::from(1);
+    }
+    let (list_code, list_out, list_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "list"],
+        Duration::from_secs(20),
+    );
+    println!(
+        "----- service list pid exit={list_code:?} stdout -----\n{list_out}----- stderr -----\n{list_err}----- end -----"
+    );
+    if list_code != Some(0) || !list_out.contains("manager: [android.os.IServiceManager]") {
+        eprintln!(
+            "android-servicemanager: first blocker: service list did not report the original manager"
+        );
+        return ExitCode::from(1);
+    }
+    let (found_code, found_out, found_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "check", "manager"],
+        Duration::from_secs(20),
+    );
+    println!(
+        "----- service check manager exit={found_code:?} stdout -----\n{found_out}----- stderr -----\n{found_err}----- end -----"
+    );
+    if found_code != Some(0) || !found_out.contains("Service manager: found") {
+        eprintln!("android-servicemanager: first blocker: service check manager was not found");
+        return ExitCode::from(1);
+    }
+    let (missing_code, missing_out, missing_err) = run_android(
+        &linux_run,
+        &root,
+        &name,
+        shell,
+        &["/system/bin/service", "check", "servicemanager"],
+        Duration::from_secs(20),
+    );
+    println!(
+        "----- service check servicemanager exit={missing_code:?} stdout -----\n{missing_out}----- stderr -----\n{missing_err}----- end -----"
+    );
+    if missing_code != Some(0) || !missing_out.contains("Service servicemanager: not found") {
+        eprintln!(
+            "android-servicemanager: first blocker: the absent name was not reported missing"
+        );
+        return ExitCode::from(1);
+    }
+    if !binder_device_opened(&list_err) {
+        eprintln!("android-servicemanager: first blocker: service list did not open /dev/binder");
+        return ExitCode::from(1);
+    }
+    let _ = sm.child.kill();
+    let _ = sm.child.wait();
+    kids.pids.clear();
+    if !kids.stop_first(daemon_pid) {
+        eprintln!("android-servicemanager: first blocker: daemon {daemon_pid} did not exit");
+        return ExitCode::from(1);
+    }
+    if !wait_until(Duration::from_secs(2), || Client::connect(&name).is_none()) {
+        eprintln!("android-servicemanager: first blocker: {name} still registered");
+        return ExitCode::from(1);
+    }
+    println!(
+        "android-servicemanager daemon={daemon_pid} servicemanager={sm_pid} trace=openat(-100,\"/dev/binder\")=fd"
+    );
+    println!("android-servicemanager ok");
+    ExitCode::SUCCESS
+}
+
+struct AndroidProc {
+    child: Child,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl AndroidProc {
+    fn stdout(&self) -> String {
+        self.stdout.lock().unwrap().clone()
+    }
+
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+}
+
+impl Drop for AndroidProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_android(
+    linux_run: &Path,
+    root: &Path,
+    name: &str,
+    identity: &str,
+    argv: &[&str],
+) -> AndroidProc {
+    let mut child = Command::new(linux_run);
+    child
+        .arg("--no-cache")
+        .arg("--trace")
+        .arg("--root")
+        .arg(root)
+        .arg("--binder")
+        .arg(name)
+        .arg("--identity-text")
+        .arg(identity)
+        .args(argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn().unwrap_or_else(|error| {
+        eprintln!("aim-binder-proc android: spawn linux-run: {error}");
+        std::process::exit(1);
+    });
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    AndroidProc {
+        child,
+        stdout: pipe_text(stdout),
+        stderr: pipe_text(stderr),
+    }
+}
+
+fn pipe_text(mut pipe: impl Read + Send + 'static) -> Arc<Mutex<String>> {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let slot = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        let mut tmp = [0u8; 8192];
+        let mut text = String::new();
+        loop {
+            match pipe.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => text.push_str(&String::from_utf8_lossy(&tmp[..n])),
+            }
+            *slot.lock().unwrap() = text.clone();
+        }
+        *slot.lock().unwrap() = text;
+    });
+    buf
+}
+
+fn run_android(
+    linux_run: &Path,
+    root: &Path,
+    name: &str,
+    identity: &str,
+    argv: &[&str],
+    limit: Duration,
+) -> (Option<i32>, String, String) {
+    let mut guest = spawn_android(linux_run, root, name, identity, argv);
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Ok(Some(status)) = guest.child.try_wait() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = guest.child.kill();
+            break guest.child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    (
+        status.and_then(|status| status.code()),
+        guest.stdout(),
+        guest.stderr(),
+    )
 }
 
 fn returns(read: &[u8]) -> Vec<(u32, Option<TransactionData>)> {

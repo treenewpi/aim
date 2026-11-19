@@ -16,6 +16,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+mod manager;
+pub use manager::{binder_device_opened, prepare_manager};
+
 /// Docker Hub repository that publishes reDroid. The tag is only a name for
 /// the digest below; the tool never resolves a moving tag.
 pub const REPOSITORY: &str = "redroid/redroid";
@@ -313,7 +316,7 @@ pub fn prepare(layer: &Path) -> Result<PathBuf, String> {
     Ok(guest)
 }
 
-fn write_entry(entry: &mut tar::Entry<impl Read>, dest: &Path) -> Result<(), String> {
+pub(crate) fn write_entry(entry: &mut tar::Entry<impl Read>, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -768,7 +771,7 @@ fn verify_file(path: &Path, expect: &str, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|e| format!("chmod {} {:o}: {e}", path.display(), mode))

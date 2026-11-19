@@ -6,6 +6,19 @@ under `linux-run`, then the original reDroid `linker64` and toybox. Rust
 1.88 or newer is required (`&& let`, edition 2024). `cargo fetch -p` is
 not a Cargo command; fetch the lockfile with `cargo fetch --locked`.
 
+## Acceptance platform
+
+The only acceptance platform for this port is a real Apple Silicon Mac
+running macOS on XNU. A Linux compile, `cargo test`, or a process started
+on Linux is auxiliary evidence. A command that has not been run on that
+Mac is unverified. A Linux VM or a Linux container on the Mac does not
+stand in for the XNU syscall layer. The original `servicemanager` stage
+below is accepted only when that Mac runs it and the log has the host
+`sysname`, `machine`, `release`, `version`, and `pagesize`, the exact
+commit, the commands as run, each pid, each exit code, the original
+stdout and stderr, and the transaction text printed by the original
+`service` binary. A result from the cloud Linux host is not that stage.
+
 The binder tests need a compiler and the crates in `Cargo.lock` for
 `aim-binder-host` (`libc`, `sha2` and their default-feature dependencies).
 They do not need Xcode, the NDK, an Android image, or ANGLE. The ELF smoke
@@ -116,6 +129,62 @@ guests had already exchanged the payload.
 starts. That is an environment limit, not a result of this check. The
 guest root the harness creates has to be traversable; a root created
 mode `0700` returns errno 13 before the ELF is read.
+
+## Original servicemanager
+
+`bionic-smoke --prepare-servicemanager` copies the audited bionic root
+and adds the original `servicemanager`, `service`, `libbinder.so`, and
+the rest of that `DT_NEEDED` closure from the pinned layer. Those bytes
+stay the layer's. `linkerconfig/ld.config.txt` is generated. Staging
+does not execute either program. `aim-binder-proc android` is the run:
+one binder daemon, then the original `service check manager` with no
+context manager, then the original `servicemanager`, then `service
+list`, `service check manager`, and `service check servicemanager`.
+The harness prints those programs' stdout and stderr. It does not
+invent a service list.
+
+`TMPDIR` has to be short enough for the daemon socket path. Do not pass
+`--fetch`. The layer is the 733630886-byte cache already used for
+linker64.
+
+```sh
+git fetch origin cursor/binder-fd-elf-smoke-602d
+git checkout cursor/binder-fd-elf-smoke-602d
+git rev-parse HEAD
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
+cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+./target/release/bionic-smoke --prepare
+./target/release/bionic-smoke --prepare-servicemanager
+./target/release/aim-binder-proc android ./target/release/linux-run "$PWD/_build/redroid-16-servicemanager/root"
+```
+
+Run the last command once, on the Mac, and record `git rev-parse HEAD`
+from that checkout. The log has to include `host sysname=Darwin
+machine=arm64` and `pagesize=16384`. A pass is all of these, from that
+process:
+
+- `android-servicemanager original-binary not-synthetic`
+- `service check manager` before servicemanager starts prints
+  `Unable to get default service manager`, and its stderr has a completed
+  `openat(-100, "/dev/binder", ...) = <fd>`
+- servicemanager stays up, and its pid is distinct from the daemon
+- `service list` exits 0 and its stdout contains
+  `manager: [android.os.IServiceManager]`
+- `service check manager` exits 0 and its stdout contains
+  `Service manager: found`
+- `service check servicemanager` exits 0 and its stdout contains
+  `Service servicemanager: not found`
+- `service list`'s stderr has a completed open of `/dev/binder`
+- `android-servicemanager daemon=… servicemanager=…` and
+  `android-servicemanager ok`
+- the daemon's service name is gone, and no `linux-run` or
+  `aim-binder-proc` is left
+
+`android-servicemanager: first blocker:` is not a pass. Keep that
+command's pid, exit code, stdout, and stderr; that is the next Mac
+input. This is still not ART or a reDroid boot. Linux tests of the
+staging tool do not satisfy this section.
 
 ## Synthetic ELF
 

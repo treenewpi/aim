@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
     let mut linux_run: Option<PathBuf> = None;
     let mut do_fetch = false;
     let mut prepare_only = false;
+    let mut prepare_manager = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--linux-run" => {
@@ -38,29 +39,48 @@ fn run() -> Result<(), String> {
             }
             "--fetch" => do_fetch = true,
             "--prepare" => prepare_only = true,
+            "--prepare-servicemanager" => prepare_manager = true,
             "--help" | "-h" => {
                 println!(
                     "\
 usage: bionic-smoke --linux-run PATH
        bionic-smoke --fetch
        bionic-smoke --prepare
+       bionic-smoke --prepare-servicemanager
 
 Pinned image: {REPOSITORY}:{TAG}
   manifest {MANIFEST_DIGEST}
   layer    {LAYER_DIGEST} ({LAYER_SIZE} bytes)
   diff_id  {DIFF_ID}
 This is the reDroid Android 16 64-bit image, not the Play Store image.
-It does not boot reDroid."
+It does not boot reDroid.
+--prepare-servicemanager only stages the original servicemanager and
+service binaries. It does not register a service or run a transaction.
+Acceptance of that stage is a real Apple Silicon Mac running them under
+linux-run on XNU. A Linux compile, unit test, this staging, a Linux VM,
+or a Linux container is not that run. A Mac log has to include the host
+sysname, machine, release, version, and pagesize, the exact commit, the
+commands, each pid and exit code, the original stdout and stderr, and
+the transaction text from the original service binary."
                 );
                 return Ok(());
             }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if linux_run.is_none() && !prepare_only && !do_fetch {
+    if linux_run.is_none() && !prepare_only && !prepare_manager && !do_fetch {
         return Err(
-            "pass --fetch, --prepare, or --linux-run PATH; --help prints the pinned digest".into(),
+            "pass --fetch, --prepare, --prepare-servicemanager, or --linux-run PATH; --help prints the pinned digest"
+                .into(),
         );
+    }
+    if prepare_manager {
+        let layer = if do_fetch { fetch()? } else { require_layer()? };
+        if prepare_only {
+            prepare(&layer)?;
+        }
+        aim_bionic_smoke::prepare_manager()?;
+        return Ok(());
     }
     let layer = if do_fetch { fetch()? } else { require_layer()? };
     if linux_run.is_none() && !prepare_only {

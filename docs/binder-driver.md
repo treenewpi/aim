@@ -113,7 +113,15 @@ open `/dev/binder`, mmap the receive buffer and `ioctl` through this
 path. The check parses leave lines. The open leave is
 `openat(-100, "/dev/binder", 0x80002, 0x0) = <fd>`, because the tracer
 prints the directory fd (`AT_FDCWD`) first; a path substring is not a
-pass. `servicemanager` is the same path once that binary is the guest.
+pass. The original `servicemanager` and `service` binaries from the
+pinned reDroid layer are the next guest on that path
+(`bionic-smoke --prepare-servicemanager`, then `aim-binder-proc android`).
+A Linux staging of those files is not the run, and neither is a Linux
+VM or container on the Mac. Acceptance is the Mac command in
+[mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host
+platform and page size, the exact commit, the commands, pids, exit
+codes, original stdout and stderr, and the transaction text from the
+original `service` client.
 
 - **Open.** `openat("/dev/binder")` creates a Unix socket pair. The guest's
   fd is one end, and the other end goes to the daemon as a fileport. The
