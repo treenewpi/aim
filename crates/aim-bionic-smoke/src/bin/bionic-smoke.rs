@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use aim_bionic_smoke::{
-    execute, fetch, prepare, require_layer, DIFF_ID, LAYER_DIGEST, LAYER_SIZE, MANIFEST_DIGEST,
-    REPOSITORY, TAG,
+    execute, fetch, prepare, prepare_property, require_layer, run_property, DIFF_ID, LAYER_DIGEST,
+    LAYER_SIZE, MANIFEST_DIGEST, REPOSITORY, TAG,
 };
 
 fn main() -> ExitCode {
@@ -30,6 +30,8 @@ fn run() -> Result<(), String> {
     let mut do_fetch = false;
     let mut prepare_only = false;
     let mut prepare_manager = false;
+    let mut prepare_property_root = false;
+    let mut property: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--linux-run" => {
@@ -40,6 +42,10 @@ fn run() -> Result<(), String> {
             "--fetch" => do_fetch = true,
             "--prepare" => prepare_only = true,
             "--prepare-servicemanager" => prepare_manager = true,
+            "--prepare-property" => prepare_property_root = true,
+            "--property" => {
+                property = Some(PathBuf::from(args.next().ok_or("--property needs linux-run")?));
+            }
             "--help" | "-h" => {
                 println!(
                     "\
@@ -47,6 +53,8 @@ usage: bionic-smoke --linux-run PATH
        bionic-smoke --fetch
        bionic-smoke --prepare
        bionic-smoke --prepare-servicemanager
+       bionic-smoke --prepare-property
+       bionic-smoke --property LINUX_RUN
 
 Pinned image: {REPOSITORY}:{TAG}
   manifest {MANIFEST_DIGEST}
@@ -59,6 +67,11 @@ service binaries, plus a generated /dev/__properties__ where
 servicemanager.ready is true. That value lets the original client leave
 WaitForProperty. It is not a binder result and it does not register a
 service or run a transaction.
+--prepare-property stages original getprop, setprop and libbase.so on a
+copy of the bionic root, plus generated system/bin/property-wait. It does
+not write servicemanager.ready. --property starts the property socket and
+runs those programs. That command is not accepted until a real Apple
+Silicon Mac runs it.
 Acceptance of that stage is a real Apple Silicon Mac running them under
 linux-run on XNU. A Linux compile, unit test, this staging, a Linux VM,
 or a Linux container is not that run. A Mac log has to include the host
@@ -71,11 +84,30 @@ the transaction text from the original service binary."
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if linux_run.is_none() && !prepare_only && !prepare_manager && !do_fetch {
+    if linux_run.is_none()
+        && property.is_none()
+        && !prepare_only
+        && !prepare_manager
+        && !prepare_property_root
+        && !do_fetch
+    {
         return Err(
-            "pass --fetch, --prepare, --prepare-servicemanager, or --linux-run PATH; --help prints the pinned digest"
+            "pass --fetch, --prepare, --prepare-servicemanager, --prepare-property, --property PATH, or --linux-run PATH; --help prints the pinned digest"
                 .into(),
         );
+    }
+    if prepare_property_root || property.is_some() {
+        if prepare_only || prepare_property_root {
+            let layer = if do_fetch { fetch()? } else { require_layer()? };
+            if prepare_only {
+                prepare(&layer)?;
+            }
+            prepare_property()?;
+        }
+        if let Some(linux_run) = property {
+            run_property(&linux_run)?;
+        }
+        return Ok(());
     }
     if prepare_manager {
         let layer = if do_fetch { fetch()? } else { require_layer()? };

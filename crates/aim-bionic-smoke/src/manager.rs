@@ -123,7 +123,7 @@ pub fn prepare_manager() -> Result<PathBuf, String> {
     Ok(root)
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -317,7 +317,7 @@ fn copy_apex_libdl(root: &Path) -> Result<(), String> {
     .map_err(|e| format!("runtime apex libdl_android: {e}"))
 }
 
-fn resolve_lib(root: &Path, lib: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_lib(root: &Path, lib: &str) -> Result<PathBuf, String> {
     for dir in ["/system/lib64", "/apex/com.android.runtime/lib64/bionic"] {
         if let Ok(path) = guest_file(root, &format!("{dir}/{lib}")) {
             return Ok(path);
@@ -328,7 +328,7 @@ fn resolve_lib(root: &Path, lib: &str) -> Result<PathBuf, String> {
     ))
 }
 
-fn require_arm64(info: &super::ElfInfo, what: &str) -> Result<(), String> {
+pub(crate) fn require_arm64(info: &super::ElfInfo, what: &str) -> Result<(), String> {
     if info.machine != 183 {
         return Err(format!("{what} machine {}", info.machine));
     }

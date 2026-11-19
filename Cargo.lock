@@ -131,6 +131,7 @@ dependencies = [
  "aim-paths",
  "android-image-extract",
  "flate2",
+ "libc",
  "sha2",
  "tar",
 ]

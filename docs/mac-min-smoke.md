@@ -259,6 +259,21 @@ and `getpid`. The pass list below is unchanged. Re-run
 `3f9489b1edb76c7d8d64ed4d5e92f6425c09c54b006259c6206d662276d873e9`.
 Do not pass `--fetch`.
 
+Commit `b2c2c7d5450a0b68872b23eab4a15ea8e9c4d98c` was run on the same M4
+(macOS 26.5.1, Darwin 25.5, arm64, 16 KiB pages, Rust 1.88). The
+original android matrix passed 2/2 and `libbinder` passed 2/2, with no
+harness timeout. Before addService, `service check` printed not found.
+After the server registered, the original check printed found. The
+caller printed `binder reply: value=2` with server pid 90774 and caller
+pid 90780; the second round was 90816 and 90822. The caller did a real
+`write` of fd 1, 56 bytes. After the server was killed, check printed
+not found and `libbinder-ping call` exited 1 with `binder missing`.
+Each of those had an open and `BR_REPLY`. The four pids in a round were
+distinct. The staged probe was 4976 bytes at the hash above. The log
+archive is `fa7b940afae2df7dff245824c09e055f0b81b385dcf55fab6cd7888eac9e5f19`.
+The `servicemanager.ready=true` area in that root is still the generated
+fixture. The vDSO eight-try fallback was not the path measured.
+
 ```sh
 git fetch origin cursor/binder-fd-elf-smoke-602d
 git checkout cursor/binder-fd-elf-smoke-602d
@@ -301,6 +316,74 @@ exit code, and the original stdout and stderr. `libbinder-ping ok` is
 this registration and one Parcel call. It is not ART, zygote, or a boot.
 The vDSO fallback branch is still unmeasured. Linux tests do not
 satisfy this section.
+
+## Property service
+
+`bionic-smoke --property` is the next measurement. It does not use the
+servicemanager root and it does not write `servicemanager.ready` ahead
+of the client. `--prepare-property` copies the bionic root and adds the
+original `system/bin/toolbox` (sha256
+`f2233523a39537e741a0c728fb56abbb1c0c5bc8422ce623a84f12a0f52192e4`).
+`getprop` and `setprop` are the image's symlinks to `toolbox`; `argv[0]`
+selects the applet. It also adds `system/lib64/libbase.so` (sha256
+`025a1c793543c73887e386d888aa3de247af4492ec53ca750a8c985b6ab8c865`).
+`system/bin/property-wait` is generated from
+`crates/aim-bionic-smoke/probe/`. It links the image `libc.so` and calls
+`__system_property_get` and `__system_property_wait_any`. Its sha256 is
+`3b87daaaa4a695ae72321641fc36320d0ad0e26d42068d4506a68072801a319d`.
+Original `getprop` has no wait flag, so the waiter is not an image file.
+
+The server is in `bionic-smoke`. It maps `/dev/__properties__` with
+`MAP_SHARED`, writes only `ro.property_service.version=2` (init's
+protocol version), and listens on `/dev/socket/property_service`. A set
+is accepted only when `linux-run --by-pid` has published the peer's
+`seclabel`. There is no fallback context. The trie is the default
+string context, not the image `property_contexts`. This is not
+`libbinder-ping ok` and not a boot.
+
+Keep the `android` and `libbinder` commands above as regressions. Their
+static ready area stays until this path has passed on the Mac. Do not
+pass `--fetch`. The Mac does not compile `property-wait`.
+
+```sh
+git fetch origin cursor/binder-fd-elf-smoke-602d
+git checkout cursor/binder-fd-elf-smoke-602d
+git rev-parse HEAD
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+./target/release/bionic-smoke --prepare
+./target/release/bionic-smoke --prepare-property
+./target/release/bionic-smoke --property ./target/release/linux-run
+```
+
+`git rev-parse HEAD` has to be the commit that contains this server.
+The log has to include `host sysname=Darwin machine=arm64` and
+`pagesize=16384`. A pass is all of:
+
+- `property-service: servicemanager.ready absent` before any guest
+- original `getprop servicemanager.ready` exits 0, stdout does not
+  contain `true`, and stderr has a completed `openat` of
+  `/dev/__properties__/property_info`
+- `property-wait servicemanager.ready true` stays up with more `futex`
+  enters than leaves, then after setprop exits 0 and its stdout is
+  `property wait: servicemanager.ready=true`
+- original `setprop servicemanager.ready true` exits 0, stderr has a
+  completed `connect`, and the server line is
+  `property-service set pid=<setprop pid> uid=2000 context=u:r:shell:s0 name=servicemanager.ready value=true reply=0`
+- a later original `getprop servicemanager.ready` exits 0 and prints
+  `true`, from a pid distinct from setprop and the waiter
+- original `setprop ro.property_service.version 9` does not exit 0, and
+  `getprop ro.property_service.version` prints `2`
+- original `getprop debug.aim.unset` does not print `true`
+- `property-service ok`, then the socket is gone and no `linux-run` or
+  `bionic-smoke` remains
+
+`property-service: first blocker:` is not a pass. Keep that command's
+pid, exit code, and the original stdout and stderr. A waiter that never
+leaves `futex`, a setprop the server denies, or a getprop that prints a
+value nobody sent is the blocker. Linux unit tests drive the socket
+from the host. They are not this run. The vDSO eight-try fallback is
+still unmeasured. This is not ART and not a reDroid boot.
 
 `cargo test -p aim-linux-abi --lib` builds that crate's dev-dependencies,
 including the AIDL services. `cargo test -p aim-vdso-retry` does not.

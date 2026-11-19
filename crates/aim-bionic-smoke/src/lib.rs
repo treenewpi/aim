@@ -6,6 +6,8 @@
 //! out; the only file this tool writes itself under the guest root is
 //! `linkerconfig/ld.config.txt` (the file init's `linkerconfig` would
 //! generate) and the non-ELF negative control.
+//! `--prepare-property` stages a second root for the original `getprop`
+//! and `setprop`. That root does not seed `servicemanager.ready`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -17,7 +19,9 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 mod manager;
+mod property;
 pub use manager::{binder_device_opened, prepare_manager};
+pub use property::{prepare_property, property_root, run_property};
 
 /// Docker Hub repository that publishes reDroid. The tag is only a name for
 /// the digest below; the tool never resolves a moving tag.

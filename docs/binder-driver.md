@@ -119,6 +119,10 @@ pinned reDroid layer run on that path
 The staged root adds a generated `servicemanager.ready=true` property
 area so the original client can leave `WaitForProperty` and open
 `/dev/binder`. That value is the test root, not a property service.
+`bionic-smoke --prepare-property` stages a different root and serves
+`/dev/socket/property_service` with file-backed areas. It does not seed
+`servicemanager.ready`. That command is a separate Mac measurement; it
+does not replace the fixture this binder command still uses.
 The vDSO's commpage timebase retry is bounded and then takes the
 `clock_gettime` syscall. With no context manager the original
 `service` keeps transacting: the driver returns `BR_DEAD_REPLY` in the
