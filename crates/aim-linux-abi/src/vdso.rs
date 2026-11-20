@@ -11,7 +11,16 @@
 //! timestamp advanced by the ticks since it, all from Darwin's commpage;
 //! ticks become nanoseconds with the timebase in `[vvar]`. What they cannot
 //! serve (CPU and alarm clocks, bad ids, a host without a user-readable
-//! counter, a stale wall-clock timestamp) is the syscall, as on Linux.
+//! counter, a stale wall-clock timestamp, or a commpage word that changes
+//! on every read) is the syscall, as on Linux.
+//!
+//! The offset and the wall-clock generation are each tried eight times.
+//! libsystem retries without a limit because the offset is stable except
+//! across wake. On the M4 sample of the original `service` binary the two
+//! loads never matched, so `__kernel_clock_gettime` stayed in this page
+//! and the process never opened `/dev/binder`. A mismatch after the last
+//! try is the syscall, which reads the same clock through
+//! `mach_absolute_time`. A matching pair still returns in the page.
 //!
 //! The code is assembled into this binary and copied into each process's
 //! image already translated: its `svc` sites branch to syscall stubs
@@ -48,14 +57,18 @@ std::arch::global_asm!(
     "8: mrs \\dst, S3_4_C15_C10_6", // Apple's non-speculative counter
     "9:",
     ".endm",
-    // \dst = mach_absolute_time.
-    ".macro ABSTIME dst, t1, t2",
+    // \dst = mach_absolute_time. Eight tries, then \fail. w17 is the count.
+    ".macro ABSTIME dst, t1, t2, fail",
+    "mov w17, #8",
     "6: ldr \\t1, [x9, #{tb_off}]",
     "COUNTER \\dst",
     "ldr \\t2, [x9, #{tb_off}]",
     "cmp \\t1, \\t2",
+    "b.eq 4f",
+    "subs w17, w17, #1",
     "b.ne 6b",
-    "add \\dst, \\dst, \\t1",
+    "b \\fail",
+    "4: add \\dst, \\dst, \\t1",
     ".endm",
     ".macro NSEC_PER_SEC reg",
     "movz \\reg, #0xca00",
@@ -64,15 +77,19 @@ std::arch::global_asm!(
     // x11 = seconds, x12 = nanoseconds of the wall clock
     // (`clock::commpage_realtime`); \fail when the commpage cannot serve it.
     ".macro REALTIME fail",
+    "mov w16, #8",
     "add x15, x9, #{tod}",
     "5: ldr x2, [x15]",
-    "ABSTIME x3, x4, x5",
+    "ABSTIME x3, x4, x5, \\fail",
     "ldp x11, x12, [x15, #8]",
     "ldp x4, x5, [x15, #24]",
     "ldr x6, [x15]",
     "cmp x2, x6",
+    "b.eq 3f",
+    "subs w16, w16, #1",
     "b.ne 5b",
-    "cbz x2, \\fail",
+    "b \\fail",
+    "3: cbz x2, \\fail",
     "sub x3, x3, x2",
     "cmp x3, x5",
     "b.hs \\fail",
@@ -122,7 +139,7 @@ std::arch::global_asm!(
     "add x12, x12, x13",
     "b Lvdso_ticks",
     "Lvdso_mono:",
-    "ABSTIME x12, x13, x14",
+    "ABSTIME x12, x13, x14, Lvdso_gettime_sys",
     // x12 ticks to nanoseconds as `aim_hostcall::clock::ticks_to_ns`.
     "Lvdso_ticks:",
     "adr x13, Lvdso_start",
@@ -443,6 +460,58 @@ pub fn rt_sigreturn() -> u64 {
     BASE.load(Relaxed) + (TEXT_OFF + at) as u64
 }
 
+/// The translated vDSO text. The commpage retry check reads it without
+/// the rest of this crate's tests.
+pub fn translated_text() -> Vec<u8> {
+    let image = build();
+    let len = aim_vdso_end as usize - aim_vdso_start as usize;
+    image[TEXT_OFF..TEXT_OFF + len].to_vec()
+}
+
+/// Eight tries, then a branch out. `w17` is the monotonic counter retry
+/// and `w16` the wall-clock generation retry. An open `b.ne` has no `subs`.
+pub fn commpage_retry_is_bounded(text: &[u8]) -> Result<(), String> {
+    if text.len() % 4 != 0 || text.is_empty() {
+        return Err(format!("vDSO text length {}", text.len()));
+    }
+    let words: Vec<u32> = text
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    let count = |word: u32| words.iter().filter(|w| **w == word).count();
+    if count(0x5280_0111) != 3 {
+        return Err(format!("mov w17, #8 x{}", count(0x5280_0111)));
+    }
+    if count(0x5280_0110) != 2 {
+        return Err(format!("mov w16, #8 x{}", count(0x5280_0110)));
+    }
+    let bounded = |subs: u32, label: &str| -> Result<(), String> {
+        let mut seen = 0;
+        for (index, word) in words.iter().enumerate() {
+            if *word != subs {
+                continue;
+            }
+            let next = words.get(index + 1).copied().unwrap_or(0);
+            let after = words.get(index + 2).copied().unwrap_or(0);
+            // b.cond, then an unconditional b out of the loop.
+            if next >> 24 != 0x54 || after >> 26 != 0b000101 {
+                return Err(format!("{label} at {index} is not a bounded branch"));
+            }
+            seen += 1;
+        }
+        if seen == 0 {
+            return Err(format!("{label} missing"));
+        }
+        Ok(())
+    };
+    bounded(0x7100_0631, "subs w17, w17, #1")?;
+    bounded(0x7100_0610, "subs w16, w16, #1")?;
+    if count(0x7100_0631) != 3 || count(0x7100_0610) != 2 {
+        return Err("retry count".into());
+    }
+    Ok(())
+}
+
 /// What `/proc/<pid>/maps` names the mapping at `addr`: `[vvar]`, `[vdso]`.
 pub fn name_of(addr: u64) -> Option<&'static str> {
     let base = BASE.load(Relaxed);
@@ -576,5 +645,6 @@ mod tests {
                 .all(|w| a64::classify(u32::from_le_bytes(w.try_into().unwrap())).is_none()),
             "an svc left in the vDSO"
         );
+        commpage_retry_is_bounded(text).unwrap();
     }
 }

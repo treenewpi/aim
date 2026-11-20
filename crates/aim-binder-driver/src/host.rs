@@ -24,6 +24,10 @@ pub mod errno {
     pub const EFAULT: Errno = 14;
     pub const EBUSY: Errno = 16;
     pub const EINVAL: Errno = 22;
+    /// Too many open files. The hosted reader uses this when it prepared
+    /// fewer descriptor slots than the transaction carries and cannot ask
+    /// for more.
+    pub const EMFILE: Errno = 24;
     pub const ENOSPC: Errno = 28;
     pub const EPROTO: Errno = 71;
 }

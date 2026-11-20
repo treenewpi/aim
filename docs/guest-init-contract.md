@@ -501,4 +501,17 @@ in the guest or passed by a service's `file` line.
   boot completed`.
 - Tracked in #174.
 
+That list is the 2026-09-27 `linux-run`. It is not a trace of today's
+`/system/bin/init`. Those three calls are dispatched now, and original
+servicemanager has since reached `main` on the Mac. The 2026-11-19 macmini probe of `/system/bin/init` (commit `88f3d34`)
+captured the fd 2 `writev` of 149 bytes. It is Scudo's zero chunk
+header at tagged `0x2000081af1ed6c0` (untagged `0x81af1ed6c0`). That
+address is in the guest page after the 4 KiB `MADV_DONTNEED` at call
+2371. The syscall layer had rounded that discard up to 16 KiB and
+zeroed the live header. `MADV_DONTNEED` now discards 4 KiB guest
+pages. The check and the abort stay. The run still exited 6 before
+`property_info` and before any second-stage `mount`. The fix has not
+been measured again. `/linkerconfig` still contains `ld.config.txt`
+and is not replaced. See [boot-status.md](boot-status.md).
+
 The current state of the boot is in [boot-status.md](boot-status.md).

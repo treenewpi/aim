@@ -383,6 +383,36 @@ fn openat_owned(a: [u64; 6], id: &super::cred::Identity) -> i64 {
     openat_host(&r, flags, mode, id)
 }
 
+fn open_socket_path(r: &vfs::Resolved, flags: u64) -> i64 {
+    let bytes = r.host.as_bytes();
+    let Some(split) = bytes.iter().rposition(|&byte| byte == b'/') else {
+        return -(errno::EINVAL as i64);
+    };
+    let Ok(parent) = CString::new(&bytes[..split.max(1)]) else {
+        return -(errno::EINVAL as i64);
+    };
+    // SAFETY: parent directory of a resolved host path.
+    let raw = unsafe {
+        libc::open(
+            parent.as_ptr(),
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return -(errno::last() as i64);
+    }
+    if flags & O_CLOEXEC == 0 && unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } < 0 {
+        let error = errno::last();
+        unsafe { libc::close(raw) };
+        return -(error as i64);
+    }
+    fdtab::insert(
+        raw,
+        Kind::Path(fdtab::PathDescription::socket(flags, r.guest.clone())),
+    );
+    raw as i64
+}
+
 fn openat_host(r: &vfs::Resolved, flags: u64, mode: u64, id: &super::cred::Identity) -> i64 {
     let hflags = open_flags_to_host(flags);
     let cgroup = vfs::cgroup(&r.guest);
@@ -444,6 +474,16 @@ fn openat_host(r: &vfs::Resolved, flags: u64, mode: u64, id: &super::cred::Ident
         return fdtab::PathDescription::open_character(&r, flags)
             .map(|fd| fd as i64)
             .unwrap_or_else(|error| -(error as i64));
+    }
+    // A bound socket has no host open, including O_EVTONLY (Darwin
+    // EOPNOTSUPP, Linux 95). An O_PATH handle is a new parent-directory
+    // fd plus the guest path, never the listening socket. libc 0.2.189
+    // Darwin: O_EVTONLY 0x8000, O_SYMLINK 0x200000, O_CLOEXEC 0x01000000.
+    if flags & O_PATH != 0 && super::fsops::is_socket_file(r) {
+        if flags & O_DIRECTORY != 0 {
+            return -(errno::ENOTDIR as i64);
+        }
+        return open_socket_path(r, flags);
     }
     // A file the guest creates keeps its owner's access on the host, as
     // mkdirat's does (fsops::host_mode), so its recorded metadata stays
@@ -1245,6 +1285,254 @@ fn iovs(ptr: u64, n: u64) -> Result<Vec<libc::iovec>, i64> {
         })
         .collect())
 }
+
+/// Bytes of one stdio payload copied onto the diagnostics descriptor.
+const STDIO_CAPTURE_CAP: usize = 512;
+const STDIO_LENS_SHOWN: usize = 16;
+
+struct StdioCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    partial: bool,
+    not_written: bool,
+    unreadable: bool,
+}
+
+/// How many bytes of a completed write to copy. `returned` is the syscall
+/// result and is never rewritten from this account.
+fn stdio_capture_limits(requested: u64, returned: i64) -> (usize, bool, bool, bool) {
+    if returned > 0 {
+        let written = returned as u64;
+        let available = written.min(requested);
+        let truncated = available > STDIO_CAPTURE_CAP as u64;
+        let partial = written < requested;
+        (
+            available.min(STDIO_CAPTURE_CAP as u64) as usize,
+            truncated,
+            partial,
+            false,
+        )
+    } else {
+        (
+            requested.min(STDIO_CAPTURE_CAP as u64) as usize,
+            requested > STDIO_CAPTURE_CAP as u64,
+            false,
+            true,
+        )
+    }
+}
+
+fn read_capped(address: u64, length: usize) -> Result<Vec<u8>, ()> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    super::user_memory::read_exact(address, length).map_err(|_| ())
+}
+
+fn capture_linear(address: u64, requested: u64, returned: i64) -> StdioCapture {
+    let (count, truncated, partial, not_written) = stdio_capture_limits(requested, returned);
+    match read_capped(address, count) {
+        Ok(bytes) => StdioCapture {
+            bytes,
+            truncated,
+            partial,
+            not_written,
+            unreadable: false,
+        },
+        Err(()) => StdioCapture {
+            bytes: Vec::new(),
+            truncated,
+            partial,
+            not_written,
+            unreadable: true,
+        },
+    }
+}
+
+fn capture_iov(vectors: &[libc::iovec], requested: u64, returned: i64) -> StdioCapture {
+    let (count, truncated, partial, not_written) = stdio_capture_limits(requested, returned);
+    let mut bytes = Vec::new();
+    let mut left = count;
+    let mut unreadable = false;
+    for vector in vectors {
+        if left == 0 {
+            break;
+        }
+        let take = vector.iov_len.min(left);
+        if take == 0 {
+            continue;
+        }
+        match read_capped(vector.iov_base as u64, take) {
+            Ok(part) => {
+                bytes.extend_from_slice(&part);
+                left -= take;
+            }
+            Err(()) => {
+                unreadable = true;
+                break;
+            }
+        }
+    }
+    StdioCapture {
+        bytes,
+        truncated,
+        partial,
+        not_written,
+        unreadable,
+    }
+}
+
+fn escape_stdio(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out
+}
+
+fn format_stdio_capture(
+    kind: &str,
+    fd: i32,
+    iov_count: usize,
+    lens: &[u64],
+    lens_truncated: bool,
+    saturated: bool,
+    requested: u64,
+    returned: i64,
+    captured: &StdioCapture,
+) -> String {
+    let mut line = format!("[linux-trace] stdio {kind} fd={fd} iov={iov_count} lens=");
+    for (index, len) in lens.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        line.push_str(&len.to_string());
+    }
+    if lens_truncated {
+        line.push_str(",...");
+    }
+    line.push_str(&format!(" requested={requested} returned={returned}"));
+    if saturated {
+        line.push_str(" requested-saturated");
+    }
+    if captured.partial {
+        line.push_str(" partial");
+    }
+    if captured.not_written {
+        line.push_str(" not-written");
+    }
+    if captured.truncated {
+        line.push_str(&format!(" truncated cap={STDIO_CAPTURE_CAP}"));
+    }
+    if captured.unreadable {
+        line.push_str(" unreadable");
+    }
+    line.push_str(&format!(
+        " captured={} payload=\"{}\"",
+        captured.bytes.len(),
+        escape_stdio(&captured.bytes)
+    ));
+    line
+}
+
+/// Bounded copy of a guest write to fd 0, 1, or 2 for the syscall trace.
+/// The syscall result is an input. This reads guest memory after the call
+/// and does not change that result, the descriptor, or the bytes written.
+pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    stdio_write_note(super::tracing(), nr, a, returned)
+}
+
+fn stdio_write_note(enabled: bool, nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let fd = a[0] as i32;
+    if !(0..=2).contains(&fd) {
+        return None;
+    }
+    let kind = match nr {
+        64 => "write",
+        66 => "writev",
+        68 => "pwrite64",
+        70 => "pwritev",
+        287 => "pwritev2",
+        _ => return None,
+    };
+    if matches!(nr, 64 | 68) {
+        let requested = a[2];
+        if requested == 0 && returned <= 0 {
+            return None;
+        }
+        let captured = capture_linear(a[1], requested, returned);
+        return Some(format_stdio_capture(
+            kind,
+            fd,
+            1,
+            &[requested],
+            false,
+            false,
+            requested,
+            returned,
+            &captured,
+        ));
+    }
+    let count = a[2];
+    if count == 0 && returned <= 0 {
+        return None;
+    }
+    if count > 1024 {
+        return Some(format!(
+            "[linux-trace] stdio {kind} fd={fd} iov_count={count} <iov count not captured> returned={returned}"
+        ));
+    }
+    let vectors = match iovs(a[1], count) {
+        Ok(vectors) => vectors,
+        Err(_) => {
+            return Some(format!(
+                "[linux-trace] stdio {kind} fd={fd} iov_count={count} <iov unreadable> returned={returned}"
+            ));
+        }
+    };
+    let mut requested: u64 = 0;
+    let mut saturated = false;
+    let mut lens = Vec::with_capacity(vectors.len());
+    for vector in &vectors {
+        let len = vector.iov_len as u64;
+        lens.push(len);
+        match requested.checked_add(len) {
+            Some(sum) => requested = sum,
+            None => {
+                saturated = true;
+                requested = u64::MAX;
+            }
+        }
+    }
+    if requested == 0 && returned <= 0 {
+        return None;
+    }
+    let lens_truncated = lens.len() > STDIO_LENS_SHOWN;
+    let shown = &lens[..lens.len().min(STDIO_LENS_SHOWN)];
+    let captured = capture_iov(&vectors, requested, returned);
+    Some(format_stdio_capture(
+        kind,
+        fd,
+        lens.len(),
+        shown,
+        lens_truncated,
+        saturated,
+        requested,
+        returned,
+        &captured,
+    ))
+}
 /// `positioned`: the transfer is at a given offset, not the file's.
 fn prepare_iov(
     pin: &fdtab::Pinned,
@@ -1735,6 +2023,16 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i64> {
     stat_fd_kernel(pin.descriptor().as_raw_fd())
 }
 pub(super) fn stat_fd_kernel(fd: i32) -> Result<libc::stat, i64> {
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        let resolved = vfs::resolve(vfs::LINUX_AT_FDCWD, guest.as_bytes(), false)
+            .map_err(|error| -(error as i64))?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(resolved.host.as_ptr(), &mut stat) } < 0 {
+            return Err(-(errno::last() as i64));
+        }
+        attrs::apply(attrs::Host::Path(&resolved.host), || guest, &mut stat);
+        return Ok(stat);
+    }
     if let Some(reference) = fdtab::character_reference(fd) {
         let failure = |error: std::io::Error| {
             -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64)
@@ -2954,16 +3252,19 @@ pub fn ioctl(a: [u64; 6]) -> i64 {
             FIONREAD => {
                 let n = match inotify::pending_bytes(fd) {
                     Some(n) => n as i32,
-                    None if let Some(r) = super::net::fionread(fd) => match r {
-                        Ok(n) => n,
-                        Err(error) => return error,
-                    },
                     None => {
-                        let mut n = 0i32;
-                        if libc::ioctl(fd, libc::FIONREAD, &mut n) < 0 {
-                            return -(errno::last() as i64);
+                        if let Some(r) = super::net::fionread(fd) {
+                            match r {
+                                Ok(n) => n,
+                                Err(error) => return error,
+                            }
+                        } else {
+                            let mut n = 0i32;
+                            if libc::ioctl(fd, libc::FIONREAD, &mut n) < 0 {
+                                return -(errno::last() as i64);
+                            }
+                            n
                         }
-                        n
                     }
                 };
                 super::user_memory::write_exact(arg, &n.to_le_bytes())
@@ -3825,6 +4126,187 @@ mod dac_tests {
         record(base, 1000, 1000, 0o755);
         fs::remove_dir_all(&host).unwrap();
     }
+
+    /// O_PATH of a bound socket is a new Path fd. Darwin cannot open the
+    /// socket inode, so the host fd is the parent directory and the guest
+    /// path is what readlink, fstat, and a later path chmod use.
+    #[test]
+    fn socket_path_opath_is_a_new_path_handle() {
+        if fdtab::isolated_kernel_test("sys::fs::dac_tests::socket_path_opath_is_a_new_path_handle")
+        {
+            return;
+        }
+        let (_guard, view) = vfs::test_view();
+        let base = "/data/aim-socket-opath";
+        let guest = format!("{base}/sock");
+        let (host, _) = vfs::lookup(base);
+        if host.exists() {
+            fs::remove_dir_all(&host).unwrap();
+        }
+        fs::create_dir_all(&host).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(host.join("sock")).unwrap();
+        let bound = std::os::fd::AsRawFd::as_raw_fd(&listener);
+        record(base, 1000, 1000, 0o755);
+        record(&guest, 10101, 10101, 0o660);
+        let owner = identity(10101, 10101);
+        let outsider = identity(10102, 10102);
+        super::super::cred::init(owner.clone(), None);
+        let flags = O_PATH | O_CLOEXEC | O_NOFOLLOW;
+        assert_eq!(flags, 0x288000);
+        let fd = open(&guest, flags, 0, &owner);
+        assert!(fd >= 0, "{fd}");
+        assert_ne!(fd as i32, bound);
+        assert!(matches!(fdtab::get(fd as i32), Some(fdtab::Kind::Path(_))));
+        assert_eq!(
+            fdtab::socket_path_guest(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        let mut host_stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd as i32, &mut host_stat) }, 0);
+        assert_eq!(host_stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let guest_stat = stat_fd(fd as i32).unwrap();
+        assert_eq!(guest_stat.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+        assert_eq!(guest_stat.st_mode & 0o7777, 0o660);
+        let stored = flags & !O_CLOEXEC;
+        assert_eq!(stored, 0x208000);
+        assert_eq!(fcntl([fd as u64, 3, 0, 0, 0, 0]), stored as i64);
+        let reject = |n: i32| {
+            let mut context: crate::context::GuestContext = unsafe { std::mem::zeroed() };
+            context.x[0] = n as u64;
+            context.x[1] = 0o666;
+            context.x[8] = 52;
+            super::super::dispatch(&mut context);
+            assert_eq!(context.x[0] as i64, -(errno::EBADF as i64));
+            assert_ne!(context.x[0] as i64, -95);
+            assert_eq!(
+                super::super::fsops::fchmod([n as u64, 0o666, 0, 0, 0, 0]),
+                -(errno::EBADF as i64)
+            );
+        };
+        reject(fd as i32);
+        let copy = dup([fd as u64, 0, 0, 0, 0, 0]);
+        assert!(copy >= 0);
+        assert_eq!(fcntl([copy as u64, 3, 0, 0, 0, 0]), stored as i64);
+        reject(copy as i32);
+        let dupfd = fcntl([fd as u64, 0, 0, 0, 0, 0]);
+        assert!(dupfd >= 0);
+        assert_eq!(fcntl([dupfd as u64, 3, 0, 0, 0, 0]), stored as i64);
+        reject(dupfd as i32);
+        let proc_host = view.join("run/socket-opath-proc");
+        fs::create_dir_all(&proc_host).unwrap();
+        vfs::add_mount(
+            "/proc",
+            proc_host.canonicalize().unwrap(),
+            vfs::Area::Kernfs,
+            "proc",
+            "proc",
+        )
+        .unwrap();
+        struct Unmount;
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = vfs::remove_mount("/proc");
+            }
+        }
+        let _unmount = Unmount;
+        assert_eq!(
+            super::super::procfs::fd_link(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        let link = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+        let mut buf = [0u8; 128];
+        let n = readlinkat([
+            vfs::LINUX_AT_FDCWD as u64,
+            link.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ]);
+        assert_eq!(n, guest.len() as i64);
+        assert_eq!(&buf[..n as usize], guest.as_bytes());
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                0o640,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(stat_fd(fd as i32).unwrap().st_mode & 0o7777, 0o640);
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, base.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o755
+        );
+        let path = CString::new(guest.as_str()).unwrap();
+        super::super::cred::init(outsider, None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o666,
+                0,
+                0,
+                0,
+            ]),
+            -(errno::EPERM as i64)
+        );
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, guest.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o640
+        );
+        super::super::cred::init(owner.clone(), None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o600,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, guest.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            open(&guest, O_PATH | O_DIRECTORY, 0, &owner),
+            -(errno::ENOTDIR as i64)
+        );
+        let text = fdtab::regular_exec_text().unwrap();
+        assert!(text.contains(&format!("spath\t{fd}\t{stored}\t{guest}")));
+        let mut writer = super::super::fork_state::Writer::default();
+        fdtab::fork_save(&mut writer);
+        let bytes = writer.into_bytes();
+        let mut reader = super::super::fork_state::Reader::new(&bytes);
+        fdtab::fork_restore(&mut reader);
+        assert!(reader.ok());
+        assert_eq!(
+            fdtab::socket_path_guest(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        assert_eq!(close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(close([copy as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(close([dupfd as u64, 0, 0, 0, 0, 0]), 0);
+        assert!(unsafe { libc::fcntl(bound, libc::F_GETFD) } >= 0);
+        assert!(fdtab::get(fd as i32).is_none());
+        drop(listener);
+        fs::remove_dir_all(&host).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -4152,5 +4634,166 @@ mod read_only_map_tests {
         assert_eq!(super::openat(args(1)), -(errno::EROFS as i64));
         assert_eq!(std::fs::read(apex.join("payload")).unwrap(), b"original");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stdio_trace_tests {
+    use super::*;
+
+    #[test]
+    fn stdio_capture_is_bounded_and_does_not_invent_a_payload() {
+        let exact = StdioCapture {
+            bytes: b"FATAL example".to_vec(),
+            truncated: false,
+            partial: false,
+            not_written: false,
+            unreadable: false,
+        };
+        let line = format_stdio_capture(
+            "writev",
+            2,
+            4,
+            &[12, 1, 100, 36],
+            false,
+            false,
+            149,
+            149,
+            &exact,
+        );
+        assert!(line.contains("fd=2"));
+        assert!(line.contains("iov=4"));
+        assert!(line.contains("lens=12,1,100,36"));
+        assert!(line.contains("requested=149"));
+        assert!(line.contains("returned=149"));
+        assert!(line.contains("captured=13"));
+        assert!(line.contains("payload=\"FATAL example\""));
+        assert!(!line.contains("truncated"));
+        assert!(!line.contains("partial"));
+        assert!(!line.contains("not-written"));
+
+        let mut long = StdioCapture {
+            bytes: vec![b'A'; STDIO_CAPTURE_CAP],
+            truncated: true,
+            partial: false,
+            not_written: false,
+            unreadable: false,
+        };
+        let truncated =
+            format_stdio_capture("writev", 2, 1, &[600], false, false, 600, 600, &long);
+        assert!(truncated.contains("truncated cap=512"));
+        assert!(truncated.contains("captured=512"));
+        assert!(!truncated.contains(&"A".repeat(513)));
+
+        long.partial = true;
+        long.bytes.truncate(100);
+        long.truncated = false;
+        let partial =
+            format_stdio_capture("write", 1, 1, &[149], false, false, 149, 100, &long);
+        assert!(partial.contains("partial"));
+        assert!(partial.contains("returned=100"));
+        assert!(partial.contains("captured=100"));
+
+        let failed = StdioCapture {
+            bytes: b"attempt".to_vec(),
+            truncated: false,
+            partial: false,
+            not_written: true,
+            unreadable: false,
+        };
+        let not_written =
+            format_stdio_capture("writev", 2, 1, &[7], false, false, 7, -2, &failed);
+        assert!(not_written.contains("not-written"));
+        assert!(not_written.contains("returned=-2"));
+        assert!(not_written.contains("payload=\"attempt\""));
+
+        let broken = StdioCapture {
+            bytes: b"pre".to_vec(),
+            truncated: false,
+            partial: true,
+            not_written: false,
+            unreadable: true,
+        };
+        let unreadable =
+            format_stdio_capture("writev", 2, 2, &[4, 10], false, false, 14, 14, &broken);
+        assert!(unreadable.contains("unreadable"));
+        assert!(unreadable.contains("payload=\"pre\""));
+        assert!(unreadable.contains("captured=3"));
+
+        let escaped = escape_stdio(b"a\\b\"\n\t\x00\xff");
+        assert_eq!(escaped, "a\\\\b\\\"\\n\\t\\x00\\xff");
+
+        assert!(stdio_write_note(false, 66, &[2, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 66, &[3, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 63, &[2, 0, 1, 0, 0, 0], 149).is_none());
+        assert!(stdio_write_note(true, 64, &[2, 0, 0, 0, 0, 0], 0).is_none());
+        let refused = stdio_write_note(true, 66, &[2, 0, 1, 0, 0, 0], 149).unwrap();
+        assert!(refused.contains("<iov unreadable>"));
+        assert!(refused.contains("returned=149"));
+        assert!(refused.contains("fd=2"));
+        let huge = stdio_write_note(true, 66, &[2, 0, 1025, 0, 0, 0], 149).unwrap();
+        assert!(huge.contains("<iov count not captured>"));
+        assert!(huge.contains("returned=149"));
+        let overlong = stdio_write_note(true, 64, &[2, 0, 1u64 << 40, 0, 0, 0], 4).unwrap();
+        assert!(overlong.contains("unreadable"));
+        assert!(overlong.contains("partial"));
+        assert!(overlong.contains("returned=4"));
+        assert!(overlong.contains("requested=1099511627776"));
+        assert!(!overlong.contains("truncated"));
+    }
+
+    #[test]
+    fn stdio_capture_reads_the_written_prefix_only() {
+        if fdtab::isolated_kernel_test(
+            "sys::fs::stdio_trace_tests::stdio_capture_reads_the_written_prefix_only",
+        ) {
+            return;
+        }
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let payload = b"FATAL example\n";
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), page.cast::<u8>(), payload.len());
+        }
+        let iov = page as u64 + 256;
+        unsafe {
+            std::ptr::write_unaligned(iov as *mut u64, page as u64);
+            std::ptr::write_unaligned((iov + 8) as *mut u64, payload.len() as u64);
+            // A second vector whose length would be fatal to allocate, and a
+            // third whose address is not mapped. The copy stops at the cap
+            // and at the fault.
+            std::ptr::write_unaligned((iov + 16) as *mut u64, page as u64);
+            std::ptr::write_unaligned((iov + 24) as *mut u64, 1u64 << 40);
+        }
+        let note = stdio_write_note(true, 66, &[2, iov, 2, 0, 0, 0], payload.len() as i64).unwrap();
+        assert!(note.contains("payload=\"FATAL example\\n\""));
+        assert!(note.contains("captured=14"));
+        assert!(note.contains("partial"));
+        assert!(note.contains("lens=14,1099511627776"));
+        assert!(!note.contains("requested-saturated"));
+        assert!(!note.contains("truncated"));
+        let short = stdio_write_note(true, 66, &[2, iov, 1, 0, 0, 0], 5).unwrap();
+        assert!(short.contains("partial"));
+        assert!(short.contains("returned=5"));
+        assert!(short.contains("payload=\"FATAL\""));
+        assert!(short.contains("captured=5"));
+        unsafe {
+            std::ptr::write_unaligned((iov + 16) as *mut u64, 0u64);
+            std::ptr::write_unaligned((iov + 24) as *mut u64, 10u64);
+        }
+        let broken = stdio_write_note(true, 66, &[2, iov, 2, 0, 0, 0], 24).unwrap();
+        assert!(broken.contains("unreadable"));
+        assert!(broken.contains("payload=\"FATAL example\\n\""));
+        assert!(broken.contains("captured=14"));
+        assert_eq!(unsafe { libc::munmap(page, 4096) }, 0);
     }
 }

@@ -769,7 +769,7 @@ fn character_mutation(
 /// Whether `resolved` names a socket file. Darwin opens none, not even
 /// with O_EVTONLY (EOPNOTSUPP), so a socket's metadata changes by its
 /// path, which holds no data a swap could redirect.
-fn is_socket_file(resolved: &Resolved) -> bool {
+pub(super) fn is_socket_file(resolved: &Resolved) -> bool {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     let found = unsafe { libc::lstat(resolved.host.as_ptr(), &mut stat) } == 0;
     found && stat.st_mode & libc::S_IFMT == libc::S_IFSOCK
@@ -1021,9 +1021,19 @@ fn fchmodat_as(a: [u64; 6], id: &super::cred::Identity) -> i64 {
             .map(|_| 0)
             .unwrap_or_else(|error| -(error as i64));
     }
-    let anchor = match metadata_anchor(&resolved, true, false) {
+    chmod_resolved(&resolved, a[2] as u32, id)
+}
+fn chmod_socket_guest(guest: &str, mode: u32, id: &super::cred::Identity) -> i64 {
+    let resolved = match resolve_metadata(vfs::LINUX_AT_FDCWD, guest.as_bytes(), true, id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    chmod_resolved(&resolved, mode, id)
+}
+fn chmod_resolved(resolved: &Resolved, mode: u32, id: &super::cred::Identity) -> i64 {
+    let anchor = match metadata_anchor(resolved, true, false) {
         Ok(fd) => Some(fd),
-        Err(error) if error == -EOPNOTSUPP && is_socket_file(&resolved) => None,
+        Err(error) if error == -EOPNOTSUPP && is_socket_file(resolved) => None,
         Err(error) => return error,
     };
     let host = match &anchor {
@@ -1031,7 +1041,7 @@ fn fchmodat_as(a: [u64; 6], id: &super::cred::Identity) -> i64 {
         None => Host::Path(&resolved.host),
     };
     inode_mutation(host, &resolved.guest, true, |stat| {
-        let mode = match chmod_mode(&stat, a[2] as u32 & 0o7777, id) {
+        let mode = match chmod_mode(&stat, mode & 0o7777, id) {
             Ok(mode) => mode,
             Err(error) => return error,
         };
@@ -1090,6 +1100,9 @@ fn chmod_fd_private(
     }
     if !magic_link && super::fs::is_path_fd(fd) {
         return -(crate::errno::EBADF as i64);
+    }
+    if let Some(guest) = super::fdtab::socket_path_guest(fd) {
+        return chmod_socket_guest(&guest, mode, id);
     }
     // `anon_inode_setattr`: a bpf object's inode takes no attributes.
     if matches!(super::fdtab::get(fd), Some(super::fdtab::Kind::Bpf)) {

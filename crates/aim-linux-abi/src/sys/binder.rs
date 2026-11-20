@@ -326,11 +326,51 @@ pub fn ioctl(fd: i32, cmd: u64, arg: u64) -> Option<i64> {
     let r = super::signal::interruptible(&interrupt, || {
         file.ioctl(tid, cmd as u32, arg, &mut Guest::default())
     });
+    if matches!(r, Some(Ok(()))) && cmd as u32 == aim_binder_driver::uapi::BINDER_WRITE_READ {
+        note_read(fd, arg);
+    }
     Some(match r {
         None => -(EINTR as i64),
         Some(Ok(())) => 0,
         Some(Err(e)) => -(e as i64),
     })
+}
+
+/// The return commands this `BINDER_WRITE_READ` actually copied into the
+/// guest buffer. A transaction to handle 0 with no context manager is
+/// `BR_DEAD_REPLY` in this buffer; the line is that buffer, not a status
+/// the harness invented.
+fn note_read(fd: i32, arg: u64) {
+    use aim_binder_driver::uapi::{WRITE_READ_SIZE, WriteRead, ioc_size, return_name};
+    let Ok(header) = super::user_memory::read_exact(arg, WRITE_READ_SIZE) else {
+        return;
+    };
+    let read = WriteRead::decode(&header);
+    let consumed = read.read_consumed as usize;
+    if consumed < 4 {
+        return;
+    }
+    // The command words are at the front. A reply's payload can be large;
+    // the names of the first commands are what distinguishes a dead reply
+    // from a real one.
+    let Ok(buf) = super::user_memory::read_exact(read.read_buffer, consumed.min(64)) else {
+        return;
+    };
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at + 4 <= buf.len() && names.len() < 8 {
+        let code = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        names.push(return_name(code));
+        let next = at + 4 + ioc_size(code);
+        if next <= at || next > buf.len() {
+            break;
+        }
+        at = next;
+    }
+    if names.is_empty() {
+        return;
+    }
+    crate::diag!("[linux-abi] binder-read fd={fd} {}", names.join(" "));
 }
 
 const PROT_WRITE: u64 = 2;

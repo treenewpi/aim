@@ -667,6 +667,16 @@ pub fn write(open: &Open, iov: &[libc::iovec]) -> i64 {
     if total > RECORD_MAX {
         return -(EINVAL as i64);
     }
+    // Read the record before the ratelimit. Init points stdio at
+    // `/dev/null` before `InitKernelLogging`, and the burst is ten lines,
+    // so a later `LOG(FATAL)` would otherwise never reach a file. The
+    // diagnostics line is kept either way. A valid buffer still returns
+    // the length when the ring drops it.
+    let line = user_try!(gather(iov));
+    let (facility, level, text) = parse_prefix(&line);
+    let shown = String::from_utf8_lossy(text);
+    let shown = shown.replace(['\n', '\r'], " ");
+    crate::diag!("[kmsg] level={level} {shown}");
     if devkmsg() == "ratelimit" {
         let now = super::clock::Base::Monotonic.now();
         let mut l = limit.lock().unwrap();
@@ -679,8 +689,6 @@ pub fn write(open: &Open, iov: &[libc::iovec]) -> i64 {
         }
         l.printed += 1;
     }
-    let line = user_try!(gather(iov));
-    let (facility, level, text) = parse_prefix(&line);
     match with_ring(|ring| ring.append(facility, level, text)) {
         Ok(()) => total as i64,
         Err(error) => -(error as i64),
