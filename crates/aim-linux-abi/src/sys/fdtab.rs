@@ -93,6 +93,9 @@ impl Drop for PathProof {
 pub struct PathDescription {
     pub flags: u64,
     pub reference: Option<aim_binder_host::path_file::CharacterReference>,
+    /// Guest path of a bound socket opened with `O_PATH`. The host
+    /// descriptor is the parent directory, never the socket inode.
+    socket_guest: Option<String>,
     proof: Mutex<Option<Arc<PathProof>>>,
 }
 impl PathDescription {
@@ -100,6 +103,15 @@ impl PathDescription {
         Arc::new(Self {
             flags: flags & !super::fs::O_CLOEXEC,
             reference: None,
+            socket_guest: None,
+            proof: Mutex::new(None),
+        })
+    }
+    pub(super) fn socket(flags: u64, guest: String) -> Arc<Self> {
+        Arc::new(Self {
+            flags: flags & !super::fs::O_CLOEXEC,
+            reference: None,
+            socket_guest: Some(guest),
             proof: Mutex::new(None),
         })
     }
@@ -141,6 +153,7 @@ impl PathDescription {
             Kind::Path(Arc::new(Self {
                 flags: flags & !super::fs::O_CLOEXEC,
                 reference: Some(reference),
+                socket_guest: None,
                 proof: Mutex::new(None),
             })),
         );
@@ -153,6 +166,14 @@ pub(crate) fn character_reference(
 ) -> Option<aim_binder_host::path_file::CharacterReference> {
     match get(fd) {
         Some(Kind::Path(path)) => path.reference.clone(),
+        _ => None,
+    }
+}
+
+/// Guest path recorded for an `O_PATH` socket handle, when this fd is one.
+pub(super) fn socket_path_guest(fd: i32) -> Option<String> {
+    match get(fd) {
+        Some(Kind::Path(path)) => path.socket_guest.clone(),
         _ => None,
     }
 }
@@ -248,6 +269,7 @@ pub(super) fn install_path(fd: i32) -> Result<(), crate::errno::Errno> {
         Kind::Path(Arc::new(PathDescription {
             flags: adopted.flags as u64,
             reference: adopted.reference,
+            socket_guest: None,
             proof: Mutex::new(Some(proof)),
         })),
     );
@@ -1509,6 +1531,10 @@ pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
                     .unwrap_or(-1)
             )),
             Kind::Path(description) => {
+                if let Some(guest) = &description.socket_guest {
+                    records.push(format!("spath\t{fd}\t{}\t{guest}", description.flags));
+                    continue;
+                }
                 let mut bytes = description.flags.to_le_bytes().to_vec();
                 if let Some(reference) = &description.reference {
                     bytes.extend_from_slice(&reference.encode());
@@ -1589,6 +1615,25 @@ pub(crate) fn restore_regular_exec(text: &str) -> Result<(), crate::errno::Errno
     let mut signals = std::collections::HashMap::new();
     for line in text.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.first() == Some(&"spath") {
+            if fields.len() != 4 {
+                return Err(crate::errno::EINVAL);
+            }
+            let fd = fields[1].parse::<i32>().map_err(|_| crate::errno::EINVAL)?;
+            let flags = fields[2].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            if flags & super::fs::O_PATH == 0
+                || flags & !(super::fs::O_PATH | 0o40000 | 0o100000) != 0
+                || !fields[3].starts_with('/')
+            {
+                return Err(crate::errno::EINVAL);
+            }
+            require_guest_visible(fd)?;
+            insert(
+                fd,
+                Kind::Path(PathDescription::socket(flags, fields[3].to_owned())),
+            );
+            continue;
+        }
         if fields.len() != 3 {
             return Err(crate::errno::EINVAL);
         }
@@ -1627,6 +1672,7 @@ pub(crate) fn restore_regular_exec(text: &str) -> Result<(), crate::errno::Errno
                 Kind::Path(Arc::new(PathDescription {
                     flags,
                     reference,
+                    socket_guest: None,
                     proof: Mutex::new(None),
                 })),
             );
@@ -2106,6 +2152,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 w.opt(path.reference.as_ref(), |w, reference| {
                     w.bytes(&reference.encode())
                 });
+                w.opt(path.socket_guest.as_deref(), |w, guest| w.str(guest));
             }
             Kind::TracePipe(open) => {
                 w.u32(20);
@@ -2211,9 +2258,11 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                         return (fd, None);
                     }
                 };
+                let socket_guest = r.opt(|r| r.str());
                 Kind::Path(Arc::new(PathDescription {
                     flags,
                     reference,
+                    socket_guest,
                     proof: Mutex::new(None),
                 }))
             }

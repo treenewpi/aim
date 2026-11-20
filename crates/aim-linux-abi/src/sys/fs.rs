@@ -383,6 +383,36 @@ fn openat_owned(a: [u64; 6], id: &super::cred::Identity) -> i64 {
     openat_host(&r, flags, mode, id)
 }
 
+fn open_socket_path(r: &vfs::Resolved, flags: u64) -> i64 {
+    let bytes = r.host.as_bytes();
+    let Some(split) = bytes.iter().rposition(|&byte| byte == b'/') else {
+        return -(errno::EINVAL as i64);
+    };
+    let Ok(parent) = CString::new(&bytes[..split.max(1)]) else {
+        return -(errno::EINVAL as i64);
+    };
+    // SAFETY: parent directory of a resolved host path.
+    let raw = unsafe {
+        libc::open(
+            parent.as_ptr(),
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return -(errno::last() as i64);
+    }
+    if flags & O_CLOEXEC == 0 && unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } < 0 {
+        let error = errno::last();
+        unsafe { libc::close(raw) };
+        return -(error as i64);
+    }
+    fdtab::insert(
+        raw,
+        Kind::Path(fdtab::PathDescription::socket(flags, r.guest.clone())),
+    );
+    raw as i64
+}
+
 fn openat_host(r: &vfs::Resolved, flags: u64, mode: u64, id: &super::cred::Identity) -> i64 {
     let hflags = open_flags_to_host(flags);
     let cgroup = vfs::cgroup(&r.guest);
@@ -444,6 +474,16 @@ fn openat_host(r: &vfs::Resolved, flags: u64, mode: u64, id: &super::cred::Ident
         return fdtab::PathDescription::open_character(&r, flags)
             .map(|fd| fd as i64)
             .unwrap_or_else(|error| -(error as i64));
+    }
+    // A bound socket has no host open, including O_EVTONLY (Darwin
+    // EOPNOTSUPP, Linux 95). An O_PATH handle is a new parent-directory
+    // fd plus the guest path, never the listening socket. libc 0.2.189
+    // Darwin: O_EVTONLY 0x8000, O_SYMLINK 0x200000, O_CLOEXEC 0x01000000.
+    if flags & O_PATH != 0 && super::fsops::is_socket_file(r) {
+        if flags & O_DIRECTORY != 0 {
+            return -(errno::ENOTDIR as i64);
+        }
+        return open_socket_path(r, flags);
     }
     // A file the guest creates keeps its owner's access on the host, as
     // mkdirat's does (fsops::host_mode), so its recorded metadata stays
@@ -1983,6 +2023,16 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i64> {
     stat_fd_kernel(pin.descriptor().as_raw_fd())
 }
 pub(super) fn stat_fd_kernel(fd: i32) -> Result<libc::stat, i64> {
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        let resolved = vfs::resolve(vfs::LINUX_AT_FDCWD, guest.as_bytes(), false)
+            .map_err(|error| -(error as i64))?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(resolved.host.as_ptr(), &mut stat) } < 0 {
+            return Err(-(errno::last() as i64));
+        }
+        attrs::apply(attrs::Host::Path(&resolved.host), || guest, &mut stat);
+        return Ok(stat);
+    }
     if let Some(reference) = fdtab::character_reference(fd) {
         let failure = |error: std::io::Error| {
             -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64)
@@ -4074,6 +4124,187 @@ mod dac_tests {
         ));
         closed(dir as i64);
         record(base, 1000, 1000, 0o755);
+        fs::remove_dir_all(&host).unwrap();
+    }
+
+    /// O_PATH of a bound socket is a new Path fd. Darwin cannot open the
+    /// socket inode, so the host fd is the parent directory and the guest
+    /// path is what readlink, fstat, and a later path chmod use.
+    #[test]
+    fn socket_path_opath_is_a_new_path_handle() {
+        if fdtab::isolated_kernel_test("sys::fs::dac_tests::socket_path_opath_is_a_new_path_handle")
+        {
+            return;
+        }
+        let (_guard, view) = vfs::test_view();
+        let base = "/data/aim-socket-opath";
+        let guest = format!("{base}/sock");
+        let (host, _) = vfs::lookup(base);
+        if host.exists() {
+            fs::remove_dir_all(&host).unwrap();
+        }
+        fs::create_dir_all(&host).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(host.join("sock")).unwrap();
+        let bound = std::os::fd::AsRawFd::as_raw_fd(&listener);
+        record(base, 1000, 1000, 0o755);
+        record(&guest, 10101, 10101, 0o660);
+        let owner = identity(10101, 10101);
+        let outsider = identity(10102, 10102);
+        super::super::cred::init(owner.clone(), None);
+        let flags = O_PATH | O_CLOEXEC | O_NOFOLLOW;
+        assert_eq!(flags, 0x288000);
+        let fd = open(&guest, flags, 0, &owner);
+        assert!(fd >= 0, "{fd}");
+        assert_ne!(fd as i32, bound);
+        assert!(matches!(fdtab::get(fd as i32), Some(fdtab::Kind::Path(_))));
+        assert_eq!(
+            fdtab::socket_path_guest(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        let mut host_stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd as i32, &mut host_stat) }, 0);
+        assert_eq!(host_stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let guest_stat = stat_fd(fd as i32).unwrap();
+        assert_eq!(guest_stat.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+        assert_eq!(guest_stat.st_mode & 0o7777, 0o660);
+        let stored = flags & !O_CLOEXEC;
+        assert_eq!(stored, 0x208000);
+        assert_eq!(fcntl([fd as u64, 3, 0, 0, 0, 0]), stored as i64);
+        let reject = |n: i32| {
+            let mut context: crate::context::GuestContext = unsafe { std::mem::zeroed() };
+            context.x[0] = n as u64;
+            context.x[1] = 0o666;
+            context.x[8] = 52;
+            super::super::dispatch(&mut context);
+            assert_eq!(context.x[0] as i64, -(errno::EBADF as i64));
+            assert_ne!(context.x[0] as i64, -95);
+            assert_eq!(
+                super::super::fsops::fchmod([n as u64, 0o666, 0, 0, 0, 0]),
+                -(errno::EBADF as i64)
+            );
+        };
+        reject(fd as i32);
+        let copy = dup([fd as u64, 0, 0, 0, 0, 0]);
+        assert!(copy >= 0);
+        assert_eq!(fcntl([copy as u64, 3, 0, 0, 0, 0]), stored as i64);
+        reject(copy as i32);
+        let dupfd = fcntl([fd as u64, 0, 0, 0, 0, 0]);
+        assert!(dupfd >= 0);
+        assert_eq!(fcntl([dupfd as u64, 3, 0, 0, 0, 0]), stored as i64);
+        reject(dupfd as i32);
+        let proc_host = view.join("run/socket-opath-proc");
+        fs::create_dir_all(&proc_host).unwrap();
+        vfs::add_mount(
+            "/proc",
+            proc_host.canonicalize().unwrap(),
+            vfs::Area::Kernfs,
+            "proc",
+            "proc",
+        )
+        .unwrap();
+        struct Unmount;
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = vfs::remove_mount("/proc");
+            }
+        }
+        let _unmount = Unmount;
+        assert_eq!(
+            super::super::procfs::fd_link(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        let link = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+        let mut buf = [0u8; 128];
+        let n = readlinkat([
+            vfs::LINUX_AT_FDCWD as u64,
+            link.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ]);
+        assert_eq!(n, guest.len() as i64);
+        assert_eq!(&buf[..n as usize], guest.as_bytes());
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                0o640,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(stat_fd(fd as i32).unwrap().st_mode & 0o7777, 0o640);
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, base.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o755
+        );
+        let path = CString::new(guest.as_str()).unwrap();
+        super::super::cred::init(outsider, None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o666,
+                0,
+                0,
+                0,
+            ]),
+            -(errno::EPERM as i64)
+        );
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, guest.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o640
+        );
+        super::super::cred::init(owner.clone(), None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                vfs::LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o600,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(
+            stat_at(vfs::LINUX_AT_FDCWD, guest.as_bytes(), AT_SYMLINK_NOFOLLOW)
+                .unwrap()
+                .st_mode
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            open(&guest, O_PATH | O_DIRECTORY, 0, &owner),
+            -(errno::ENOTDIR as i64)
+        );
+        let text = fdtab::regular_exec_text().unwrap();
+        assert!(text.contains(&format!("spath\t{fd}\t{stored}\t{guest}")));
+        let mut writer = super::super::fork_state::Writer::default();
+        fdtab::fork_save(&mut writer);
+        let bytes = writer.into_bytes();
+        let mut reader = super::super::fork_state::Reader::new(&bytes);
+        fdtab::fork_restore(&mut reader);
+        assert!(reader.ok());
+        assert_eq!(
+            fdtab::socket_path_guest(fd as i32).as_deref(),
+            Some(guest.as_str())
+        );
+        assert_eq!(close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(close([copy as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(close([dupfd as u64, 0, 0, 0, 0, 0]), 0);
+        assert!(unsafe { libc::fcntl(bound, libc::F_GETFD) } >= 0);
+        assert!(fdtab::get(fd as i32).is_none());
+        drop(listener);
         fs::remove_dir_all(&host).unwrap();
     }
 }

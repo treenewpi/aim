@@ -108,6 +108,9 @@ pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Ok(open.path.clone());
     }
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        return Ok(guest);
+    }
     if let Some(reference) = fdtab::character_reference(fd) {
         reference
             .stat(fd)
@@ -137,6 +140,9 @@ pub(super) fn fd_link(fd: i32) -> Option<String> {
     }
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Some(open.path.clone());
+    }
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        return Some(guest);
     }
     if fdtab::character_reference(fd).is_some() {
         return fd_guest_path(fd).ok();
@@ -2014,6 +2020,20 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     {
         if !fdtab::visible(n) {
             return Some(-(ENOENT as i64));
+        }
+        if let Some(guest) = fdtab::socket_path_guest(n) {
+            let path = std::ffi::CString::new(guest).ok()?;
+            return Some(super::fs::openat_as(
+                [
+                    vfs::LINUX_AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    flags,
+                    0,
+                    0,
+                    0,
+                ],
+                &super::cred::current(),
+            ));
         }
         if let Some(reference) = fdtab::character_reference(n) {
             if let Err(error) = reference.stat(n) {
