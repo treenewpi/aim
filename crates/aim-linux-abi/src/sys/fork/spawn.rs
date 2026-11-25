@@ -1063,16 +1063,74 @@ fn spawn_program_suspended(
                 libc::posix_spawn_file_actions_adddup2(&mut setup.actions, source, target)
             })?;
         }
-        checked(libc::posix_spawn(
+        // Darwin `posix_spawn` returns `ENOENT` when the calling thread's
+        // cwd cannot be opened, and attributes it to the executable. The
+        // guest `clone` did not name that path.
+        repair_host_cwd(std::path::Path::new(exe.to_str().unwrap_or("")).parent());
+        let spawned = libc::posix_spawn(
             &mut pid,
             exe.as_ptr(),
             &setup.actions,
             &setup.attr,
             argv.as_ptr() as *const *mut libc::c_char,
             *_NSGetEnviron() as *const *mut libc::c_char,
-        ))?;
+        );
+        if let Err(error) = map_spawn_errno(exe, spawned) {
+            return Err(error);
+        }
     }
     Ok(pid)
+}
+
+/// `posix_spawn`'s errno, as a guest `clone` result. A host `ENOENT` (the
+/// executable path, or Darwin failing to open `.`) is not a missing guest
+/// path; it is traced and reported as `EIO`.
+pub(crate) fn map_spawn_errno(exe: &std::ffi::CStr, spawned: i32) -> Result<(), i64> {
+    if spawned == 0 {
+        return Ok(());
+    }
+    let guest = errno::from_darwin(spawned);
+    if guest == libc::ENOENT {
+        crate::diag!(
+            "[linux-abi] fork: posix_spawn {} returned ENOENT (host path, not a guest path)",
+            exe.to_string_lossy()
+        );
+        return Err(-(crate::errno::EIO as i64));
+    }
+    Err(-(guest as i64))
+}
+
+/// Darwin `posix_spawn` opens `.` for the child. If that directory is gone,
+/// the spawn returns `ENOENT` for the executable. Move the host cwd to
+/// `fallback` (or `/`) so the next spawn is not that error. The guest cwd
+/// is the VFS one and is left as it is.
+pub(crate) fn repair_host_cwd(fallback: Option<&std::path::Path>) {
+    let probe = unsafe {
+        libc::open(
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if probe >= 0 {
+        unsafe { libc::close(probe) };
+        return;
+    }
+    let error = errno::last();
+    let dir = fallback.unwrap_or(std::path::Path::new("/"));
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new("/")
+    } else {
+        dir
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    crate::diag!(
+        "[linux-abi] host cwd is not a directory (errno {error}); chdir {}",
+        dir.display()
+    );
+    unsafe { libc::chdir(path.as_ptr()) };
 }
 
 #[cfg(test)]

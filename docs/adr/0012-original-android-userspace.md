@@ -660,7 +660,11 @@ the remaining original daemons use, evdev, and memfd/ashmem. Loop
 (`/dev/loop-control` is 10:237, `/dev/loopN` is 7:N) and device-mapper
 (`/dev/device-mapper` is 10:236, `/dev/block/dm-N` is 253:N) record that
 device number at open; `stat` and `fstat` report it, and ioctl follows
-it, so a device-mapper command is not accepted on loop-control.
+it, so a device-mapper command is not accepted on loop-control. The
+loop and device-mapper tables are a file in the runtime directory, so
+a later process's `DM_DEV_STATUS` and `/sys/dev/block/M:N` see a device
+another process created. `LOOP_CTL_ADD` creates the `/dev/loopN` and
+`/dev/block/loopN` nodes.
 `LOOP_CTL_ADD`, `LOOP_CTL_REMOVE` and `LOOP_CTL_GET_FREE` are `0x4c80`
 through `0x4c82`. Device-mapper commands are
 `_IOWR(0xfd, nr, struct dm_ioctl)` with size 312, including `DM_VERSION`.

@@ -321,7 +321,32 @@ times). The trace has no `DM_VERSION` (`0xc138fd00`) before
 `reboot,bootloader,bootstrap-apexd-failed` after 4.7s. No mount ran, so
 ext4 and verity were not exercised. ioctl now follows the device number
 stored at open (`10:237` loop-control, `10:236` device-mapper, `7:N`
-loop). That dispatch is not Mac-remeasured. The pinned layer has 35
+loop). `7e68fcab960a6fa53d62ee85189d68022613b481` (archive SHA256
+`3d89f69c06060d96c6e619355d8882fdd983f496db443bfda96faa1a4eaa23f9`)
+remeasured that dispatch. Every step exited 0. apexd-bootstrap mounted
+runtime, i18n, tzdata and virt (`MS_RDONLY|MS_NODEV|MS_DIRSYNC|MS_NOATIME`
+plus a bind) and exited 0: `Activated 4 packages`. `LOOP_CTL_ADD` was
+`EEXIST` eight times then 31 successes, `LOOP_CTL_GET_FREE` returned
+0..3, `LOOP_CONFIGURE` succeeded, and `DM_DEV_CREATE` / `DM_TABLE_LOAD`
+succeeded 35 times. Init then rebooted after 1.8s with
+`reboot,boringssl-self-check-failed`. The first failure was
+`clone(0x1200011)` = `ENOENT` at calls 8347 (`prng_seeder`) and 8365
+(`boringssl_self_test64_vendor`). Those are the first forks after the
+APEX mounts; the same clone had succeeded for vendor_init, ueventd and
+apexd. The errno was the host helper `aim-pty-holder` (or Darwin
+`posix_spawn` opening `.`), stored when logwrapper's `openat("/dev/ptmx")`
+failed and then returned from `inherit_child` with no `[linux-abi]`
+line. `clone` now traces that host path and does not return it.
+`/dev/ptmx` returns `ENODEV` when the helper binary is missing. A
+`LOOP_CONFIGURE` whose backing fd is not open in the process is
+`EBADF`, including the first try on loop0 before that thread had opened
+the apex file; `CLONE_FILES` threads share the one table. `DM_DEV_STATUS`
+in init and ueventd is `ENXIO` because those processes did not see
+apexd's devices; the records are now in the runtime catalog, `LOOP_CTL_ADD`
+creates `/dev/loopN` and `/dev/block/loopN`, and `/sys/dev/block/M:N`
+names loop, dm and the image volume (`1:24` on that Mac is the volume's
+`st_dev`). The kobject uevent stays in the process that created the
+device. This fix is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

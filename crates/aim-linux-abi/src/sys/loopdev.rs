@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -153,13 +154,94 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 }
 
 fn ensure(state: &mut State) {
-    if state.seeded {
+    if !state.seeded {
+        for minor in 0..MIN_COUNT {
+            state.loops.entry(minor).or_insert_with(new_loop);
+        }
+        state.seeded = true;
+    }
+    // Another process (apexd) created these. This process's table starts
+    // empty, so status and sysfs would otherwise answer `ENXIO` / `ENOENT`.
+    absorb(state);
+}
+
+fn catalog_path() -> Option<PathBuf> {
+    vfs::runtime_dir().map(|dir| dir.join("block-devices"))
+}
+
+fn publish(state: &State) {
+    let Some(path) = catalog_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut text = String::new();
+    for minor in state.loops.keys() {
+        text.push_str(&format!("loop\t{minor}\n"));
+    }
+    for (minor, dev) in &state.dms {
+        let name = dev.name.replace(['\t', '\n'], "_");
+        let uuid = dev.uuid.replace(['\t', '\n'], "_");
+        text.push_str(&format!(
+            "dm\t{minor}\t{name}\t{uuid}\t{}\t{}\n",
+            u8::from(dev.suspended),
+            u8::from(dev.readonly)
+        ));
+    }
+    let _ = fs::write(path, text);
+}
+
+fn absorb(state: &mut State) {
+    let Some(path) = catalog_path() else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        match fields.next() {
+            Some("loop") => {
+                let Some(minor) = fields.next().and_then(|text| text.parse().ok()) else {
+                    continue;
+                };
+                state.loops.entry(minor).or_insert_with(new_loop);
+            }
+            Some("dm") => {
+                let Some(minor) = fields.next().and_then(|text| text.parse().ok()) else {
+                    continue;
+                };
+                let Some(name) = fields.next() else {
+                    continue;
+                };
+                if state.names.contains_key(name) || state.dms.contains_key(&minor) {
+                    continue;
+                }
+                let uuid = fields.next().unwrap_or("").to_string();
+                let mut dev = new_dm(name.to_string(), uuid);
+                dev.suspended = fields.next() == Some("1");
+                dev.readonly = fields.next() == Some("1");
+                state.names.insert(name.to_string(), minor);
+                state.dms.insert(minor, dev);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A guest node ueventd can `chown`. The open path is still the device
+/// table; the file is only so the directory entry exists. The image root
+/// is not written.
+fn place_node(guest: &str) {
+    let (host, area) = vfs::lookup(guest);
+    if area == Area::Image {
         return;
     }
-    for minor in 0..MIN_COUNT {
-        state.loops.insert(minor, new_loop());
+    if let Some(parent) = host.parent() {
+        let _ = fs::create_dir_all(parent);
     }
-    state.seeded = true;
+    let _ = fs::OpenOptions::new().write(true).create(true).open(host);
 }
 
 fn new_loop() -> Loop {
@@ -596,8 +678,11 @@ fn ctl_add(id: u32) -> Result<i64, Errno> {
         return Err(EEXIST);
     }
     state.loops.insert(id, new_loop());
-    let event = loop_device(id);
+    publish(&state);
     drop(state);
+    place_node(&format!("/dev/block/loop{id}"));
+    place_node(&format!("/dev/loop{id}"));
+    let event = loop_device(id);
     super::uevent::emit("add", &event, &[]);
     Ok(i64::from(id))
 }
@@ -609,6 +694,7 @@ fn ctl_remove(id: u32) -> Result<i64, Errno> {
         return Err(EBUSY);
     }
     state.loops.remove(&id);
+    publish(&state);
     Ok(0)
 }
 
@@ -625,14 +711,21 @@ fn ctl_free() -> Result<i64, Errno> {
     }
     let minor = state.loops.keys().next_back().copied().unwrap_or(0) + 1;
     state.loops.insert(minor, new_loop());
-    let event = loop_device(minor);
+    publish(&state);
     drop(state);
+    place_node(&format!("/dev/block/loop{minor}"));
+    place_node(&format!("/dev/loop{minor}"));
+    let event = loop_device(minor);
     super::uevent::emit("add", &event, &[]);
     Ok(i64::from(minor))
 }
 
 fn configure_checked(minor: u32, fd: i32, block: u32, info: &[u8]) -> Result<(), Errno> {
     // The apexd probe passes fd -1. Linux returns EBADF before EBUSY.
+    // A `CLONE_FILES` thread shares this process's descriptor table, so
+    // `F_GETFD` fails only when the fd is not open in the process. The
+    // first `LOOP_CONFIGURE` of loop0 in the Mac trace passed an fd this
+    // thread had not opened; that result is the same `EBADF`.
     if fd < 0 {
         return Err(EBADF);
     }
@@ -659,6 +752,7 @@ fn configure(minor: u32, fd: i32, block: u32, info: &[u8]) -> Result<(), Errno> 
 fn set_fd(minor: u32, fd: i32) -> Result<(), Errno> {
     let backing = attach(fd, &[0; 232])?;
     let mut state = lock();
+    ensure(&mut state);
     let dev = state.loops.get_mut(&minor).ok_or(ENXIO)?;
     if dev.backing.is_some() {
         return Err(EBUSY);
@@ -675,6 +769,7 @@ fn set_status(minor: u32, info: &[u8]) -> Result<(), Errno> {
         return Err(EINVAL);
     }
     let mut state = lock();
+    ensure(&mut state);
     let dev = state.loops.get_mut(&minor).ok_or(ENXIO)?;
     let backing = dev.backing.as_mut().ok_or(ENXIO)?;
     backing.offset = offset;
@@ -686,7 +781,8 @@ fn set_status(minor: u32, info: &[u8]) -> Result<(), Errno> {
 }
 
 fn get_status(minor: u32) -> Result<[u8; 232], Errno> {
-    let state = lock();
+    let mut state = lock();
+    ensure(&mut state);
     let backing = state
         .loops
         .get(&minor)
@@ -896,6 +992,9 @@ fn dm_create(buf: &mut [u8]) -> Result<(), Errno> {
     let minor = (0..).find(|m| !state.dms.contains_key(m)).unwrap();
     state.dms.insert(minor, new_dm(name.clone(), uuid));
     state.names.insert(name, minor);
+    publish(&state);
+    drop(state);
+    place_node(&format!("/dev/block/dm-{minor}"));
     put_version(buf);
     put_u32(buf, 20, 0);
     put_u32(buf, 24, 0);
@@ -906,6 +1005,7 @@ fn dm_create(buf: &mut [u8]) -> Result<(), Errno> {
 
 fn dm_remove(buf: &mut [u8]) -> Result<(), Errno> {
     let mut state = lock();
+    ensure(&mut state);
     let minor = find_dm(&state, buf)?;
     let dev = state.dms.get(&minor).ok_or(ENXIO)?;
     if dev.opens > 0 {
@@ -914,6 +1014,7 @@ fn dm_remove(buf: &mut [u8]) -> Result<(), Errno> {
     let name = dev.name.clone();
     state.dms.remove(&minor);
     state.names.remove(&name);
+    publish(&state);
     put_version(buf);
     put_u32(buf, 28, u32_at(buf, 28) | DM_UEVENT);
     let event = dm_device(minor, &name);
@@ -925,6 +1026,7 @@ fn dm_remove(buf: &mut [u8]) -> Result<(), Errno> {
 fn dm_suspend(buf: &mut [u8]) -> Result<(), Errno> {
     let suspend = u32_at(buf, 28) & DM_SUSPEND != 0;
     let mut state = lock();
+    ensure(&mut state);
     let minor = find_dm(&state, buf)?;
     let dev = state.dms.get_mut(&minor).ok_or(ENXIO)?;
     if suspend {
@@ -944,6 +1046,7 @@ fn dm_suspend(buf: &mut [u8]) -> Result<(), Errno> {
     }
     put_u32(buf, 28, flags);
     put_u64(buf, 40, encode_dev(DM_MAJOR, minor));
+    publish(&state);
     if !suspend {
         let event = dm_device(minor, &name);
         drop(state);
@@ -953,7 +1056,8 @@ fn dm_suspend(buf: &mut [u8]) -> Result<(), Errno> {
 }
 
 fn dm_status(buf: &mut [u8]) -> Result<(), Errno> {
-    let state = lock();
+    let mut state = lock();
+    ensure(&mut state);
     let minor = find_dm(&state, buf)?;
     let dev = state.dms.get(&minor).ok_or(ENXIO)?;
     put_version(buf);
@@ -1001,6 +1105,7 @@ fn dm_load(buf: &mut [u8]) -> Result<(), Errno> {
     };
     let readonly = u32_at(buf, 28) & DM_READONLY != 0;
     let mut state = lock();
+    ensure(&mut state);
     let minor = find_dm(&state, buf)?;
     let dev = state.dms.get_mut(&minor).ok_or(ENXIO)?;
     dev.inactive = Some(target);
@@ -1297,7 +1402,10 @@ pub fn sys_node(rest: &str) -> Option<Node> {
         return Some(Node::File(control_device().attribute()));
     }
     if let Some(rest) = rest.strip_prefix("dev/block/") {
-        return dev_link(&state, rest);
+        return dev_link(&state, rest).or_else(|| volume_link(rest));
+    }
+    if let Some(node) = volume_node(rest) {
+        return Some(node);
     }
     if rest == "dev/char/10:237" {
         return Some(Node::Link("/sys/devices/virtual/misc/loop-control".into()));
@@ -1378,6 +1486,54 @@ fn dev_text(which: &Which) -> String {
         Which::Loop(minor) => format!("{LOOP_MAJOR}:{minor}\n"),
         Which::Dm(minor) => format!("{DM_MAJOR}:{minor}\n"),
     }
+}
+
+/// `stat` of a file on the image volume. apexd's queue-depth walk
+/// `readlink`s `/sys/dev/block/<major>:<minor>` of that `st_dev`. On the
+/// Mac archive that pair was `1:24`.
+fn volume_id() -> Option<(u32, u32)> {
+    let root = vfs::root();
+    let path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let d = st.st_dev as u32 as u64;
+    let major = (d >> 24) as u32;
+    let minor = (d & 0xff_ffff) as u32;
+    Some((major, minor))
+}
+
+fn volume_link(rest: &str) -> Option<Node> {
+    let (major, minor) = rest.split_once(':')?;
+    let major: u32 = major.parse().ok()?;
+    let minor: u32 = minor.parse().ok()?;
+    let (have_major, have_minor) = volume_id()?;
+    (major == have_major && minor == have_minor)
+        .then(|| Node::Link("/sys/devices/virtual/block/vd0".into()))
+}
+
+fn volume_node(rest: &str) -> Option<Node> {
+    let tail = rest
+        .strip_prefix("devices/virtual/block/vd0")
+        .or_else(|| rest.strip_prefix("class/block/vd0"))
+        .or_else(|| rest.strip_prefix("block/vd0"))?;
+    let tail = tail.strip_prefix('/').unwrap_or(tail);
+    let (major, minor) = volume_id()?;
+    Some(match tail {
+        "" => dir_list(
+            vec!["dev".into(), "uevent".into(), "mq".into(), "queue".into()],
+            dir::DT_DIR,
+        ),
+        "dev" => Node::File(format!("{major}:{minor}\n").into_bytes()),
+        "uevent" => Node::File(
+            format!("MAJOR={major}\nMINOR={minor}\nDEVNAME=block/vd0\n").into_bytes(),
+        ),
+        "mq" => dir_list(vec!["0".into()], dir::DT_DIR),
+        "mq/0" => dir_list(vec!["nr_tags".into()], dir::DT_REG),
+        "mq/0/nr_tags" | "queue/nr_requests" => Node::File(b"128\n".to_vec()),
+        _ => return None,
+    })
 }
 
 fn dev_link(state: &State, rest: &str) -> Option<Node> {
@@ -1879,5 +2035,103 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_closed_backing_fd_is_ebadf_on_the_shared_table() {
+        let _gate = gate();
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        unsafe { libc::close(fd) };
+        assert_eq!(
+            configure_checked(0, fd, 4096, &[0; 232]).unwrap_err(),
+            EBADF
+        );
+    }
+
+    #[test]
+    fn an_added_loop_stays_visible_to_status_and_sysfs() {
+        let _gate = gate();
+        let (_view, _) = crate::vfs::test_view();
+        assert_eq!(ctl_add(8).unwrap(), 8);
+        {
+            let mut state = lock();
+            state.loops.remove(&8);
+            state.dms.clear();
+            state.names.clear();
+        }
+        match sys_node("dev/block/7:8") {
+            Some(Node::Link(path)) => {
+                assert_eq!(path, "/sys/devices/virtual/block/loop8");
+            }
+            _ => panic!("loop8 sysfs link"),
+        }
+        match sys_node("block/loop8/dev") {
+            Some(Node::File(bytes)) => assert_eq!(bytes, b"7:8\n"),
+            _ => panic!("loop8 dev"),
+        }
+        let mut created = vec![0u8; 312];
+        write_name(&mut created, 48, 128, "shared-dm");
+        put_u32(&mut created, 0, 4);
+        put_u32(&mut created, 12, 312);
+        dm_create(&mut created).unwrap();
+        {
+            let mut state = lock();
+            state.dms.clear();
+            state.names.clear();
+        }
+        let mut status = vec![0u8; 312];
+        write_name(&mut status, 48, 128, "shared-dm");
+        put_u32(&mut status, 0, 4);
+        put_u32(&mut status, 12, 312);
+        dm_status(&mut status).unwrap();
+        dm_remove(&mut status).unwrap();
+        ctl_remove(8).unwrap();
+        let (major, minor) = volume_id().expect("image volume");
+        match sys_node(&format!("dev/block/{major}:{minor}")) {
+            Some(Node::Link(path)) => {
+                assert_eq!(path, "/sys/devices/virtual/block/vd0");
+            }
+            _ => panic!("volume sysfs link"),
+        }
+        match sys_node("class/block/vd0/mq/0/nr_tags") {
+            Some(Node::File(bytes)) => assert_eq!(bytes, b"128\n"),
+            _ => panic!("volume queue depth"),
+        }
+    }
+
+    #[test]
+    fn mount_ext4_then_fork_does_not_return_host_enoent() {
+        let _gate = gate();
+        let (_view, _) = crate::vfs::test_view();
+        let (image, manifest) = super::super::ext4ro::manifest_fixture();
+        let dir = std::env::temp_dir().join(format!("aim-fork-mount-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.img");
+        fs::write(&path, &image).unwrap();
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        let minor = ctl_free().unwrap() as u32;
+        configure(minor, fd, 4096, &[0; 232]).unwrap();
+        unsafe { libc::close(fd) };
+        let guest = "/aim-fork-mount";
+        mount_ext4(&format!("/dev/block/loop{minor}"), guest, true).unwrap();
+        assert_eq!(guest_read(&format!("{guest}/apex_manifest.pb")), manifest);
+        super::super::pty_owner::with_owner_down(|| {
+            super::super::pty_owner::inherit_child(1).unwrap();
+        });
+        // `clone` reports a host `posix_spawn` `ENOENT` as `EIO`. A live
+        // guest fork needs the Darwin register frame, which this host has not.
+        super::super::fork::spawn::repair_host_cwd(Some(std::path::Path::new("/")));
+        assert_eq!(
+            super::super::fork::spawn::map_spawn_errno(c"/no/such/linux-run", libc::ENOENT)
+                .unwrap_err(),
+            -(crate::errno::EIO as i64)
+        );
+        crate::vfs::remove_mount(guest).unwrap();
+        clr_fd(minor).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

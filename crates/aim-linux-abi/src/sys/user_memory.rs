@@ -137,8 +137,11 @@ unsafe extern "C" {
 }
 #[cfg(not(target_os = "macos"))]
 unsafe extern "C" fn aim_user_copy(source: u64, destination: u64, length: usize) -> CopyResult {
+    // The Linux stand-in copies host memory. A test's guest buffer and the
+    // kernel buffer are both host allocations and can sit within `length`
+    // of each other; `copy` allows that. Darwin copies between address spaces.
     unsafe {
-        std::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, length);
+        std::ptr::copy(source as *const u8, destination as *mut u8, length);
     }
     CopyResult {
         remaining: 0,

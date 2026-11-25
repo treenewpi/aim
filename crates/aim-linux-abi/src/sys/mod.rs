@@ -223,6 +223,24 @@ pub(crate) fn guest_cstr(p: u64) -> Result<Vec<u8>, crate::errno::Errno> {
     user_memory::read_cstr(p, user_memory::PATH_MAX)
 }
 
+/// One traced argument. `mount` (40) is `source, target, fstype, flags, data`;
+/// the four strings are decoded, and a null `data` pointer stays `NULL`.
+fn trace_arg(nr: u64, index: usize, value: u64) -> String {
+    let string = (nr == 40 && matches!(index, 0 | 1 | 2 | 4) && !(index == 4 && value == 0))
+        || (path_arg(nr) == Some(index) && nr != 17);
+    if string {
+        return match guest_cstr(value) {
+            Ok(path) => format!("\"{}\"", String::from_utf8_lossy(&path)),
+            Err(error) => format!("<errno {error}>"),
+        };
+    }
+    if (value as i64) < 0 && (value as i64) > -4096 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:#x}")
+    }
+}
+
 /// Syscalls whose first or second argument is a path, for tracing.
 fn path_arg(nr: u64) -> Option<usize> {
     match nr {
@@ -262,16 +280,7 @@ pub fn dispatch(ctx: &mut GuestContext) {
             if i > 0 {
                 line.push_str(", ");
             }
-            if path_arg(nr) == Some(i) && nr != 17 {
-                match guest_cstr(*v) {
-                    Ok(path) => line.push_str(&format!("\"{}\"", String::from_utf8_lossy(&path))),
-                    Err(error) => line.push_str(&format!("<errno {error}>")),
-                }
-            } else if (*v as i64) < 0 && (*v as i64) > -4096 {
-                line.push_str(&format!("{}", *v as i64));
-            } else {
-                line.push_str(&format!("{v:#x}"));
-            }
+            line.push_str(&trace_arg(nr, i, *v));
         }
         line.push(')');
         crate::diag!("{line} [pid={pid} tid={tid} call={call} enter]");
