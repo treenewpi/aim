@@ -656,7 +656,14 @@ peripheral mode and no `/sys/class/android_usb`.
 ### Kernel features to emulate
 
 binder, FUSE, `/proc` and `/sys` per the device contract, the netlink subset
-the remaining original daemons use, evdev, and memfd/ashmem.
+the remaining original daemons use, evdev, and memfd/ashmem. Loop
+(`/dev/loop-control`, `/dev/loopN`) and device-mapper (`/dev/device-mapper`,
+`/dev/block/dm-N`) answer the ioctl set android-16.0.0_r1 apexd and libdm
+issue on the bootstrap path. Any other command on those fds is `ENOTTY`.
+A read-only `ext4` mount of one of those devices is the bytes that block
+source returns. A dm-verity table is checked per data block on read against
+the hashtree and the root digest; a mismatch is `EIO`. Preinstalled
+bootstrap apexes do not load that table.
 
 - **uevents:** NETLINK_KOBJECT_UEVENT sockets receive the kernel's
   uevents (`ACTION@DEVPATH`, the variables, `SEQNUM`) with the kernel's

@@ -270,6 +270,9 @@ fn openat_owned(a: [u64; 6], id: &super::cred::Identity) -> i64 {
     if let Some(fd) = super::evdev::open(&r, flags) {
         return fd;
     }
+    if let Some(fd) = super::loopdev::open(&r.guest, flags) {
+        return fd;
+    }
     if let Some(fd) = super::selinuxfs::open(&r.guest, flags) {
         return fd;
     }
@@ -1049,10 +1052,13 @@ fn special_pio(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> Option<i
 }
 
 fn special_read_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> {
+    use std::os::fd::AsRawFd;
+    if let Some(result) = super::loopdev::rwv(pin.descriptor().as_raw_fd(), iov, false) {
+        return Some(result);
+    }
     if pin.regular_access().is_some() && pin.kind().is_none() {
         return None;
     }
-    use std::os::fd::AsRawFd;
     let fd = pin.descriptor().as_raw_fd();
     if is_path_fd(fd) {
         return Some(-(EBADF as i64));
@@ -1118,10 +1124,13 @@ fn special_read_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> 
 }
 
 fn special_write_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> {
+    use std::os::fd::AsRawFd;
+    if let Some(result) = super::loopdev::rwv(pin.descriptor().as_raw_fd(), iov, true) {
+        return Some(result);
+    }
     if pin.regular_access().is_some() && pin.kind().is_none() {
         return None;
     }
-    use std::os::fd::AsRawFd;
     let fd = pin.descriptor().as_raw_fd();
     if is_path_fd(fd) {
         return Some(-(EBADF as i64));
@@ -1187,6 +1196,9 @@ fn special_write_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64>
 
 /// pread/pwrite on an fd with Linux state. None: a plain host fd.
 fn special_pio_kernel(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> Option<i64> {
+    if let Some(result) = super::loopdev::pio(fd, buf, len, Some(pos), write) {
+        return Some(result);
+    }
     if is_path_fd(fd) {
         return Some(-(EBADF as i64));
     }
@@ -2037,6 +2049,13 @@ pub fn lseek(a: [u64; 6]) -> i64 {
         Err(error) => return -(error as i64),
     };
     use std::os::fd::AsRawFd;
+    if let Some(result) = super::loopdev::lseek(
+        pin.descriptor().as_raw_fd(),
+        a[1] as i64,
+        a[2] as i32,
+    ) {
+        return result;
+    }
     if let Some(Kind::Regular(description)) = pin.kind() {
         let whence = match a[2] as i32 {
             3 => 4,
@@ -2249,6 +2268,9 @@ pub(super) fn stat_fd_kernel(fd: i32) -> Result<libc::stat, i64> {
         return s.map_err(|e| -(e as i64));
     }
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if super::loopdev::fstat(fd, &mut st) {
+        return Ok(st);
+    }
     // SAFETY: stat buffer on our stack.
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
         return Err(-(errno::last() as i64));
@@ -2356,6 +2378,9 @@ pub(super) fn stat_resolved_parent(r: &vfs::Resolved) -> Result<libc::stat, errn
 /// stat of a resolved path (`follow` as it was resolved), with the
 /// guest's ownership view.
 pub(super) fn stat_resolved(r: &vfs::Resolved, follow: bool) -> Result<libc::stat, i64> {
+    if let Some(st) = super::loopdev::stat(&r.guest) {
+        return Ok(st);
+    }
     if r.guest == "/dev/fuse" {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         st.st_mode = libc::S_IFCHR | 0o666;
@@ -2745,6 +2770,7 @@ pub fn faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
     if super::binder::is_device(&r.guest)
         || super::ashmem::stat(&r.guest).is_some()
         || super::dma_heap::stat(&r.guest).is_some()
+        || super::loopdev::stat(&r.guest).is_some()
     {
         return 0;
     }
@@ -3398,6 +3424,9 @@ pub fn ioctl(a: [u64; 6]) -> i64 {
         return r;
     }
     if let Some(r) = super::evdev::ioctl(fd, req, arg) {
+        return r;
+    }
+    if let Some(r) = super::loopdev::ioctl(fd, req, arg) {
         return r;
     }
     if let Some(r) = super::netif::ioctl(fd, req, arg) {

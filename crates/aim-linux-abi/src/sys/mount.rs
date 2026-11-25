@@ -254,6 +254,13 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
                 .map_err(|error| -(error as i64))?;
             Ok(())
         }
+        b"ext4" => {
+            let source = super::guest_cstr(a[0]).map_err(|error| -(error as i64))?;
+            let source = std::str::from_utf8(&source).map_err(|_| -(EINVAL as i64))?;
+            super::loopdev::mount_ext4(source, &target.guest, flags & MS_RDONLY != 0)
+                .map_err(|error| -(error as i64))?;
+            Ok(())
+        }
         _ => Err(-(ENODEV as i64)),
     }
 }

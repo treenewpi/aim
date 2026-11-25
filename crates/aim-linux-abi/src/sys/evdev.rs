@@ -1145,6 +1145,9 @@ pub fn canonical(guest: &str) -> Option<String> {
 /// and character-device links. Our absolute links resolve as Linux's
 /// relative ones do.
 pub fn sys_node(rest: &str) -> Option<Node> {
+    if let Some(node) = super::loopdev::sys_node(rest) {
+        return Some(node);
+    }
     let devs = present();
     let dirs = |names: Vec<String>, ty| {
         Node::Dir(names.into_iter().map(|n| Entry::new(1, ty, n)).collect())
@@ -1152,21 +1155,26 @@ pub fn sys_node(rest: &str) -> Option<Node> {
     let input = |i: u32| format!("/sys/devices/virtual/input/input{i}");
     let minor = |i: u32| EVDEV_MINOR_BASE + i;
     Some(match rest {
-        "dev" => dirs(vec!["char".into()], dir::DT_DIR),
-        "dev/char" => dirs(
-            devs.iter()
+        "dev" => dirs(vec!["block".into(), "char".into()], dir::DT_DIR),
+        "dev/char" => {
+            let mut names: Vec<String> = devs
+                .iter()
                 .map(|&i| format!("{INPUT_MAJOR}:{}", minor(i)))
-                .collect(),
-            dir::DT_LNK,
-        ),
-        "class" => dirs(vec!["input".into()], dir::DT_DIR),
+                .collect();
+            names.extend(super::loopdev::char_dev_names());
+            dirs(names, dir::DT_LNK)
+        }
+        "class" => dirs(vec!["block".into(), "input".into(), "misc".into()], dir::DT_DIR),
         "class/input" => dirs(
             devs.iter()
                 .flat_map(|&i| [format!("event{i}"), format!("input{i}")])
                 .collect(),
             dir::DT_LNK,
         ),
-        "devices/virtual" => dirs(vec!["input".into()], dir::DT_DIR),
+        "devices/virtual" => dirs(
+            vec!["block".into(), "input".into(), "misc".into()],
+            dir::DT_DIR,
+        ),
         "devices/virtual/input" => dirs(
             devs.iter().map(|&i| format!("input{i}")).collect(),
             dir::DT_DIR,

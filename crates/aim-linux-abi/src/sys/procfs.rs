@@ -1519,6 +1519,7 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
     }
     Some(match rest {
         "" => Node::Dir(entries(&[
+            ("block", dir::DT_DIR),
             ("class", dir::DT_DIR),
             ("dev", dir::DT_DIR),
             ("devices", dir::DT_DIR),
@@ -2320,6 +2321,9 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     if let Some(result) = super::fuse_sysfs::open(guest, flags) {
         return Some(result);
     }
+    if let Some(result) = super::loopdev::open_sysfs(guest, flags) {
+        return Some(result);
+    }
     if !is_kernfs(guest) {
         return None;
     }
@@ -2692,7 +2696,9 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
             st.st_nlink = 1;
         }
         Some(Node::File(_))
-            if canon == super::memfd::NOEXEC_SYSCTL || super::sysctl::known(&canon) =>
+            if canon == super::memfd::NOEXEC_SYSCTL
+                || super::sysctl::known(&canon)
+                || super::loopdev::queue_attr(&canon) =>
         {
             st.st_mode = libc::S_IFREG | 0o644;
             st.st_nlink = 1;

@@ -64,6 +64,8 @@ pub enum Knob {
     FuseAbort(super::fuse::SessionKey),
     /// A `proc_dointvec_minmax` file. The string is its guest path.
     Sysctl(&'static str),
+    /// `/sys/block/<dev>/queue/{scheduler,nr_requests,read_ahead_kb}`.
+    LoopQueue(String),
 }
 
 impl Knob {
@@ -80,6 +82,7 @@ impl Knob {
             Self::Uevent(dev) => super::uevent::synthesize(dev, bytes).map(|()| None),
             Self::FuseAbort(key) => super::fuse::abort(key).map(|()| None),
             Self::Sysctl(path) => super::sysctl::write(path, bytes),
+            Self::LoopQueue(path) => super::loopdev::write_queue(path, bytes).map(|()| None),
         }
     }
 }
@@ -128,6 +131,10 @@ pub(super) fn save(k: &Knob, w: &mut super::fork_state::Writer) {
             w.u32(9);
             w.str(path);
         }
+        Knob::LoopQueue(path) => {
+            w.u32(10);
+            w.str(path);
+        }
     }
 }
 
@@ -164,6 +171,7 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Option<Arc<Knob>> {
             };
             Knob::Sysctl(path)
         }
+        10 => Knob::LoopQueue(r.str()),
         _ => {
             r.invalidate();
             return None;
@@ -244,6 +252,7 @@ mod tests {
                 "/runtime/fuse/socket".into(),
             )),
             Knob::Sysctl("/proc/sys/kernel/kptr_restrict"),
+            Knob::LoopQueue("/sys/block/loop0/queue/read_ahead_kb".into()),
         ];
         for owner in owners {
             let mut w = Writer::default();

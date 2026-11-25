@@ -1043,6 +1043,9 @@ fn path_stat_known(
     if let Some(stat) = super::procfs::stat(guest, true) {
         return stat;
     }
+    if let Some(stat) = super::loopdev::stat(guest) {
+        return Ok(stat);
+    }
     let (host, area) = vfs::lookup(guest);
     use std::os::unix::ffi::OsStrExt;
     let host =

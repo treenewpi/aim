@@ -1001,14 +1001,17 @@ fn write_provenance(
     fs::write(path, text).map_err(|e| e.to_string())
 }
 
-/// Run init for at most eight seconds. Guest stdout and stderr are files,
+/// Run init for at most `timeout`. Guest stdout and stderr are files,
 /// not pipes: a 64 KiB pipe stalled the previous Mac capture after the
 /// guest had already exited. The full trace is `init-probe.txt` next to
 /// the root. Exit success means the observation was recorded. It does
-/// not mean init booted.
-pub fn run_init(linux_run: &Path) -> Result<(), String> {
+/// not mean init booted. The default the CLI passes is eight seconds.
+pub fn run_init(linux_run: &Path, timeout: Duration) -> Result<(), String> {
     super::property::print_host();
-    println!("init-probe original-init not-a-boot");
+    println!(
+        "init-probe original-init not-a-boot timeout={}s",
+        timeout.as_secs()
+    );
     if !linux_run.is_file() {
         return Err(format!("linux-run is not a file at {}", linux_run.display()));
     }
@@ -1035,12 +1038,16 @@ pub fn run_init(linux_run: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("start linux-run {}: {e}", INIT_GUEST))?;
     let pid = child.id();
-    let code = wait_child(&mut child, Duration::from_secs(8));
+    let code = wait_child(&mut child, timeout);
     let timed_out = code.is_none();
     let out = read_lossy(&stdout_path)?;
     let err = read_lossy(&stderr_path)?;
     let observation = first_observation(&out, &err, code, timed_out);
     let mut report = format_guest("init", pid, code, &out, &err);
+    report.push_str(&format!(
+        "init-probe: timeout={}s\n",
+        timeout.as_secs()
+    ));
     report.push_str(&format!("init-probe: first observation: {observation}\n"));
     report.push_str(&format!(
         "init-probe: pid={pid} exit={code:?} timed_out={timed_out}\n"

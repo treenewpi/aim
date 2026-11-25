@@ -1211,6 +1211,7 @@ pub fn get(fd: i32) -> Option<Kind> {
 
 /// The guest closed `fd` (or is about to replace it with dup2).
 pub fn on_close(fd: i32) {
+    super::loopdev::on_close(fd);
     super::knob::clear_access(fd);
     clear_regular_access(fd);
     super::procfs::close_mount_poll(fd);
@@ -1244,6 +1245,7 @@ pub fn on_dup(old: i32, new: i32) {
     super::procfs::dup_mount_poll(old, new);
     super::procfs::dup_mount_namespace(old, new);
     super::knob::dup_access(old, new);
+    super::loopdev::on_dup(old, new);
 }
 
 /// Recognize an fd that arrived from elsewhere (exec, `SCM_RIGHTS`,

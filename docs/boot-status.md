@@ -294,10 +294,26 @@ strict collisions stay open. `reboot` (arm64 142) kills
 this namespace init: `SIGHUP` for `RESTART` and `RESTART2`, `SIGINT` for
 `POWER_OFF` and `HALT`. The diagnostics line and
 `<runtime>/reboot-reason` record `guest-requested reboot:` plus the
-argument. For this apexd failure that argument is
-`reboot,bootloader,bootstrap-apexd-failed`. The exit is the recorded
-reboot. It does not make apexd succeed. The `8735777ad` property-r1
-run is the archive above. Init was not remeasured.
+argument. `703f2a48edcb4367cd2707c90ed6efdbe4fd79e8` (archive SHA256
+`a9126d37608a11b9aad3ddf630db5f6cbbd43668b46ab3fc044d78cf54a789bb`)
+remeasured init after the `PROT_NONE` reservation fix. Every step
+exited 0. Property 8 roles, integrated x2, android, and libbinder
+passed. Init made 3716 transitions and 267 icache flushes, with 0
+`SEGV_ACCERR` and no `CANNOT LINK`. It reached second stage
+(`SetupMountNamespaces`, vendor_init pid 54084, `SetupCgroups`,
+`SetKptrRestrict`, `TestPerfEventSelinux`, early-init). sysrq and
+modprobe writes got `EACCES` and init continued. ueventd started.
+apexd-bootstrap started as `SVC_EXEC`, mapped
+`/vendor/apex/com.android.hardware.cas.apex` `MAP_SHARED` at offset
+`0x5a000`, found 38 APEXes and the bootstrap set (runtime, i18n, virt,
+tzdata), and logged `Need to pre-allocate 39 loop devices`. It then
+looped `newfstatat("/dev/loop-control") = ENOENT` 1270 times until the
+harness's 8 second limit. No reboot. Loop devices, a read-only ext4
+mount of a loop or dm device, and per-block dm-verity are in the tree
+after that archive and are not Mac-remeasured. The pinned layer has 35
+`apex_payload.img` files, all ext4 with a 4096-byte block; the trace's
+count of 38 is apexd's, and the three names that are not in the tarball
+are not invented here.
 The trace logs a bounded
 `/proc/sys` read or write payload, including a failed write, and a
 `readlinkat` result on failure. `write` of

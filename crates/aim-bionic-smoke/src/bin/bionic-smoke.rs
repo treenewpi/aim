@@ -35,6 +35,7 @@ fn run() -> Result<(), String> {
     let mut prepare_init_root = false;
     let mut property: Option<PathBuf> = None;
     let mut init_probe: Option<PathBuf> = None;
+    let mut init_timeout = std::time::Duration::from_secs(8);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--linux-run" => {
@@ -54,6 +55,16 @@ fn run() -> Result<(), String> {
             "--init" => {
                 init_probe = Some(PathBuf::from(args.next().ok_or("--init needs linux-run")?));
             }
+            "--init-timeout" => {
+                let text = args.next().ok_or("--init-timeout needs seconds")?;
+                let secs: u64 = text
+                    .parse()
+                    .map_err(|_| "--init-timeout needs a whole number of seconds")?;
+                if secs == 0 {
+                    return Err("--init-timeout must be at least 1".into());
+                }
+                init_timeout = std::time::Duration::from_secs(secs);
+            }
             "--help" | "-h" => {
                 println!(
                     "\
@@ -65,7 +76,7 @@ usage: bionic-smoke --linux-run PATH
        bionic-smoke --property LINUX_RUN
        bionic-smoke --prepare-integrated
        bionic-smoke --prepare-init
-       bionic-smoke --init LINUX_RUN
+       bionic-smoke --init LINUX_RUN [--init-timeout SECONDS]
 
 Pinned image: {REPOSITORY}:{TAG}
   manifest {MANIFEST_DIGEST}
@@ -90,7 +101,8 @@ starts the property service and the binder daemon, starts the original
 service client first, then the original servicemanager. Ready has to
 come from that servicemanager's SetProperty.
 --prepare-init stages original /system/bin/init and the libraries it
-needs. --init runs it for at most eight seconds and prints the trace.
+needs. --init runs it for at most --init-timeout seconds (default 8)
+and prints the trace.
 init-probe: not a boot is the result. A historical list of mremap,
 SOCK_SEQPACKET, and rt_tgsigqueueinfo is not that observation.
 linux-run probes every round's guest root. That includes
@@ -142,7 +154,7 @@ the transaction text from the original service binary."
             prepare_init()?;
         }
         if let Some(linux_run) = init_probe {
-            run_init(&linux_run)?;
+            run_init(&linux_run, init_timeout)?;
         }
         return Ok(());
     }

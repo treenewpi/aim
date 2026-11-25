@@ -83,6 +83,9 @@ pub(crate) use verity_pager::{
 mod memfd;
 mod misc;
 mod mount;
+mod ext4ro;
+mod dmverity;
+mod loopdev;
 pub mod names;
 mod nat66;
 mod net;
