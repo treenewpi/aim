@@ -1,12 +1,15 @@
-//! Guest `mprotect` is tracked in 4 KiB slices. The host page stays 16 KiB,
-//! and its protection is the union of the slices that share it.
+//! Guest `mprotect` is tracked in 4 KiB slices. The host page stays 16 KiB.
+//! Its protection is write-wins: the read bits of every present slice, write
+//! if any slice asks for write, and execute only when some slice asks for
+//! execute and none asks for write. Write and execute are never both set.
 //!
 //! Bionic's `WriteProtected` calls `mprotect` on `__libc_globals` (vaddr
 //! `0x18e000`, length `0x1000`, `PROT_READ`). That slice sits inside a host
 //! page that also holds writable globals. The call succeeds and those
 //! globals stay writable. When every slice of a page asks for the same
-//! protection, the host page changes. Execute is part of that union: text
-//! and a read-only slice share the page, and the page stays executable.
+//! protection, the host page changes. A read-only slice beside text leaves
+//! the page executable. A writable slice drops execute until that write is
+//! gone, including a neighbor module's data or an anonymous mapping.
 
 /// Host and guest granules. The guest value is Bionic's hardcoded length,
 /// not `AT_PAGESZ`.
@@ -220,11 +223,132 @@ pub fn private_copy_is_wx(prot: u32) -> bool {
     prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC
 }
 
-/// The union of two 4 KiB slices newly makes the host page both writable
-/// and executable.
-pub fn union_creates_wx(old_union: u32, new_union: u32) -> bool {
-    let wx = PROT_WRITE | PROT_EXEC;
-    new_union & wx == wx && old_union & wx != wx
+/// Host protection of the present slices on one page.
+///
+/// Read is the union. Write is set when any slice asks for it. Execute is
+/// set only when some slice asks for it and none asks for write. A zero
+/// word (absent or `PROT_NONE`) contributes nothing. The result never has
+/// write and execute together.
+pub fn host_protection(slices: impl IntoIterator<Item = u32>) -> u32 {
+    let mut read = 0u32;
+    let mut write = false;
+    let mut execute = false;
+    for prot in slices {
+        let prot = prot_bits(prot);
+        if prot == 0 {
+            continue;
+        }
+        read |= prot & PROT_READ;
+        write |= prot & PROT_WRITE != 0;
+        execute |= prot & PROT_EXEC != 0;
+    }
+    let mut host = read;
+    if write {
+        host |= PROT_WRITE;
+    } else if execute {
+        host |= PROT_EXEC;
+    }
+    host
+}
+
+/// Bytes of the host page to invalidate after a write-to-execute transition.
+///
+/// The span is the whole 16 KiB page. A guest 4 KiB request is not enough:
+/// the other slices of the page were writable too.
+pub fn icache_span_on_execute_restore(old: u32, new: u32) -> Option<u64> {
+    let (old, new) = (prot_bits(old), prot_bits(new));
+    if new & PROT_EXEC != 0 && old & PROT_EXEC == 0 {
+        Some(PAGE)
+    } else {
+        None
+    }
+}
+
+/// One present 4 KiB slice, named by the module that mapped it.
+pub struct SliceView<'a> {
+    pub addr: u64,
+    pub prot: u32,
+    pub module: &'a str,
+}
+
+/// An instruction fetch that wants execute while some slice on the same
+/// host page still wants write. The host page is not executable.
+pub struct ExecWindow<'a> {
+    pub fetch: u64,
+    pub fetch_slice: u64,
+    pub fetch_module: &'a str,
+    pub write_slice: u64,
+    pub write_module: &'a str,
+    pub host: u64,
+    pub host_prot: u32,
+}
+
+/// `None` when the fetch may run: the slice does not want execute, or the
+/// host page is executable because no slice wants write.
+pub fn exec_window<'a>(addr: u64, slices: &'a [SliceView<'a>]) -> Option<ExecWindow<'a>> {
+    let host = addr & !(PAGE - 1);
+    let fetch_slice = addr & !(GUEST_PAGE - 1);
+    let fetch = slices.iter().find(|slice| slice.addr == fetch_slice)?;
+    if prot_bits(fetch.prot) & PROT_EXEC == 0 {
+        return None;
+    }
+    let host_prot = host_protection(slices.iter().map(|slice| slice.prot));
+    if host_prot & PROT_EXEC != 0 {
+        return None;
+    }
+    let write = slices
+        .iter()
+        .find(|slice| slice.addr != fetch_slice && prot_bits(slice.prot) & PROT_WRITE != 0)
+        .or_else(|| {
+            slices
+                .iter()
+                .find(|slice| prot_bits(slice.prot) & PROT_WRITE != 0)
+        })?;
+    Some(ExecWindow {
+        fetch: addr,
+        fetch_slice,
+        fetch_module: fetch.module,
+        write_slice: write.addr,
+        write_module: write.module,
+        host,
+        host_prot,
+    })
+}
+
+/// Linux `SIGSEGV` / `SEGV_ACCERR`. The address is the fetch.
+pub struct ExecFault<'a> {
+    pub signo: i32,
+    pub code: i32,
+    pub si_addr: u64,
+    pub window: ExecWindow<'a>,
+}
+
+pub const SIGSEGV: i32 = 11;
+pub const SEGV_ACCERR: i32 = 2;
+
+pub fn exec_fault<'a>(addr: u64, slices: &'a [SliceView<'a>]) -> Option<ExecFault<'a>> {
+    let window = exec_window(addr, slices)?;
+    Some(ExecFault {
+        signo: SIGSEGV,
+        code: SEGV_ACCERR,
+        si_addr: window.fetch,
+        window,
+    })
+}
+
+/// The traced line for [`exec_fault`]. `thread` names the guest tid and the
+/// host thread, so a different thread is distinguishable.
+pub fn format_exec_window(thread: &str, window: &ExecWindow<'_>, count: u64) -> String {
+    format!(
+        "[linux-abi] SIGSEGV SEGV_ACCERR si_addr {:#x}: {thread} fetch slice {:#x} module {} wants X; slice {:#x} module {} holds W; host page {:#x} prot {:#x} (exec window {count})",
+        window.fetch,
+        window.fetch_slice,
+        window.fetch_module,
+        window.write_slice,
+        window.write_module,
+        window.host,
+        window.host_prot,
+    )
 }
 
 /// Bytes of a copied mapping that come from the file, and bytes that stay
@@ -393,8 +517,8 @@ pub fn begin_subpage(addr: u64, len: u64, prot: u32) -> Result<u64, i32> {
 ///
 /// `current` is every 4 KiB slice of each touched host page, in order. A
 /// length that is not a multiple of four slices is [`EINVAL`]: the caller
-/// walked the wrong range. The host protection is the union, including
-/// execute when any slice has it.
+/// walked the wrong range. The host protection is [`host_protection`] of
+/// all four slices, including a neighbor module and an anonymous mapping.
 pub fn plan_subpage(
     host_lo: u64,
     req_lo: u64,
@@ -411,7 +535,6 @@ pub fn plan_subpage(
     for (host_index, chunk) in current.chunks(per_host).enumerate() {
         let page = host_lo + host_index as u64 * PAGE;
         let mut next = Vec::with_capacity(chunk.len());
-        let mut old_host = 0u32;
         for (slot, &was) in chunk.iter().enumerate() {
             let guest = page + slot as u64 * GUEST_PAGE;
             let now = if guest >= req_lo && guest < req_hi {
@@ -420,10 +543,10 @@ pub fn plan_subpage(
                 was
             };
             next.push(now);
-            old_host |= was;
             slices.push((guest, now));
         }
-        let new_host = next.iter().fold(0, |bits, slice| bits | slice);
+        let old_host = host_protection(chunk.iter().copied());
+        let new_host = host_protection(next.iter().copied());
         if new_host != old_host {
             host_ops.push(HostProtect {
                 addr: page,
@@ -436,7 +559,7 @@ pub fn plan_subpage(
 }
 
 /// Protection the host page has after `ops`. A page with no operation keeps
-/// the union of its current slices.
+/// [`host_protection`] of its current slices.
 pub fn host_prot_at(ops: &[HostProtect], current: &[u32], host_lo: u64, page: u64) -> u32 {
     if let Some(op) = ops
         .iter()
@@ -447,9 +570,7 @@ pub fn host_prot_at(ops: &[HostProtect], current: &[u32], host_lo: u64, page: u6
     let per_host = (PAGE / GUEST_PAGE) as usize;
     let slot = ((page - host_lo) / GUEST_PAGE) as usize;
     let base = slot & !(per_host - 1);
-    current[base..base + per_host]
-        .iter()
-        .fold(0, |bits, slice| bits | slice)
+    host_protection(current[base..base + per_host].iter().copied())
 }
 
 #[cfg(test)]
@@ -638,10 +759,18 @@ mod tests {
     }
 
     #[test]
-    fn a_writable_executable_union_is_distinct_from_write_protected() {
-        assert!(union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE | PROT_EXEC));
-        assert!(!union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE));
-        assert!(!union_creates_wx(PROT_READ | PROT_WRITE | PROT_EXEC, PROT_READ | PROT_EXEC));
+    fn write_wins_drops_execute_while_any_slice_is_writable() {
+        let mixed = host_protection([RX, RW, RX, RW]);
+        assert_eq!(mixed & (PROT_WRITE | PROT_EXEC), PROT_WRITE);
+        assert_eq!(mixed & PROT_READ, PROT_READ);
+        assert_eq!(host_protection([RX, RO, 0, 0]), RX);
+        assert_eq!(
+            icache_span_on_execute_restore(RW, RX),
+            Some(PAGE),
+            "the whole host page, not the 4 KiB request"
+        );
+        assert_eq!(icache_span_on_execute_restore(RX, RX), None);
+        assert_eq!(icache_span_on_execute_restore(RX, RW), None);
     }
 
     #[test]
@@ -836,8 +965,9 @@ mod tests {
     fn guest4k_relro_beside_text_and_bti_mprotect_share_the_host_page() {
         // libz.so: text occupies the first three slices of 0x8005fb0000
         // (RX) and the data slice 0x8005fb3000 is RW. GNU RELRO asks for
-        // PROT_READ on that one slice. The host stays RWX because the text
-        // is still executable; the data slice is recorded read-only.
+        // PROT_READ on that one slice. While the data slice is writable the
+        // host page is RW, not executable. After the slice is read-only the
+        // host page is RX again, and that slice stays recorded.
         let current = [RX, RX, RX, RW];
         let (host, slices) =
             plan_subpage(0x8005fb0000, 0x8005fb3000, 0x8005fb4000, RO, &current).unwrap();
@@ -845,7 +975,7 @@ mod tests {
             host,
             vec![HostProtect {
                 addr: 0x8005fb0000,
-                old: RW | RX,
+                old: RW,
                 prot: RX,
             }]
         );
@@ -888,6 +1018,215 @@ mod tests {
         assert_eq!(
             recorded(0x80061f4000, &current, &host, &slices),
             [(0x80061f4000, RO)]
+        );
+    }
+
+    #[test]
+    fn liblog_bias_12288_relro_restores_execute_and_the_data_stays_reachable() {
+        // system/lib64/liblog.so, p_align 0x4000.
+        // LOAD RX vaddr 0x8000 filesz 0x96e0; GNU RELRO covers the RW load at
+        // vaddr 0x14000 memsz 0x1000; the permanent RW load is vaddr 0x18000.
+        // Bias 12288 (0x3000), the residue of the Mac run's 0x8005c47000.
+        // RX occupies [0xb000, 0x15000). RELRO occupies [0x17000, 0x18000).
+        // Those share host page 0x14000. Data at 0x1b000 is the next page.
+        let window = [RX, 0, 0, RW];
+        assert_eq!(host_protection(window), RW);
+        let during = [
+            SliceView {
+                addr: 0x14000,
+                prot: RX,
+                module: "liblog.so",
+            },
+            SliceView {
+                addr: 0x17000,
+                prot: RW,
+                module: "liblog.so",
+            },
+        ];
+        let fault = exec_fault(0x14010, &during).expect("fetch during the window");
+        assert_eq!(
+            (fault.signo, fault.code, fault.si_addr),
+            (SIGSEGV, SEGV_ACCERR, 0x14010)
+        );
+        let msg = format_exec_window("guest tid 3 pthread 0x10", &fault.window, 1);
+        assert!(msg.contains("liblog.so"), "{msg}");
+        assert!(msg.contains("0x14000"), "{msg}");
+        assert!(msg.contains("0x17000"), "{msg}");
+        assert!(msg.contains("guest tid 3"), "{msg}");
+        assert!(msg.contains("wants X") && msg.contains("holds W"), "{msg}");
+        let (ops, _) = plan_subpage(0x14000, 0x17000, 0x18000, RO, &window).unwrap();
+        assert_eq!(
+            ops,
+            vec![HostProtect {
+                addr: 0x14000,
+                old: RW,
+                prot: RX,
+            }]
+        );
+        assert_eq!(
+            icache_span_on_execute_restore(ops[0].old, ops[0].prot),
+            Some(PAGE)
+        );
+        let after = [
+            SliceView {
+                addr: 0x14000,
+                prot: RX,
+                module: "liblog.so",
+            },
+            SliceView {
+                addr: 0x17000,
+                prot: RO,
+                module: "liblog.so",
+            },
+        ];
+        assert!(exec_fault(0x14010, &after).is_none());
+        assert_eq!(host_protection([RX, 0, 0, RO]), RX);
+        // The permanent data segment is a different host page and stays writable.
+        assert_eq!(host_protection([0, 0, 0, RW]), RW);
+    }
+
+    #[test]
+    fn libm_bias_4096_relro_window_ends_executable() {
+        // apex libm.so, p_align 0x4000. LOAD RX vaddr 0x14000 memsz 0x230c0
+        // rounds to guest end 0x38000. GNU RELRO is vaddr 0x38000 memsz 0x1000.
+        // Bias 4096 puts RX at slice 0x38000 and RELRO at slice 0x39000 of host
+        // page 0x38000. The permanent RW load at vaddr 0x3c000 lands at 0x3d000.
+        let window = [RX, RW, 0, 0];
+        assert_eq!(host_protection(window), RW);
+        let during = [
+            SliceView {
+                addr: 0x38000,
+                prot: RX,
+                module: "libm.so",
+            },
+            SliceView {
+                addr: 0x39000,
+                prot: RW,
+                module: "libm.so",
+            },
+        ];
+        let fault = exec_fault(0x38020, &during).expect("fetch during the window");
+        assert_eq!(
+            (fault.signo, fault.code, fault.si_addr),
+            (SIGSEGV, SEGV_ACCERR, 0x38020)
+        );
+        let msg = format_exec_window("guest tid 4 pthread 0x20", &fault.window, 1);
+        assert!(msg.contains("0x38000") && msg.contains("0x39000"), "{msg}");
+        assert!(msg.contains("libm.so") && msg.contains("guest tid 4"), "{msg}");
+        let (ops, _) = plan_subpage(0x38000, 0x39000, 0x3a000, RO, &window).unwrap();
+        assert_eq!(
+            ops,
+            vec![HostProtect {
+                addr: 0x38000,
+                old: RW,
+                prot: RX,
+            }]
+        );
+        assert_eq!(
+            icache_span_on_execute_restore(ops[0].old, ops[0].prot),
+            Some(PAGE)
+        );
+        assert!(
+            exec_fault(
+                0x38020,
+                &[
+                    SliceView {
+                        addr: 0x38000,
+                        prot: RX,
+                        module: "libm.so",
+                    },
+                    SliceView {
+                        addr: 0x39000,
+                        prot: RO,
+                        module: "libm.so",
+                    },
+                ],
+            )
+            .is_none()
+        );
+        assert_eq!(host_protection([0, RW, 0, 0]), RW);
+    }
+
+    #[test]
+    fn two_modules_share_a_host_page_until_the_last_write_drops() {
+        // liba.so text, libb.so data, and an anonymous mapping on one page.
+        let during = [RX, RX, RW, RW];
+        assert_eq!(host_protection(during), RW);
+        let views = [
+            SliceView {
+                addr: 0x8000,
+                prot: RX,
+                module: "liba.so",
+            },
+            SliceView {
+                addr: 0x9000,
+                prot: RX,
+                module: "liba.so",
+            },
+            SliceView {
+                addr: 0xa000,
+                prot: RW,
+                module: "libb.so",
+            },
+            SliceView {
+                addr: 0xb000,
+                prot: RW,
+                module: "anonymous",
+            },
+        ];
+        let fault = exec_fault(0x8004, &views).unwrap();
+        assert_eq!(fault.window.fetch_module, "liba.so");
+        assert_eq!(fault.window.fetch_slice, 0x8000);
+        assert_eq!(fault.window.write_module, "libb.so");
+        assert_eq!(fault.window.write_slice, 0xa000);
+        assert_eq!(fault.si_addr, 0x8004);
+        let msg = format_exec_window("guest tid 9 pthread 0xabc", &fault.window, 2);
+        assert!(msg.contains("liba.so") && msg.contains("libb.so"), "{msg}");
+        assert!(msg.contains("guest tid 9"), "{msg}");
+        // Protecting libb's data does not restore execute: anonymous still writes.
+        let (ops, _) = plan_subpage(0x8000, 0xa000, 0xb000, RO, &during).unwrap();
+        assert!(ops.is_empty(), "a remaining writer keeps execute off: {ops:?}");
+        let still = [RX, RX, RO, RW];
+        assert_eq!(host_protection(still), RW);
+        let held = [
+            SliceView {
+                addr: 0x8000,
+                prot: RX,
+                module: "liba.so",
+            },
+            SliceView {
+                addr: 0xb000,
+                prot: RW,
+                module: "anonymous",
+            },
+        ];
+        let fault = exec_fault(0x8010, &held).unwrap();
+        assert_eq!(fault.window.write_module, "anonymous");
+        assert_eq!(fault.window.write_slice, 0xb000);
+        // munmap of the last writable slice restores execute.
+        let (ops, _) = plan_subpage(0x8000, 0xb000, 0xc000, 0, &still).unwrap();
+        assert_eq!(
+            ops,
+            vec![HostProtect {
+                addr: 0x8000,
+                old: RW,
+                prot: RX,
+            }]
+        );
+        assert_eq!(
+            icache_span_on_execute_restore(ops[0].old, ops[0].prot),
+            Some(PAGE)
+        );
+        assert!(
+            exec_fault(
+                0x8010,
+                &[SliceView {
+                    addr: 0x8000,
+                    prot: RX,
+                    module: "liba.so",
+                }],
+            )
+            .is_none()
         );
     }
 }

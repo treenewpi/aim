@@ -266,10 +266,37 @@ of our own.
   returns a pointer displaced by `offset & 0x3fff`. A guest page that
   starts at or after EOF is installed, and a touch raises SIGBUS. A
   past-EOF page that shares a host page with file bytes stays that
-  shared mapping. `MAP_PRIVATE` whose address and offset disagree modulo
+  shared mapping.   `MAP_PRIVATE` whose address and offset disagree modulo
   16 KiB is a copy; `MAP_SHARED` at that residue is `EINVAL`.
-  `AT_PAGESZ` stays 16384, which is what bionic `sysconf(_SC_PAGESIZE)`
-  reads.
+  `AT_PAGESZ` stays 16384. This image's bionic does not read it:
+  `getpagesize` and `sysconf(_SC_PAGESIZE)` in the apex libc and the
+  bootstrap libc are `mov w0, #4096; ret`. The linker steps reservations
+  by that 4096. A host page's protection is write-wins over all four
+  4 KiB slices on it, including another module's data and an anonymous
+  mapping. Read is the union. Write is set if any slice asks for write.
+  Execute is set only when some slice asks for execute and none asks for
+  write. The two are never set together. When the last writable slice is
+  dropped, by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is
+  restored and `sys_icache_invalidate` covers the whole 16 KiB page.
+  An instruction fetch from a slice that wants execute while a neighbor
+  wants write is `SIGSEGV` `SEGV_ACCERR` at that address. The diagnostic
+  names the module and slice that wanted execute, the module and slice
+  that holds write, and the thread. It does not emulate the fetch.
+  AOSP `android-16.0.0_r1` `soinfo::link_image` (`linker/linker.cpp`)
+  calls `relocate` and then `protect_relro`, which
+  `phdr_table_protect_gnu_relro` (`linker/linker_phdr.cpp`) turns into
+  `PROT_READ`. `soinfo::call_constructors` (`linker/linker_soinfo.cpp`)
+  runs `DT_INIT` and then `DT_INIT_ARRAY` only after that link, from
+  `linker_main.cpp` and from `do_dlopen`. The library's own constructors
+  do not run during its RELRO window. Another thread can still execute a
+  different module whose text shares the host page. A request that
+  itself asks for write and execute stays `EINVAL` on a private copy.
+  Thirty-eight ELFs in this layer still place an executable byte and a
+  byte that stays writable after GNU RELRO on one 16 KiB page at some
+  4 KiB bias. Bias 0 is safe for every oat and odex in that set.
+  `vendor/bin/vncserver`, `vendor/lib64/libdrm.so.2`,
+  `libdrm_amdgpu.so.1`, `libdrm_etnaviv.so.1`, and `libdrm_radeon.so.1`
+  also collide at bias 0. Those five are not on the default boot path.
 
 ## P1 binder driver (2026-09-27)
 

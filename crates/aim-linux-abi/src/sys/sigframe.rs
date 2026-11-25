@@ -479,6 +479,12 @@ pub fn translate_fault(hsig: i32, host_code: i32, si_addr: u64, m: &DarwinMconte
                 // as the null-page fault an implicit null check expects.
                 (SIGSEGV, SEGV_MAPERR, addr - super::window::BASE)
             } else {
+                if insn_abort {
+                    // A slice that wants execute while a neighbor wants write
+                    // is not executable. Name that window. The classification
+                    // below is still SIGSEGV at this address. Do not emulate.
+                    super::mem::note_exec_window(addr);
+                }
                 let need = if insn_abort {
                     libc::PROT_EXEC
                 } else if data_abort && esr & (1 << 6) != 0 {

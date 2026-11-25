@@ -554,7 +554,8 @@ that directory. The pinned layer has 0 NFC/NFD collisions across 3743
 ASCII paths. prepare does not rename, and it does not add a
 normalization crate: `Cargo.lock` has none. A shared file `mmap` at a
 4096-byte offset maps the enclosing 16 KiB host pages. `AT_PAGESZ`
-stays 16384. A guest `reboot` ends the run and records
+stays 16384. This image's bionic `getpagesize` and
+`sysconf(_SC_PAGESIZE)` are the constant 4096 and do not read it. A guest `reboot` ends the run and records
 `guest-requested reboot:` plus the argument in the diagnostics line
 and in `<runtime>/reboot-reason`.
 
@@ -787,10 +788,13 @@ Mac run's stderr. Do not treat a Linux compile as that result.
 `bc811359` stopped in `WriteProtected`: `mprotect` of `__libc_globals`
 (4 KiB at vaddr `0x18e000`, and the same shape in toybox) inside a 16 KiB
 page that also holds writable globals. The host page stays 16 KiB.
-`AT_PAGESZ` stays 16 KiB, and Bionic is not rebuilt for this. The call
-succeeds; the page's protection is the union of its 4 KiB slices, so the
-writable globals keep working. A request that gives every slice the same
-protection updates the whole page.
+`AT_PAGESZ` stays 16 KiB. This image's bionic `getpagesize` is the
+constant 4096 and does not read it, and Bionic is not rebuilt for this.
+The call succeeds. The host page's protection is write-wins over its
+4 KiB slices: a read-only slice keeps its writable neighbors, and
+execute is set only when some slice asks for it and none asks for
+write. A request that gives every slice the same protection updates the
+whole page.
 
 `a1d5909` then ran linker64. toybox stopped in
 `mmap(0, 0x12c0, PROT_READ, MAP_PRIVATE, libcrypto.so, 0x17a000)`: the
@@ -810,9 +814,10 @@ edges are 4 KiB-aligned. A range with both ends 16 KiB-aligned is unchanged.
 Otherwise only the 4 KiB slices inside the request are punched or replaced;
 a host page is really unmapped only when every slice is in the request.
 `MAP_FIXED` returns the requested address and copies the file into the
-covered slices. The page's protection is the union of the slices that are
-still present, and a punched slice stays readable until the whole page is
-unmapped. A shared `MAP_FIXED` of a partial page is `EINVAL`.
+covered slices. The page's protection is write-wins over the slices that
+are still present, including another module and an anonymous mapping,
+and a punched slice stays readable until the whole page is unmapped. A
+shared `MAP_FIXED` of a partial page is `EINVAL`.
 
 `8a46cb5` placed those file segments. toybox then stopped on
 `mmap(0x800619f000, 0x8000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0)`,
@@ -828,9 +833,10 @@ different. Direct toybox: `mprotect(0x8005fb3000, 0x1000, PROT_READ)` is
 `libz.so` GNU RELRO, one 4 KiB data slice beside the text. Formal smoke:
 `mprotect(0x8005ee2000, 0x80000, PROT_READ|PROT_EXEC|PROT_BTI)` is
 `libc++.so`'s text, already rewritten. Both starts are 4 KiB-aligned.
-Execute is part of the host-page union, and `PROT_BTI` is not a host bit.
-The RELRO slice is recorded read-only; the text beside it keeps the page
-executable, so that data is not a private read-only page. A `mprotect`
+`PROT_BTI` is not a host bit. While the RELRO slice is writable the host
+page is not executable. After that slice is read-only, execute is
+restored for the whole 16 KiB page and the slice stays recorded
+read-only. A `mprotect`
 whose start and end are both 16 KiB-aligned stays one host call. A 4 KiB
 length at a 16 KiB-aligned address does not: rounding it up write-protects
 the next three slices.

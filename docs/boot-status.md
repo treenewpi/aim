@@ -175,10 +175,103 @@ A guest page that starts at or after EOF is mapped, and a touch raises
 `SIGBUS`. A past-EOF 4 KiB slice that shares its 16 KiB host page with
 a slice that still contains file bytes stays that shared mapping, and
 Darwin zero-fills the past-EOF slice.
-`mprotect` keeps the union of the slices in one host page and refuses a
-union that newly makes that page writable and executable. `msync`
-accepts a 4 KiB address and syncs the covering host pages. `AT_PAGESZ`
-and `sysconf(_SC_PAGESIZE)` both stay 16384. `reboot` (arm64 142) kills
+`mprotect` tracks each 4 KiB slice. The host page's protection is the
+read bits of every slice on it, write if any slice asks for write, and
+execute only when some slice asks for execute and none asks for write,
+including another module's data and an anonymous mapping. Write and
+execute are never set together. When the last writable slice is dropped,
+by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is restored and
+`sys_icache_invalidate` covers the whole 16 KiB page. An instruction
+fetch from a slice that wants execute while a neighbor wants write is
+`SIGSEGV` `SEGV_ACCERR` at that address. The diagnostic names the module
+and slice that wanted execute, the module and slice that holds write,
+and the thread. A request that itself asks for write and execute stays
+`EINVAL` on a private copy. `MAP_SHARED` residue mismatch stays
+`EINVAL`. On archive
+`778450d18ce8ff9affccd49ffd3f8bec461ade7feaf010bc710f07402e594487`,
+property-r1's getprop-before failed to link `liblog.so`: bias
+`0x8005c47000` is 12288 modulo 16 KiB, and the private copy of the GNU
+RELRO segment returned `EINVAL` because that host page was still
+executable. That refusal is the cross-slice case this model allows.
+AOSP `android-16.0.0_r1` `soinfo::link_image` relocates, then
+`protect_relro` (`phdr_table_protect_gnu_relro` to `PROT_READ`), and
+only then does `soinfo::call_constructors` run `DT_INIT` and
+`DT_INIT_ARRAY` (`linker/linker.cpp`, `linker/linker_phdr.cpp`,
+`linker/linker_soinfo.cpp`, `linker/linker_main.cpp`). The library's own
+constructors do not run during its RELRO window. `msync` accepts a 4 KiB
+address and syncs the covering host pages. `AT_PAGESZ` stays 16384.
+This image's bionic `getpagesize` and `sysconf(_SC_PAGESIZE)` are
+`mov w0, #4096; ret` and do not read `AT_PAGESZ`. The linker steps
+reservations by that 4096. A static scan of the layer's native ELF files, including the apex
+libraries, found one `getauxval(6)` (`AT_PAGESZ`): `system/lib64/libclang_rt.asan-aarch64-android.so`,
+which also calls `getauxval(7)` (`AT_BASE`). Apex and bootstrap libc
+call `getauxval` with 16, 26, 25, and 33. The linker's `__dl_getauxval`
+callers pass 3, 5, 7, 9, 16, 23, 25, 26, and 33. `libart.so` and
+`libartbase.so` pass 16 and 26; the `libart` thunk is called with 16 and
+26. `libfcp_cpp_dep_jni.so` and
+`libtflite_support_classifiers_native.so` pass 16 and 26 as well. The
+string `AT_PAGESZ` in `linker64`, `linker_asan64`, and
+`linker_hwasan64` is the `ld_show_auxv` name table, not a page-size
+read. No scanned file contains `jemalloc`. Scudo's page size in this
+libc is `sysconf(_SC_PAGESIZE)`, which is the constant 4096.
+`AT_PAGESZ` is not changed. Thirty-eight ELFs still place an executable byte and a byte
+that stays writable after GNU RELRO on one 16 KiB page at some 4 KiB
+bias. Bias 0 is safe for every oat and odex in that set. The files are
+`system/app/KeyChain/oat/arm64/KeyChain.odex`,
+`system/app/WallpaperBackup/oat/arm64/WallpaperBackup.odex`,
+`system/framework/arm64/boot-bouncycastle.oat`,
+`system/framework/arm64/boot-core-icu4j.oat`,
+`system/framework/arm64/boot-framework.oat`,
+`system/framework/arm64/boot-okhttp.oat`,
+`system/framework/arm64/boot.oat`,
+`system/framework/oat/arm64/apex@com.android.adservices@javalib@service-adservices.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.adservices@javalib@service-sdksandbox.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.appsearch@javalib@service-appsearch.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.bt@javalib@service-bluetooth.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.configinfrastructure@javalib@service-configinfrastructure.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.devicelock@javalib@service-devicelock.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.healthfitness@javalib@service-healthfitness.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.media@javalib@service-media-s.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.os.statsd@javalib@service-statsd.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.permission@javalib@service-permission.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.profiling@javalib@service-profiling.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.tethering@javalib@service-connectivity.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.uwb@javalib@service-ranging.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.uwb@javalib@service-uwb.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.virt@javalib@service-virtualization.jar@classes.odex`,
+`system/framework/oat/arm64/com.android.location.provider.odex`,
+`system/framework/oat/arm64/org.apache.http.legacy.odex`,
+`system/priv-app/FusedLocation/oat/arm64/FusedLocation.odex`,
+`system/priv-app/SettingsProvider/oat/arm64/SettingsProvider.odex`,
+`system/priv-app/Telecom/oat/arm64/Telecom.odex`,
+`vendor/bin/uinputd`,
+`vendor/bin/vncserver`,
+`vendor/lib64/hw/gralloc.gbm.so`,
+`vendor/lib64/hw/hwcomposer.redroid.so`,
+`vendor/lib64/libdrm.so.2`,
+`vendor/lib64/libdrm_amdgpu.so.1`,
+`vendor/lib64/libdrm_etnaviv.so.1`,
+`vendor/lib64/libdrm_freedreno.so.1`,
+`vendor/lib64/libdrm_nouveau.so.2`,
+`vendor/lib64/libdrm_radeon.so.1`,
+and `vendor/lib64/libvncserver.so`.
+`vendor/etc/init/vncserver.rc` defines `vendor.vncserver` as `disabled`
+and starts it only when `ro.boot.use_redroid_stream` is 1 and
+`ro.boot.use_redroid_vnc` is 1. Neither property is in the image.
+`vendor/bin/vncserver` needs `libvncserver.so`, not the libdrm files.
+No init `.rc` names `libdrm.so.2`, `libdrm_amdgpu.so.1`,
+`libdrm_etnaviv.so.1`, or `libdrm_radeon.so.1`. Nothing in the layer
+references `libdrm_etnaviv.so.1`. `libdrm_radeon.so.1` is needed by
+`libgallium_dri.so`. `libdrm_amdgpu.so.1` is needed by that and
+`vulkan.radeon.so`. `libdrm.so.2` is needed by those, Mesa EGL,
+`gralloc.cros.so`, `libgbm.so.1`, and the other Vulkan drivers.
+`vendor/etc/init/redroid.common.rc` runs `gpu_config.sh` on `early-boot`,
+before HAL and SurfaceFlinger. With `ro.boot.redroid_gpu_mode` unset the
+script takes guest mode and sets `ro.hardware.gralloc` to `redroid`.
+`gralloc.redroid.so` and `hwcomposer.redroid.so` do not need libdrm.
+Those five bias-0 files are not on the default boot path, so they are
+non-blocking for boot. They are not fixed. The other thirty-three
+strict collisions stay open. `reboot` (arm64 142) kills
 this namespace init: `SIGHUP` for `RESTART` and `RESTART2`, `SIGINT` for
 `POWER_OFF` and `HALT`. The diagnostics line and
 `<runtime>/reboot-reason` record `guest-requested reboot:` plus the

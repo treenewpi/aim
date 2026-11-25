@@ -17,7 +17,8 @@ use crate::errno::{EBADF, EFAULT, EINVAL, ENOMEM};
 
 /// Bionic names anonymous slices with a hardcoded 4 KiB length inside a
 /// 16 KiB host page, the same granule `mprotect` already accepts
-/// (`aim_guest_page`). `AT_PAGESZ` stays 16 KiB. A 16 KiB Linux kernel
+/// (`aim_guest_page`). `AT_PAGESZ` stays 16 KiB. This image's bionic
+/// `getpagesize` is the constant 4096 and does not read it. A 16 KiB Linux kernel
 /// would reject a start aligned only to 4 KiB; that check is what returned
 /// EINVAL for the linker's `prctl(PR_SET_VMA, 0, 0x8004ce9000, 0x8000, …)`
 /// while the mapping existed and the process continued.

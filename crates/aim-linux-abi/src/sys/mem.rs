@@ -29,6 +29,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::context::GuestContext;
 use crate::errno::{self, EEXIST, EINVAL, ENOMEM};
@@ -1312,6 +1313,7 @@ fn forget_guest_slices(lo: u64, hi: u64) {
         slices.remove(&page);
     }
     drop(slices);
+    forget_slice_modules(lo, hi);
     let mut pages = PAGE_PIECES.lock().unwrap();
     let hosts: Vec<u64> = pages
         .range(lo.saturating_sub(PAGE - 1)..hi)
@@ -1333,10 +1335,106 @@ struct PagePieces {
 
 static PAGE_PIECES: Mutex<BTreeMap<u64, PagePieces>> = Mutex::new(BTreeMap::new());
 
+/// Module that mapped each guest slice. The fault diagnostic names both the
+/// slice that wanted execute and the slice that still wants write.
+static SLICE_MODULE: Mutex<BTreeMap<u64, String>> = Mutex::new(BTreeMap::new());
+
+static HOST_PROT_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+static EXEC_WINDOW_FAULTS: AtomicU64 = AtomicU64::new(0);
+
 fn page_prot(host: u64) -> Option<u32> {
     vmmap::info_at(host).and_then(|info| {
         (host >= info.start && host < info.end).then_some(aim_guest_page::prot_bits(info.prot))
     })
+}
+
+fn slice_module_name(anon: bool, fd: i32) -> String {
+    if anon {
+        return "anonymous".to_string();
+    }
+    if let Some(path) = crate::xrt::original_guest_path(fd) {
+        return path;
+    }
+    xrt::fd_path(fd)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| format!("fd {fd}"))
+}
+
+fn remember_slice_module(addr: u64, name: &str) {
+    SLICE_MODULE.lock().unwrap().insert(addr, name.to_string());
+}
+
+fn forget_slice_modules(lo: u64, hi: u64) {
+    if lo >= hi {
+        return;
+    }
+    let mut modules = SLICE_MODULE.lock().unwrap();
+    let keys: Vec<u64> = modules
+        .range(lo..hi)
+        .map(|(&addr, _)| addr)
+        .filter(|&addr| addr < hi && addr + GUEST_PAGE > lo)
+        .collect();
+    for addr in keys {
+        modules.remove(&addr);
+    }
+}
+
+fn present_prots(pieces: &PagePieces) -> Vec<u32> {
+    (0..4)
+        .filter(|slot| pieces.present & (1 << slot) != 0)
+        .map(|slot| pieces.prot[slot])
+        .collect()
+}
+
+fn trace_host_transition(host: u64, pieces: &PagePieces, old: u32, new: u32) {
+    let n = HOST_PROT_TRANSITIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let slices: Vec<String> = (0..4usize)
+        .map(|slot| {
+            let at = host + slot as u64 * GUEST_PAGE;
+            if pieces.present & (1 << slot) == 0 {
+                format!("{at:#x}:absent")
+            } else {
+                format!("{at:#x}:{:#x}", pieces.prot[slot])
+            }
+        })
+        .collect();
+    crate::diag!(
+        "[linux-abi] host page {host:#x} slices {} prot {old:#x} -> {new:#x} (transition {n})",
+        slices.join(" ")
+    );
+}
+
+/// Install `new` on the host page. A transition that gains execute
+/// invalidates the whole 16 KiB page. `wrote` is set when this call filled
+/// bytes while the page was writable, which also needs that invalidate.
+fn apply_host_prot(host: u64, pieces: &PagePieces, old: u32, new: u32, wrote: bool) -> i64 {
+    if old != new {
+        trace_host_transition(host, pieces, old, new);
+        let mut result = host_mprotect(host, PAGE, host_prot(new as u64));
+        if result == -(errno::EACCES as i64) {
+            result = super::jit::protect_around(host, PAGE, host_prot(new as u64));
+        }
+        if result != 0 {
+            return result;
+        }
+    }
+    let gain = aim_guest_page::icache_span_on_execute_restore(old, new);
+    if gain.is_some() || (wrote && new & aim_guest_page::PROT_EXEC != 0) {
+        let span = gain.unwrap_or(PAGE);
+        // SAFETY: `host` is a mapped page in this process. The span is the
+        // whole host page, not the guest slice that was written.
+        unsafe { sys_icache_invalidate(host as *mut libc::c_void, span as usize) };
+        if old & aim_guest_page::PROT_WRITE != 0 && gain.is_some() {
+            crate::diag!(
+                "[linux-abi] host page {host:#x} write dropped, execute restored, icache invalidated {span:#x}"
+            );
+        } else {
+            crate::diag!(
+                "[linux-abi] host page {host:#x} icache invalidated {span:#x}"
+            );
+        }
+    }
+    0
 }
 
 fn punch_page(host: u64, cover: u8) -> i64 {
@@ -1347,6 +1445,7 @@ fn punch_page(host: u64, cover: u8) -> i64 {
         if cover & (1 << slot) != 0 {
             let at = host + slot * GUEST_PAGE;
             forget_eof_bus(at, at + GUEST_PAGE);
+            SLICE_MODULE.lock().unwrap().remove(&at);
         }
     }
     if cover == 0b1111 {
@@ -1355,21 +1454,41 @@ fn punch_page(host: u64, cover: u8) -> i64 {
     let Some(prot) = page_prot(host) else {
         return 0;
     };
-    let gone = {
+    let plan = {
         let mut pages = PAGE_PIECES.lock().unwrap();
         let entry = pages.entry(host).or_insert(PagePieces {
             present: 0b1111,
             prot: [prot; 4],
         });
+        let saved = *entry;
+        let old = aim_guest_page::host_protection(present_prots(entry));
         entry.present &= !cover;
-        entry.present == 0
+        for slot in 0..4 {
+            if cover & (1 << slot) != 0 {
+                entry.prot[slot] = 0;
+            }
+        }
+        let new = aim_guest_page::host_protection(present_prots(entry));
+        let gone = entry.present == 0;
+        let pieces = *entry;
+        if gone {
+            pages.remove(&host);
+        }
+        (gone, old, new, pieces, saved)
     };
+    let (gone, old, new, pieces, saved) = plan;
     if gone {
-        PAGE_PIECES.lock().unwrap().remove(&host);
-        release_aligned(host, PAGE)
-    } else {
-        0
+        return release_aligned(host, PAGE);
     }
+    if old == new {
+        return 0;
+    }
+    let result = apply_host_prot(host, &pieces, old, new, false);
+    if result != 0 {
+        PAGE_PIECES.lock().unwrap().insert(host, saved);
+        return result;
+    }
+    result
 }
 
 fn map_covered_slices(
@@ -1383,6 +1502,15 @@ fn map_covered_slices(
 ) -> i64 {
     if cover == 0 {
         return 0;
+    }
+    let prot = aim_guest_page::prot_bits(prot);
+    // A request that itself asks for write and execute stays refused for a
+    // file copy. A neighbor slice wanting the other bit is write-wins, below.
+    if aim_guest_page::private_copy_is_wx(prot) && !anon {
+        crate::diag!(
+            "[linux-abi] mmap: private copy host page {host:#x} prot {prot:#x} would be writable and executable; refusing"
+        );
+        return -(EINVAL as i64);
     }
     let existed = page_prot(host);
     if existed.is_none() {
@@ -1407,7 +1535,7 @@ fn map_covered_slices(
             return result;
         }
     }
-    let prot = aim_guest_page::prot_bits(prot);
+    let module = slice_module_name(anon, fd);
     for slot in 0..4 {
         if cover & (1 << slot) == 0 {
             continue;
@@ -1429,55 +1557,72 @@ fn map_covered_slices(
         } else if prot & libc::PROT_EXEC as u32 != 0 {
             patch::rewrite_region(at, GUEST_PAGE);
         }
+        remember_slice_module(at, &module);
+        if anon {
+            crate::diag::register_module(at, at + GUEST_PAGE, "anonymous".to_string());
+        } else {
+            let file_off = aim_guest_page::file_offset_at(map_addr, map_off, at);
+            crate::diag::register_fd_module(at, GUEST_PAGE, fd, file_off);
+        }
     }
-    let union = {
+    // A uniform page has no `PAGE_PIECES` row. Its guest slices can still
+    // differ from the host protection (`GUEST_SLICES`), so seed from those
+    // before folding write-wins. Neighbors include another module's data.
+    let existing = { PAGE_PIECES.lock().unwrap().get(&host).copied() };
+    let seeded = if let Some(entry) = existing {
+        entry
+    } else if let Some(bits) = existed {
+        let mut prot = [bits; 4];
+        for slot in 0..4usize {
+            let at = host + slot as u64 * GUEST_PAGE;
+            if let Ok(prior) = slice_prot(at) {
+                prot[slot] = prior;
+            }
+        }
+        PagePieces {
+            present: 0b1111,
+            prot,
+        }
+    } else {
+        PagePieces {
+            present: 0,
+            prot: [0; 4],
+        }
+    };
+    let (old_host, new_host, pieces) = {
         let mut pages = PAGE_PIECES.lock().unwrap();
-        let entry = pages.entry(host).or_insert(PagePieces {
-            present: if existed.is_some() { 0b1111 } else { 0 },
-            prot: [existed.unwrap_or(0); 4],
-        });
+        let entry = pages.entry(host).or_insert(seeded);
+        let old_host = aim_guest_page::host_protection(present_prots(entry));
         for slot in 0..4 {
             if cover & (1 << slot) != 0 {
                 entry.present |= 1 << slot;
                 entry.prot[slot] = prot;
             }
         }
-        let union = (0..4)
-            .filter(|slot| entry.present & (1 << slot) != 0)
-            .fold(0, |bits, slot| bits | entry.prot[slot]);
+        let new_host = aim_guest_page::host_protection(present_prots(entry));
+        let pieces = *entry;
         if entry.present == 0b1111 && entry.prot.iter().all(|item| *item == entry.prot[0]) {
             pages.remove(&host);
         }
-        union
+        (old_host, new_host, pieces)
     };
-    if !anon && union & (PROT_WRITE | PROT_EXEC) as u32 == (PROT_WRITE | PROT_EXEC) as u32 {
-        crate::diag!(
-            "[linux-abi] mmap: private copy host page {host:#x} would be writable and executable; refusing"
-        );
-        if existed.is_none() {
-            PAGE_PIECES.lock().unwrap().remove(&host);
-            unsafe { libc::munmap(host as *mut _, PAGE as usize) };
-        } else {
-            host_mprotect(host, PAGE, host_prot(existed.unwrap() as u64));
-        }
-        return -(EINVAL as i64);
+    if aim_guest_page::private_copy_is_wx(prot) {
+        // Anonymous request that itself asks for write and execute. This is
+        // the MAP_JIT path, not a neighbor slice.
+        return super::jit::protect_rwx(host, PAGE);
     }
-    if !anon && union & libc::PROT_EXEC as u32 != 0 && union & libc::PROT_WRITE as u32 == 0 {
+    if !anon && new_host & libc::PROT_EXEC as u32 != 0 && new_host & libc::PROT_WRITE as u32 == 0 {
         crate::diag!(
-            "[linux-abi] mmap: private copy host page {host:#x} filled RW, mprotect {union:#x}; W and X are not set together"
+            "[linux-abi] mmap: private copy host page {host:#x} filled RW, mprotect {new_host:#x}; W and X are not set together"
         );
     }
-    if union & (PROT_WRITE | PROT_EXEC) as u32 == (PROT_WRITE | PROT_EXEC) as u32 {
-        super::jit::protect_rwx(host, PAGE)
-    } else {
-        host_mprotect(host, PAGE, host_prot(union as u64))
-    }
+    apply_host_prot(host, &pieces, old_host, new_host, true)
 }
 
 /// `MAP_FIXED` of a range whose address or end is only 4 KiB-aligned.
 /// Whole host pages use the ordinary path. An edge page keeps the slices
 /// the request does not cover, and the call returns the requested address.
-/// The host page's protection is the union of its present slices, and a
+/// The host page's protection is write-wins over every present slice, and a
 /// slice that was unmapped stays readable until the whole page is gone.
 fn mmap_partial_fixed(
     addr: u64,
@@ -1548,10 +1693,73 @@ fn slice_prot(page: u64) -> Result<u32, i64> {
     }
 }
 
+/// An instruction fetch whose slice wants execute while another slice on
+/// the same host page wants write. The host page is not executable. The
+/// line names both modules, both slices, and the thread.
+pub(super) fn note_exec_window(addr: u64) {
+    let host = addr & !(PAGE - 1);
+    let slot = ((addr - host) / GUEST_PAGE) as usize;
+    if slot >= 4 {
+        return;
+    }
+    let pieces = {
+        let pages = PAGE_PIECES.lock().unwrap();
+        match pages.get(&host).copied() {
+            Some(pieces) => pieces,
+            None => return,
+        }
+    };
+    if pieces.present & (1 << slot) == 0 {
+        return;
+    }
+    let mut owned = Vec::new();
+    {
+        let modules = SLICE_MODULE.lock().unwrap();
+        for s in 0..4usize {
+            if pieces.present & (1 << s) == 0 {
+                continue;
+            }
+            let at = host + s as u64 * GUEST_PAGE;
+            let module = modules.get(&at).cloned().unwrap_or_else(|| {
+                let described = crate::diag::describe(at);
+                if described == "?" {
+                    "anonymous".to_string()
+                } else {
+                    described
+                }
+            });
+            owned.push((at, pieces.prot[s], module));
+        }
+    }
+    let views: Vec<aim_guest_page::SliceView<'_>> = owned
+        .iter()
+        .map(|(at, prot, module)| aim_guest_page::SliceView {
+            addr: *at,
+            prot: *prot,
+            module,
+        })
+        .collect();
+    let Some(window) = aim_guest_page::exec_window(addr, &views) else {
+        return;
+    };
+    let n = EXEC_WINDOW_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // SAFETY: the fault is on this thread.
+    let pthread = unsafe { libc::pthread_self() } as u64;
+    let thread = match super::current_guest_tid() {
+        Some(tid) => format!("guest tid {tid} pthread {pthread:#x}"),
+        None => format!("guest tid none pthread {pthread:#x}"),
+    };
+    crate::diag!(
+        "{}",
+        aim_guest_page::format_exec_window(&thread, &window, n)
+    );
+}
+
 /// `mprotect` of a 4 KiB-aligned range that is not 16 KiB-aligned.
 ///
-/// The host page stays 16 KiB. Its protection is the union of its slices
-/// (`aim_guest_page`), so a read-only slice keeps its writable neighbors.
+/// The host page stays 16 KiB. Its protection is write-wins over every
+/// slice (`aim_guest_page`), so a read-only slice keeps its writable
+/// neighbors, and execute waits until no slice on the page wants write.
 fn mprotect_subpage(a: [u64; 6]) -> i64 {
     let _epoch = super::verity_pager::exclusive_mutation();
     let prot = aim_guest_page::prot_bits((a[2] & !(PROT_BTI | PROT_MTE)) as u32);
@@ -1588,29 +1796,31 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
         });
         page += GUEST_PAGE;
     }
+    if aim_guest_page::private_copy_is_wx(prot) {
+        crate::diag!(
+            "[linux-abi] mprotect: refusing W+X on {addr:#x}..{end:#x}"
+        );
+        return -(EINVAL as i64);
+    }
     let (host_ops, slices) = match aim_guest_page::plan_subpage(host_lo, addr, end, prot, &current)
     {
         Ok(plan) => plan,
         Err(error) => return -(error as i64),
     };
     for op in &host_ops {
-        if aim_guest_page::union_creates_wx(op.old, op.prot) {
-            crate::diag!(
-                "[linux-abi] mprotect: refusing W+X union on host page {:#x} ({:#x} -> {:#x})",
-                op.addr,
-                op.old,
-                op.prot
-            );
-            return -(EINVAL as i64);
-        }
-        if op.prot & !op.old != 0 {
-            crate::diag!(
-                "[linux-abi] mprotect: host page {:#x} takes the union of its 4 KiB slices ({:#x} -> {:#x})",
-                op.addr,
-                op.old,
-                op.prot
-            );
-        }
+        let n = HOST_PROT_TRANSITIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        let shown: Vec<String> = slices
+            .iter()
+            .filter(|(at, _)| *at >= op.addr && *at < op.addr + PAGE)
+            .map(|(at, bits)| format!("{at:#x}:{bits:#x}"))
+            .collect();
+        crate::diag!(
+            "[linux-abi] host page {:#x} slices {} prot {:#x} -> {:#x} (transition {n})",
+            op.addr,
+            shown.join(" "),
+            op.old,
+            op.prot
+        );
     }
     for (done, op) in host_ops.iter().enumerate() {
         let mut result = host_mprotect(op.addr, PAGE, op.prot as i32);
@@ -1624,25 +1834,58 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
             }
             return result;
         }
+        if let Some(span) = aim_guest_page::icache_span_on_execute_restore(op.old, op.prot) {
+            // SAFETY: the host page is mapped. Invalidate all 16 KiB, not the
+            // 4 KiB the guest named.
+            unsafe { sys_icache_invalidate(op.addr as *mut libc::c_void, span as usize) };
+            crate::diag!(
+                "[linux-abi] host page {:#x} write dropped, execute restored, icache invalidated {span:#x}",
+                op.addr
+            );
+        }
     }
     {
         let mut recorded = GUEST_SLICES.lock().unwrap();
-        for (page, prot) in slices {
+        let mut pages = PAGE_PIECES.lock().unwrap();
+        let mut planned: BTreeMap<u64, [u32; 4]> = BTreeMap::new();
+        for &(page, prot) in &slices {
             let host = page & !(PAGE - 1);
             let slot = ((page - host) / GUEST_PAGE) as usize;
-            {
-                let mut pages = PAGE_PIECES.lock().unwrap();
-                if let Some(entry) = pages.get_mut(&host)
-                    && entry.present & (1 << slot) != 0
-                {
-                    entry.prot[slot] = prot;
-                    if entry.present == 0b1111
-                        && entry.prot.iter().all(|item| *item == entry.prot[0])
-                    {
-                        pages.remove(&host);
+            let row = planned.entry(host).or_insert_with(|| {
+                if let Some(entry) = pages.get(&host) {
+                    entry.prot
+                } else {
+                    let base = ((host - host_lo) / GUEST_PAGE) as usize;
+                    let mut prior = [0u32; 4];
+                    for s in 0..4 {
+                        prior[s] = current[base + s];
                     }
+                    prior
+                }
+            });
+            row[slot] = prot;
+        }
+        for (host, row) in planned {
+            let present = pages.get(&host).map(|entry| entry.present).unwrap_or(0b1111);
+            let mut prot_row = pages.get(&host).map(|entry| entry.prot).unwrap_or(row);
+            for slot in 0..4 {
+                if present & (1 << slot) != 0 {
+                    prot_row[slot] = row[slot];
                 }
             }
+            if present == 0b1111 && prot_row.iter().all(|item| *item == prot_row[0]) {
+                pages.remove(&host);
+            } else {
+                pages.insert(
+                    host,
+                    PagePieces {
+                        present,
+                        prot: prot_row,
+                    },
+                );
+            }
+        }
+        for (page, prot) in slices {
             if prot == aim_guest_page::host_prot_at(&host_ops, &current, host_lo, page) {
                 recorded.remove(&page);
             } else {
