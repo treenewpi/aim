@@ -2118,17 +2118,22 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             | Kind::ProxyFile
             | Kind::ProcMem(_)
             | Kind::Path(_) => std::ptr::null(),
-            // A mount file's cursor is the open file, shared by dup. Another
-            // content file stays the parent's.
+            // A mount file's cursor and a namespace fd are the open file,
+            // shared by dup. A plain content file is that description too:
+            // the inherited host fd keeps the offset.
             Kind::Content => {
                 if let Some(ptr) = super::procfs::mount_poll_ptr(*fd) {
                     ptr
                 } else if let Some(ns) = super::procfs::mount_namespace_of(*fd) {
                     Arc::as_ptr(&ns) as *const ()
                 } else {
-                    continue;
+                    std::ptr::null()
                 }
             }
+            // The socket is inherited and `evdev::adopt` rebuilds the kind
+            // from the marker on it. A binder file's mach send right is not
+            // in that socket (`docs/fork.md`: the child opens its own
+            // connection), so the kind is not restored without the port.
             Kind::Evdev(_) | Kind::Binder(_) => continue,
         };
         let (i, new) = match objects.iter().position(|&o| !p.is_null() && o == p) {
@@ -2250,6 +2255,8 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 } else if let Some(ns) = super::procfs::mount_namespace_of(fd) {
                     w.u32(24);
                     w.u64(crate::vfs::mount_namespace_ino(&ns));
+                } else {
+                    w.u32(25);
                 }
             }
             Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
@@ -2408,6 +2415,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 pending_ns = Some(ns);
                 Kind::Content
             }
+            25 => Kind::Content,
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
@@ -2438,6 +2446,11 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
     }
     super::fasync::fork_restore(r);
     for fd in super::fd_visibility::visible() {
+        // An evdev socket survives as the open file. The marker on it is
+        // what exec uses; fork has the same socket and no separate kind.
+        if get(fd).is_none() {
+            super::evdev::adopt(fd);
+        }
         if super::fuse_device::adopt(fd) {
             continue;
         }

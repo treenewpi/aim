@@ -3918,6 +3918,124 @@ mod tests {
         let _ = std::fs::remove_dir(root.join("ns-boot"));
     }
 
+    /// A plain `/proc` content file is an open file description. Fork keeps
+    /// the fd; it is not only the mount-poll and namespace fds that are.
+    #[test]
+    fn fork_save_keeps_a_plain_proc_content_fd() {
+        let _view = crate::vfs::test_view();
+        let before = fd_entry_count();
+        let fd = super::open("/proc/meminfo", 0, libc::O_RDONLY).unwrap();
+        assert!(fd >= 0);
+        assert!(matches!(
+            super::fdtab::get(fd as i32),
+            Some(super::fdtab::Kind::Content)
+        ));
+        assert_eq!(fd_entry_count(), before + 1);
+        assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    fn fd_entry_count() -> u64 {
+        let mut writer = super::super::fork::state::Writer::default();
+        super::fdtab::fork_save(&mut writer);
+        let bytes = writer.into_bytes();
+        u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    }
+
+    /// vendor_init `setns` into the reconstructed default namespace, then
+    /// `readlink("/proc/self/exe")`. The exe path is the executed file and
+    /// does not move with the namespace. A fuse line whose origin is another
+    /// namespace must not make that walk return `EIO`: the parked journal
+    /// keeps its mount records. `mntns_install` sets the cwd to the
+    /// namespace root.
+    #[test]
+    fn fork_setns_readlink_exe_uses_the_journal_records() {
+        let (_view, _root) = crate::vfs::test_view();
+        let previous_exe = (
+            crate::sys::process::exe_guest_path(),
+            crate::sys::process::exe_host_path(),
+        );
+        let previous_cwd = crate::vfs::cwd();
+        crate::sys::process::set_exe("/system/bin/init".into(), "/system/bin/init".into());
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let journal = crate::vfs::mount_namespace_id().unwrap();
+        let owner = aim_storage::mount_namespace::Namespace::open(
+            crate::vfs::runtime_dir().unwrap(),
+            &journal,
+        )
+        .unwrap();
+        let state = owner.read().unwrap();
+        assert!(
+            state.mounts.iter().any(|mount| mount.guest == "/"),
+            "default namespace journal has no root mount"
+        );
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        let table = crate::vfs::runtime_dir().unwrap().join("fuse-mounts");
+        let saved_table = std::fs::read(&table).ok();
+        let line = [
+            "/fuse-foreign-probe",
+            "/var/empty",
+            "src",
+            "plain",
+            "rw",
+            "tmpfs",
+            "",
+            "not-this-namespace",
+            "1",
+            "1",
+            "0",
+            "0",
+        ]
+        .join("\t");
+        std::fs::write(&table, format!("{line}\n")).unwrap();
+        crate::vfs::set_cwd("/system".into());
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::vfs::cwd(), "/");
+        crate::vfs::refresh_fuse_mounts().expect("path walk after setns");
+        let resolved = crate::vfs::resolve(
+            crate::vfs::LINUX_AT_FDCWD,
+            b"/proc/self/exe",
+            false,
+        )
+        .expect("resolve /proc/self/exe");
+        let bytes = super::readlink(resolved.guest.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"/system/bin/init");
+        match saved_table {
+            Some(bytes) => std::fs::write(&table, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&table);
+            }
+        }
+        let _ = crate::vfs::remove_mount("/fuse-foreign-probe");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        crate::vfs::set_cwd(previous_cwd);
+        crate::sys::process::set_exe(previous_exe.0, previous_exe.1);
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+    }
+
     /// Init's sequence with the property-service thread still alive:
     /// `unshare(CLONE_NEWNS)` unshares `fs`, the pre-unshare fd keeps its
     /// inode, and `setns` of that fd succeeds.

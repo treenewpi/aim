@@ -1338,13 +1338,19 @@ fn park_saved(saved: &ForkNamespace) -> Option<ParkedJournal> {
     let id = saved.journal_id.as_deref()?;
     let runtime = runtime_dir()?;
     let owner = aim_storage::mount_namespace::Namespace::open(runtime, id).ok()?;
+    // `origin_visible` searches these records. An empty list makes the next
+    // path walk return EIO when a fuse line names another namespace
+    // (`refresh_fuse_mounts`): that was the child's `readlink` of
+    // `/proc/self/exe` after `setns`. The generation stays on the page so
+    // the walk does not replay the journal over the restored table.
+    let records = owner.read().ok()?.mounts;
     let generation = owner.generation().ok()?.current();
     Some(ParkedJournal {
         propagation,
         private_mounts: saved.private_mounts,
         view: Some(ParkedView {
             owner,
-            records: Arc::new(Vec::new()),
+            records: Arc::new(records),
             generation,
         }),
     })

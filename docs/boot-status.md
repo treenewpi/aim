@@ -39,8 +39,20 @@ the bootstrap namespace the parent had switched back to. kmsg:
 (`sys/mount.rs`): the host fd was inherited, and the child's namespace
 table was empty. It is not a leftover thread count and not `fs->users`.
 Fork without `CLONE_FS` already gives the child its own `fs_struct` with
-`users == 1`. The fork image now carries each namespace and rebinds the
-inherited fds. That child path is not measured on macmini. The same run
+`users == 1`. The fork image carries each namespace and rebinds the
+inherited fds. On `96f65ff` (archive
+`ba417120f10973655e7c4a47312f4543e245e5f5e0e054e736ae311ae3b5bc50`)
+vendor_init's `setns(15, CLONE_NEWNS)` returned 0, then
+`readlinkat("/proc/self/exe")` returned `-EIO` (child call 8) and
+`execve` of an empty path returned `ENOENT` (call 9). kmsg:
+`Could not execv subcontext init: No such file or directory`. The `EIO`
+is `refresh_fuse_mounts`: the reconstructed journal had no mount
+records, so a fuse line from another namespace made `origin_visible`
+return `EIO` before procfs read the exe link. The parked view now keeps
+those records. `/proc/self/exe` stays the executed file across `setns`.
+A plain `/proc` content fd is in the fork image, and an evdev socket is
+adopted from the inherited fd. A binder file's mach send right is not
+in that socket. This is not remeasured. On `9eacf04` the run
 then stopped on `openat("/proc/sys/kernel/kptr_restrict")` returning ENOENT
 (call 6284) and `Unable to set adequate kptr_restrict value!`.
 `kptr_restrict` is now a mode-0644 integer, 0..=2, default 0: a write
