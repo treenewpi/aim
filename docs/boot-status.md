@@ -353,9 +353,40 @@ helper (`posix_openpt`, `TIOCGPTN`, `TIOCSPTLCK`, `/dev/pts/N`); a
 missing helper is `ENODEV`. The early `mknod` of `/dev/ptmx` is `EPERM`
 because a device node is not created on the host. The open does not use
 that node: `/dev/ptmx` is the host device path. `/dev/hw_random` reads
-`getentropy`. logd's exit 127 is unchanged. `LOOP_CONFIGURE` of a
-backing fd that is not open in the process is `EBADF`. `DM_DEV_STATUS`
-of a device the catalog does not have is `ENXIO`. This fix is not
+`getentropy`. `LOOP_CONFIGURE` of a backing fd that is not open in the
+process is `EBADF`. `DM_DEV_STATUS` of a device the catalog does not
+have is `ENXIO`.
+`e7f4e7f97b5a60521ddaecf83c175635d0ea247d` (archive SHA256
+`cc6d9eb74292349b95cda47e6284d67c7a7cbec5a6d9e410643d709b6e4550bc`)
+remeasured that. `aim-pty-holder` and `aim-binderd` built offline.
+`/dev/ptmx` opened, linkerconfig wrote `/linkerconfig/ld.config.txt`,
+and `/dev/hw_random` opened. `binder_alloc` (pid 59540) opened
+`/dev/binderfs/binder-control` as fd 3 and
+`ioctl(0x3, 0xc1086201, ...)` returned `-22` `EINVAL` (`Failed to
+allocate new binder device`, exit 1). The nodes were never created, so
+init's `/dev/binderfs/{hwbinder,binder,vndbinder}`, servicemanager's
+`/dev/binder`, and hwservicemanager's and vold's `/dev/hwbinder` were
+`ENOENT`. vold aborted and init rebooted `reboot,vold-failed` after
+post-fs at 6.4s. `struct binderfs_device` is `char name[256]`, then
+`__u32 major`, then `__u32 minor` (264 bytes, the `0x108` in the ioctl).
+The name was read at offset 8. `binder` is seven bytes including its
+NUL, so that read was an empty string and `allocate` returned `EINVAL`.
+The ioctl reaches the control handler because the fd's kind is
+`BinderControl`, copied onto the pin; the host fd is `/dev/null` and
+its rdev is not `10:58`. A forked child is `linux-run --fork-child`
+with the parent's `--binder`, and that process connects before the
+guest resumes. `binder_alloc` reached the ioctl, so the connect had
+returned. The trace line names the device. `libnativeloader.so` is in
+the art APEX and `libstatspull.so` is in the statsd APEX. apexd-bootstrap
+does not activate those. Full apexd is `restart apexd` in `post-fs-data`,
+which then waits for `apexd.status` `activated`. `on zygote-start` is
+queued after that and starts zygote; `on nonencrypted` does
+`class_start main`, which starts mediaserver. linkerconfig's
+`ld.config.txt` names those APEX directories. They are absent until
+apexd mounts them, so the linker reports the libraries missing. logd is
+`start logd` in the early-init action. Exit 127 is still that service's
+status: init's child `_exit(127)` after `execve` fails, and a failed
+`execve` is traced with the path and errno. This fix is not
 Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on

@@ -320,8 +320,11 @@ fn open_device(device: Device, flags: u64) -> i64 {
     }
 }
 
-/// `struct binderfs_device`: `__u32 major`, `__u32 minor`, `char name[256]`.
+/// `struct binderfs_device` in `include/uapi/linux/android/binderfs.h`:
+/// `char name[256]`, then `__u32 major`, then `__u32 minor`. 256 + 4 + 4
+/// is 264, the `0x108` in `BINDER_CTL_ADD`. The name is not at offset 8.
 const BINDERFS_DEVICE: usize = 264;
+const BINDERFS_NAME_LEN: usize = 256;
 /// `_IOWR('b', 1, struct binderfs_device)`.
 const BINDER_CTL_ADD: u32 = 0xc108_6201;
 const MISC_MAJOR: u32 = 10;
@@ -494,37 +497,74 @@ fn allocate(mount: &str, name: &str) -> Result<(u32, u32), i32> {
     Ok(numbers(name))
 }
 
+/// The NUL-terminated name at the start of `struct binderfs_device`.
+fn device_name(bytes: &[u8]) -> Result<&str, i32> {
+    let field = bytes.get(..BINDERFS_NAME_LEN).ok_or(EINVAL)?;
+    let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+    std::str::from_utf8(&field[..end]).map_err(|_| EINVAL)
+}
+
 fn control_ioctl(mount: &str, cmd: u64, arg: u64) -> i64 {
     if (cmd >> 8) & 0xff != u64::from(b'b') {
         return -(crate::errno::ENOTTY as i64);
     }
     if cmd as u32 != BINDER_CTL_ADD {
+        crate::diag!(
+            "[linux-abi] binder-control ioctl {cmd:#x} is not BINDER_CTL_ADD"
+        );
         return -(EINVAL as i64);
     }
     let bytes = match super::user_memory::read_exact(arg, BINDERFS_DEVICE) {
         Ok(bytes) => bytes,
-        Err(error) => return -(error as i64),
+        Err(error) => {
+            crate::diag!("[linux-abi] BINDER_CTL_ADD guest read errno {error}");
+            return -(error as i64);
+        }
     };
-    let name_bytes = &bytes[8..];
-    let end = name_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(name_bytes.len());
-    let name = match std::str::from_utf8(&name_bytes[..end]) {
-        Ok(name) => name,
-        Err(_) => return -(EINVAL as i64),
+    let name = match device_name(&bytes) {
+        Ok(name) => name.to_string(),
+        Err(_) => {
+            let field = &bytes[..BINDERFS_NAME_LEN];
+            let end = field.iter().position(|byte| *byte == 0).unwrap_or(32.min(field.len()));
+            crate::diag!(
+                "[linux-abi] BINDER_CTL_ADD mount={mount} name=<not utf-8> bytes={:02x?} connected={}",
+                &field[..end],
+                u8::from(connected())
+            );
+            return -(EINVAL as i64);
+        }
     };
-    match allocate(mount, name) {
+    // The fd's kind is `BinderControl`, copied onto the pin `fs::ioctl`
+    // takes. The host descriptor is `/dev/null`; its rdev is not 10:58.
+    match allocate(mount, &name) {
         Ok((major, minor)) => {
             let mut out = bytes;
-            out[..4].copy_from_slice(&major.to_le_bytes());
-            out[4..8].copy_from_slice(&minor.to_le_bytes());
+            out[BINDERFS_NAME_LEN..BINDERFS_NAME_LEN + 4].copy_from_slice(&major.to_le_bytes());
+            out[BINDERFS_NAME_LEN + 4..BINDERFS_DEVICE].copy_from_slice(&minor.to_le_bytes());
             match super::user_memory::write_exact(arg, &out) {
-                Ok(()) => 0,
-                Err(error) => -(error as i64),
+                Ok(()) => {
+                    crate::diag!(
+                        "[linux-abi] BINDER_CTL_ADD mount={mount} name=\"{name}\" major={major} minor={minor} connected={}",
+                        u8::from(connected())
+                    );
+                    0
+                }
+                Err(error) => {
+                    crate::diag!(
+                        "[linux-abi] BINDER_CTL_ADD mount={mount} name=\"{name}\" write errno {error} connected={}",
+                        u8::from(connected())
+                    );
+                    -(error as i64)
+                }
             }
         }
-        Err(error) => -(error as i64),
+        Err(error) => {
+            crate::diag!(
+                "[linux-abi] BINDER_CTL_ADD mount={mount} name=\"{name}\" errno={error} connected={}",
+                u8::from(connected())
+            );
+            -(error as i64)
+        }
     }
 }
 
@@ -1120,8 +1160,6 @@ mod close_alias_tests {
 mod binderfs_tests {
     use std::ffi::CString;
 
-    use super::allocate;
-
     fn mount_binder(target: &str, options: &str) -> i64 {
         let target = CString::new(target).unwrap();
         let fstype = CString::new("binder").unwrap();
@@ -1136,8 +1174,24 @@ mod binderfs_tests {
         ])
     }
 
+    /// `BINDER_CTL_ADD` through `fs::ioctl`, with the name at offset 0.
+    fn add_device(fd: i32, name: &str) -> (i64, [u8; super::BINDERFS_DEVICE]) {
+        let mut buf = [0u8; super::BINDERFS_DEVICE];
+        buf[..name.len()].copy_from_slice(name.as_bytes());
+        let rc = crate::sys::fs::ioctl([
+            fd as u64,
+            super::BINDER_CTL_ADD as u64,
+            buf.as_mut_ptr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        (rc, buf)
+    }
+
     #[test]
     fn binderfs_allocates_only_the_three_contexts() {
+        assert_eq!((super::BINDER_CTL_ADD >> 16) & 0x3fff, 0x108);
         let (_view, root) = crate::vfs::test_view();
         std::fs::create_dir_all(root.join("data/binderfs")).unwrap();
         std::fs::create_dir_all(root.join("data/binderfs-bad")).unwrap();
@@ -1155,18 +1209,49 @@ mod binderfs_tests {
             ]),
             -(libc::ENOENT as i64)
         );
-        assert_eq!(allocate("/data/binderfs", "binder").unwrap(), (10, 59));
-        assert_eq!(allocate("/data/binderfs", "hwbinder").unwrap(), (10, 60));
-        assert_eq!(allocate("/data/binderfs", "vndbinder").unwrap(), (10, 61));
+        let control = CString::new("/data/binderfs/binder-control").unwrap();
+        let fd = crate::sys::fs::openat([
+            crate::vfs::LINUX_AT_FDCWD as u64,
+            control.as_ptr() as u64,
+            2,
+            0,
+            0,
+            0,
+        ]);
+        assert!(fd >= 0, "{fd}");
+        let st = super::fstat(fd as i32).unwrap();
+        assert_eq!(st.st_rdev as u64 & 0xff_ffff, 58);
+        // binder_alloc's struct: the name at offset 0, major and minor after
+        // the 256-byte field. A name written at offset 8 is the empty string.
+        let mut shifted = [0u8; super::BINDERFS_DEVICE];
+        shifted[8..14].copy_from_slice(b"binder");
         assert_eq!(
-            allocate("/data/binderfs", "binder"),
-            Err(crate::errno::EEXIST)
+            crate::sys::fs::ioctl([
+                fd as u64,
+                super::BINDER_CTL_ADD as u64,
+                shifted.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+            ]),
+            -(libc::EINVAL as i64)
         );
-        assert_eq!(
-            allocate("/data/binderfs", "not-a-context"),
-            Err(crate::errno::ENODEV)
-        );
-        assert_eq!(allocate("/data/binderfs", "a/b"), Err(crate::errno::EINVAL));
+        assert_eq!(super::device_name(&shifted).unwrap(), "");
+        let (rc, buf) = add_device(fd as i32, "binder");
+        assert_eq!(rc, 0, "{rc}");
+        assert_eq!(u32::from_le_bytes(buf[256..260].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(buf[260..264].try_into().unwrap()), 59);
+        assert!(buf.starts_with(b"binder\0"));
+        let (rc, buf) = add_device(fd as i32, "hwbinder");
+        assert_eq!(rc, 0, "{rc}");
+        assert_eq!(u32::from_le_bytes(buf[260..264].try_into().unwrap()), 60);
+        let (rc, buf) = add_device(fd as i32, "vndbinder");
+        assert_eq!(rc, 0, "{rc}");
+        assert_eq!(u32::from_le_bytes(buf[260..264].try_into().unwrap()), 61);
+        assert_eq!(add_device(fd as i32, "binder").0, -(libc::EEXIST as i64));
+        assert_eq!(add_device(fd as i32, "not-a-context").0, -(libc::ENODEV as i64));
+        assert_eq!(add_device(fd as i32, "a/b").0, -(libc::EINVAL as i64));
+        unsafe { libc::close(fd as i32) };
         let st = super::stat("/data/binderfs/binder").unwrap();
         assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR);
         assert_eq!(st.st_rdev as u64 >> 24, 10);
@@ -1183,19 +1268,6 @@ mod binderfs_tests {
             ]),
             -(libc::ENODEV as i64)
         );
-        let control = CString::new("/data/binderfs/binder-control").unwrap();
-        let fd = crate::sys::fs::openat([
-            crate::vfs::LINUX_AT_FDCWD as u64,
-            control.as_ptr() as u64,
-            2,
-            0,
-            0,
-            0,
-        ]);
-        assert!(fd >= 0, "{fd}");
-        let st = super::fstat(fd as i32).unwrap();
-        assert_eq!(st.st_rdev as u64 & 0xff_ffff, 58);
-        unsafe { libc::close(fd as i32) };
         let mounted = CString::new("/data/binderfs").unwrap();
         assert_eq!(
             crate::sys::mount::umount2([mounted.as_ptr() as u64, 0, 0, 0, 0, 0]),
