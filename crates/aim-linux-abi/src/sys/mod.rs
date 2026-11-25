@@ -70,6 +70,7 @@ mod itimer;
 mod jit;
 mod kmsg;
 mod knob;
+mod sysctl;
 mod mem;
 pub(crate) mod regular_file;
 pub(crate) mod verified_source;

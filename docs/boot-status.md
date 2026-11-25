@@ -40,9 +40,15 @@ the bootstrap namespace the parent had switched back to. kmsg:
 table was empty. It is not a leftover thread count and not `fs->users`.
 Fork without `CLONE_FS` already gives the child its own `fs_struct` with
 `users == 1`. The fork image now carries each namespace and rebinds the
-inherited fds. That child path is not measured on macmini. The same run's
-next stop is `openat("/proc/sys/kernel/kptr_restrict")` returning ENOENT
-(call 6284) and `Unable to set adequate kptr_restrict value!`. `write` of
+inherited fds. That child path is not measured on macmini. The same run
+then stopped on `openat("/proc/sys/kernel/kptr_restrict")` returning ENOENT
+(call 6284) and `Unable to set adequate kptr_restrict value!`.
+`kptr_restrict` is now a mode-0644 integer, 0..=2, default 0: a write
+outside that range is `EINVAL` and leaves the stored value, a write needs
+`CAP_SYS_ADMIN`, and a read of an already-open fd returns the stored text.
+`mmap_rnd_bits` (18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same
+kind of file. Guest mmap does not consult those two values. None of the
+three is measured on macmini. `write` of
 fd 3 for 61 bytes returned 61
 on the earlier `11bbedf` run; the raw guest buffer was not captured, and
 the 2200-byte diagnostic marker does not contain that text. Property,

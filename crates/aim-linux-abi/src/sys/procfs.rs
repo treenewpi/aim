@@ -1586,17 +1586,31 @@ fn sys_node(tail: &str) -> Option<Node> {
         "fs/inotify/max_queued_events" => {
             Node::File(format!("{}\n", super::inotify::MAX_QUEUED_EVENTS).into_bytes())
         }
-        "vm" => Node::Dir(entries(&[("memfd_noexec", dir::DT_REG)])),
+        "vm" => Node::Dir(entries(&[
+            ("memfd_noexec", dir::DT_REG),
+            ("mmap_rnd_bits", dir::DT_REG),
+            ("mmap_rnd_compat_bits", dir::DT_REG),
+        ])),
         "vm/memfd_noexec" => {
             Node::File(format!("{}\n", super::memfd::noexec_scope().ok()?).into_bytes())
         }
+        "vm/mmap_rnd_bits" => {
+            Node::File(super::sysctl::text("/proc/sys/vm/mmap_rnd_bits").ok()?)
+        }
+        "vm/mmap_rnd_compat_bits" => {
+            Node::File(super::sysctl::text("/proc/sys/vm/mmap_rnd_compat_bits").ok()?)
+        }
         "kernel" => Node::Dir(entries(&[
             ("hostname", dir::DT_REG),
+            ("kptr_restrict", dir::DT_REG),
             ("osrelease", dir::DT_REG),
             ("ostype", dir::DT_REG),
             ("pid_max", dir::DT_REG),
             ("random", dir::DT_DIR),
         ])),
+        "kernel/kptr_restrict" => {
+            Node::File(super::sysctl::text("/proc/sys/kernel/kptr_restrict").ok()?)
+        }
         "kernel/random" => Node::Dir(entries(&[("boot_id", dir::DT_REG), ("uuid", dir::DT_REG)])),
         "kernel/random/boot_id" => {
             let s = match vfs::runtime_dir().map(aim_storage::boot_id::BootId::read) {
@@ -2328,6 +2342,9 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     if canonical(guest) == super::memfd::NOEXEC_SYSCTL {
         return Some(super::memfd::open_noexec(write, cloexec));
     }
+    if let Some(result) = super::sysctl::open(&canonical(guest), write, cloexec) {
+        return Some(result);
+    }
     if canonical(guest) == "/proc/kmsg" {
         return Some(super::kmsg::open_proc(flags, host_flags));
     }
@@ -2674,7 +2691,9 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
             st.st_mode = libc::S_IFREG | 0o600;
             st.st_nlink = 1;
         }
-        Some(Node::File(_)) if canon == super::memfd::NOEXEC_SYSCTL => {
+        Some(Node::File(_))
+            if canon == super::memfd::NOEXEC_SYSCTL || super::sysctl::known(&canon) =>
+        {
             st.st_mode = libc::S_IFREG | 0o644;
             st.st_nlink = 1;
         }

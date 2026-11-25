@@ -1074,7 +1074,13 @@ fn special_read_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> 
             Some(-(EINVAL as i64))
         }
         Kind::TracePipe(_) if iov.iter().all(|v| v.iov_len == 0) => Some(0),
-        Kind::TracePipe(_) | Kind::Content | Kind::Knob(_) | Kind::Random | Kind::Ashmem => None,
+        Kind::Knob(owner) => {
+            if let super::knob::Knob::Sysctl(path) = owner.as_ref() {
+                super::sysctl::refresh(fd, path);
+            }
+            None
+        }
+        Kind::TracePipe(_) | Kind::Content | Kind::Random | Kind::Ashmem => None,
         Kind::Memfd(_) => {
             let mut total = 0i64;
             for v in iov {
@@ -1198,10 +1204,15 @@ fn special_pio_kernel(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> O
         Kind::Binder(_) => Some(-(EINVAL as i64)),
         Kind::Content => None,
         Kind::Knob(k) if write => Some(super::knob::write(fd, &k, &one(buf, len))),
-        // SAFETY: guest buffer.
-        Kind::Knob(_) => Some(errno::check(
-            unsafe { libc::pread(fd, buf as *mut _, len, pos) } as i64,
-        )),
+        // SAFETY: guest buffer. A sysctl read copies the live value first.
+        Kind::Knob(k) => {
+            if let super::knob::Knob::Sysctl(path) = k.as_ref() {
+                super::sysctl::refresh(fd, path);
+            }
+            Some(errno::check(
+                unsafe { libc::pread(fd, buf as *mut _, len, pos) } as i64,
+            ))
+        }
         Kind::Random if write => Some(super::random::write(&one(buf, len))),
         Kind::Random => None,
         Kind::Ashmem if write => Some(-(EINVAL as i64)),

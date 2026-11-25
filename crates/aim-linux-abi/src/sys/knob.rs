@@ -25,6 +25,8 @@ pub enum Knob {
     Comm(i32),
     Uevent(super::uevent::Device),
     FuseAbort(super::fuse::SessionKey),
+    /// A `proc_dointvec_minmax` file. The string is its guest path.
+    Sysctl(&'static str),
 }
 
 impl Knob {
@@ -40,6 +42,7 @@ impl Knob {
             Self::Comm(tid) => super::procfs::write_comm(*tid, bytes).map(|()| None),
             Self::Uevent(dev) => super::uevent::synthesize(dev, bytes).map(|()| None),
             Self::FuseAbort(key) => super::fuse::abort(key).map(|()| None),
+            Self::Sysctl(path) => super::sysctl::write(path, bytes),
         }
     }
 }
@@ -84,6 +87,10 @@ pub(super) fn save(k: &Knob, w: &mut super::fork_state::Writer) {
             w.u32(8);
             w.path(key.transport());
         }
+        Knob::Sysctl(path) => {
+            w.u32(9);
+            w.str(path);
+        }
     }
 }
 
@@ -113,6 +120,13 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Option<Arc<Knob>> {
             env: r.seq(|r| r.str()),
         }),
         8 => Knob::FuseAbort(super::fuse::SessionKey::from_transport(r.path())),
+        9 => {
+            let Some(path) = super::sysctl::static_path(&r.str()) else {
+                r.invalidate();
+                return None;
+            };
+            Knob::Sysctl(path)
+        }
         _ => {
             r.invalidate();
             return None;
@@ -192,6 +206,7 @@ mod tests {
             Knob::FuseAbort(super::super::fuse::SessionKey::from_transport(
                 "/runtime/fuse/socket".into(),
             )),
+            Knob::Sysctl("/proc/sys/kernel/kptr_restrict"),
         ];
         for owner in owners {
             let mut w = Writer::default();
