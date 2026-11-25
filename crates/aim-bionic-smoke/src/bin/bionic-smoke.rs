@@ -102,7 +102,9 @@ service client first, then the original servicemanager. Ready has to
 come from that servicemanager's SetProperty.
 --prepare-init stages original /system/bin/init and the libraries it
 needs. --init runs it for at most --init-timeout seconds (default 8)
-and prints the trace.
+and prints the trace. It starts aim-binderd beside linux-run and passes
+--binder. aim-pty-holder has to be beside linux-run as well. A missing
+binary is a harness error.
 init-probe: not a boot is the result. A historical list of mremap,
 SOCK_SEQPACKET, and rt_tgsigqueueinfo is not that observation.
 linux-run probes every round's guest root. That includes

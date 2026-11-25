@@ -9,7 +9,15 @@ syscall layer.
 
 `crates/aim-binder-host` runs one driver for all guest processes in a
 daemon and connects each guest's syscall layer to it (#168). The syscall
-layer exposes the device nodes (#167). With both, the original
+layer exposes the device nodes (#167). Original init mounts binderfs
+(`mount` fstype `binder`, option `stats=global`). `/vendor/bin/binder_alloc`
+issues `BINDER_CTL_ADD` on `binder-control`, which creates `binder`,
+`hwbinder` and `vndbinder` in that mount. A name this driver has no
+context for is `ENODEV`. A name that was not allocated is `ENOENT`.
+Opening an allocated node with no binder host is `ENODEV`. `/dev/binder`,
+`/dev/hwbinder` and `/dev/vndbinder` are those three contexts when
+`--binder` is set, which is how the standalone servicemanager steps open
+them. The init probe starts `aim-binderd` and passes that name. With both, the original
 `servicemanager` of the pinned image serves the original `service` and `cmd`
 clients in other processes.
 

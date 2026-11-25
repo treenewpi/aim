@@ -261,6 +261,9 @@ fn openat_owned(a: [u64; 6], id: &super::cred::Identity) -> i64 {
     if let Some(fd) = super::binder::open(&r.guest, flags) {
         return fd;
     }
+    if let Some(fd) = super::random::open_hwrng(&r.guest, flags) {
+        return fd;
+    }
     if let Some(fd) = super::ashmem::open(&r.guest, flags) {
         return fd;
     }
@@ -1094,9 +1097,13 @@ fn special_read_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> 
         Kind::Sock(_) => net::read_pinned(pin, iov),
         Kind::Dir(_) => Some(-EISDIR),
         // `bpf_dummy_read`; type information has no read.
-        Kind::Epoll(_) | Kind::PidFd(_) | Kind::SyncFile | Kind::Binder(_) | Kind::Bpf => {
-            Some(-(EINVAL as i64))
-        }
+        Kind::Epoll(_)
+        | Kind::PidFd(_)
+        | Kind::SyncFile
+        | Kind::Binder(_)
+        | Kind::BinderControl(_)
+        | Kind::Bpf => Some(-(EINVAL as i64)),
+        Kind::HwRng => Some(super::random::read_hwrng(iov)),
         Kind::TracePipe(_) if iov.iter().all(|v| v.iov_len == 0) => Some(0),
         Kind::Knob(owner) => {
             if let super::knob::Knob::Sysctl(path) = owner.as_ref() {
@@ -1171,7 +1178,10 @@ fn special_write_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64>
         | Kind::PidFd(_)
         | Kind::SyncFile
         | Kind::Binder(_)
+        | Kind::BinderControl(_)
         | Kind::Bpf => Some(-(EINVAL as i64)),
+        // Opened read-only. A write method is not part of this device.
+        Kind::HwRng => Some(-(EBADF as i64)),
         Kind::TracePipe(_) => Some(-(EBADF as i64)),
         Kind::Content => None,
         Kind::Knob(k) => Some(super::knob::write(fd, &k, iov)),
@@ -1233,7 +1243,7 @@ fn special_pio_kernel(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> O
             memfd::rw(fd, buf, len, Some(pos), write)
         }
         Kind::Dir(_) if !write => Some(-EISDIR),
-        Kind::Binder(_) => Some(-(EINVAL as i64)),
+        Kind::Binder(_) | Kind::BinderControl(_) | Kind::HwRng => Some(-(EINVAL as i64)),
         Kind::Content => None,
         Kind::Knob(k) if write => Some(super::knob::write(fd, &k, &one(buf, len))),
         // SAFETY: guest buffer. A sysctl read copies the live value first.
@@ -2277,6 +2287,9 @@ pub(super) fn stat_fd_kernel(fd: i32) -> Result<libc::stat, i64> {
     if super::loopdev::fstat(fd, &mut st) {
         return Ok(st);
     }
+    if let Some(st) = super::binder::fstat(fd).or_else(|| super::random::fstat_hwrng(fd)) {
+        return Ok(st);
+    }
     // SAFETY: stat buffer on our stack.
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
         return Err(-(errno::last() as i64));
@@ -2393,6 +2406,10 @@ pub(super) fn stat_resolved(r: &vfs::Resolved, follow: bool) -> Result<libc::sta
         st.st_nlink = 1;
         st.st_rdev = (10 << 24) | 229;
         st.st_blksize = 4096;
+        return Ok(st);
+    }
+    if let Some(st) = super::binder::stat(&r.guest).or_else(|| super::random::stat_hwrng(&r.guest))
+    {
         return Ok(st);
     }
     if let Some(route) = vfs::fuse_route(&r.guest) {
@@ -2781,6 +2798,7 @@ pub fn faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
             .unwrap_or_else(|error| -(error as i64));
     }
     if super::binder::is_device(&r.guest)
+        || super::random::stat_hwrng(&r.guest).is_some()
         || super::ashmem::stat(&r.guest).is_some()
         || super::dma_heap::stat(&r.guest).is_some()
         || super::loopdev::stat(&r.guest).is_some()

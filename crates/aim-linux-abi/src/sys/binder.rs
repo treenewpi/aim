@@ -271,47 +271,268 @@ impl UserMemory for Guest {
 const O_NONBLOCK: u64 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
 
-/// The device a guest path names: `/dev/binder` and the others, or their
-/// binderfs nodes `/dev/binderfs/<name>`. init mounts binderfs there and
-/// symlinks the former to them; this layer plays that mount.
-fn device(guest_path: &str) -> Option<Device> {
-    match guest_path.strip_prefix("/dev/binderfs/") {
-        Some(name) => Device::from_path(&format!("/dev/{name}")),
-        None => Device::from_path(guest_path),
-    }
+/// `/dev/binder`, `/dev/hwbinder` and `/dev/vndbinder`. A binderfs node is
+/// not one of these: it exists only after `BINDER_CTL_ADD` creates it.
+fn classic(guest_path: &str) -> Option<Device> {
+    Device::from_path(guest_path)
 }
 
 /// Whether `guest_path` is a binder device node that exists.
 pub fn is_device(guest_path: &str) -> bool {
-    CLIENT.lock().unwrap().is_some() && device(guest_path).is_some()
+    if binderfs_node(guest_path).is_some() {
+        return true;
+    }
+    CLIENT.lock().unwrap().is_some() && classic(guest_path).is_some()
 }
 
-/// `openat` of a binder device node; None for any other path.
+/// `openat` of a binder device node; None for any other path. A binderfs
+/// name that was not allocated is not a device, so the ordinary open
+/// reports `ENOENT`.
 pub fn open(guest_path: &str, flags: u64) -> Option<i64> {
-    let device = device(guest_path)?;
+    if let Some(node) = binderfs_node(guest_path) {
+        return Some(match node {
+            BinderfsNode::Control(mount) => open_control(&mount, flags),
+            BinderfsNode::Device(device) => open_device(device, flags),
+        });
+    }
+    let device = classic(guest_path)?;
+    Some(open_device(device, flags))
+}
+
+fn open_device(device: Device, flags: u64) -> i64 {
     let client = CLIENT.lock().unwrap();
     let Some(client) = client.as_ref() else {
-        return Some(-(ENODEV as i64));
+        return -(ENODEV as i64);
     };
     let euid = super::cred::getuid(175) as u32;
-    let file = client.open(
+    match client.open(
         device,
         flags & O_NONBLOCK != 0,
         flags & O_CLOEXEC != 0,
         euid,
         &super::cred::seclabel(),
-    );
-    Some(match file {
+    ) {
         Ok(f) => {
             super::fdtab::insert(f.fd, Kind::Binder(f));
             f.fd as i64
         }
         Err(e) => -(e as i64),
-    })
+    }
+}
+
+/// `struct binderfs_device`: `__u32 major`, `__u32 minor`, `char name[256]`.
+const BINDERFS_DEVICE: usize = 264;
+/// `_IOWR('b', 1, struct binderfs_device)`.
+const BINDER_CTL_ADD: u32 = 0xc108_6201;
+const MISC_MAJOR: u32 = 10;
+
+enum BinderfsNode {
+    Control(String),
+    Device(Device),
+}
+
+/// A file `mount` of type `binder` created, then `BINDER_CTL_ADD` for a
+/// context this driver has. The three contexts are `binder`, `hwbinder`
+/// and `vndbinder`.
+fn binderfs_node(guest: &str) -> Option<BinderfsNode> {
+    let (kind, rest) = crate::vfs::fs_path(guest)?;
+    if kind != "binder" {
+        return None;
+    }
+    let name = rest.strip_prefix('/')?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let (host, _) = crate::vfs::lookup(guest);
+    if !host.is_file() {
+        return None;
+    }
+    if name == "binder-control" {
+        let mount = guest.rsplit_once('/').map(|(dir, _)| dir.to_string())?;
+        return Some(BinderfsNode::Control(mount));
+    }
+    Device::from_path(&format!("/dev/{name}")).map(BinderfsNode::Device)
+}
+
+fn numbers(name: &str) -> (u32, u32) {
+    let minor = match name {
+        "binder-control" => 58,
+        "binder" => 59,
+        "hwbinder" => 60,
+        "vndbinder" => 61,
+        _ => 0,
+    };
+    (MISC_MAJOR, minor)
+}
+
+fn char_stat(name: &str) -> libc::stat {
+    let (major, minor) = numbers(name);
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    st.st_mode = libc::S_IFCHR | 0o666;
+    st.st_nlink = 1;
+    // Darwin's dev_t; `put_stat` turns it into Linux's encoding.
+    st.st_rdev = ((major as libc::dev_t) << 24) | minor as libc::dev_t;
+    st.st_blksize = 4096;
+    st
+}
+
+/// stat of an allocated binderfs node. None when `guest` is not one.
+pub fn stat(guest: &str) -> Option<libc::stat> {
+    let name = match binderfs_node(guest)? {
+        BinderfsNode::Control(_) => "binder-control",
+        BinderfsNode::Device(device) => device.path().rsplit('/').next().unwrap_or("binder"),
+    };
+    Some(char_stat(name))
+}
+
+pub fn fstat(fd: i32) -> Option<libc::stat> {
+    match super::fdtab::get(fd)? {
+        Kind::BinderControl(_) => Some(char_stat("binder-control")),
+        _ => None,
+    }
+}
+
+fn open_control(mount: &str, flags: u64) -> i64 {
+    let mut host = libc::O_RDWR;
+    if flags & O_CLOEXEC != 0 {
+        host |= libc::O_CLOEXEC;
+    }
+    // SAFETY: a host null device, used only as the fd's carrier.
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), host) };
+    if fd < 0 {
+        return -(crate::errno::last() as i64);
+    }
+    super::fdtab::insert(fd, Kind::BinderControl(mount.to_string()));
+    fd as i64
+}
+
+/// `mount` of fstype `binder`. The directory holds `binder-control`.
+/// `stats=global` is the option init passes. An unknown option is `EINVAL`.
+pub(super) fn mount_fs(target: &str, data: &[u8]) -> Result<(), i64> {
+    let text = std::str::from_utf8(data).map_err(|_| -(EINVAL as i64))?;
+    for opt in text.split(',').filter(|opt| !opt.is_empty()) {
+        if opt == "stats=global" || opt == "stats=unset" {
+            continue;
+        }
+        if let Some(max) = opt.strip_prefix("max=") {
+            if max.parse::<u32>().is_err() {
+                return Err(-(EINVAL as i64));
+            }
+            continue;
+        }
+        return Err(-(EINVAL as i64));
+    }
+    let dir = binderfs_dir()?;
+    let control = dir.join("binder-control");
+    std::fs::write(&control, b"").map_err(|_| -(crate::errno::EIO as i64))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o666))
+        .map_err(|_| -(crate::errno::EIO as i64))?;
+    crate::vfs::add_mount(
+        target,
+        dir,
+        crate::vfs::Area::Writable,
+        "binder",
+        "binder",
+    )
+    .map_err(|error| -(error as i64))?;
+    Ok(())
+}
+
+fn binderfs_dir() -> Result<std::path::PathBuf, i64> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let base = crate::vfs::runtime_dir()
+        .map(|runtime| runtime.join("binderfs"))
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "{}.{}",
+        unsafe { libc::getpid() },
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|_| -(crate::errno::EIO as i64))?;
+    Ok(dir)
+}
+
+/// Create `name` in the binderfs mounted at `mount`. The driver has the
+/// three named contexts; another name is `ENODEV`.
+fn allocate(mount: &str, name: &str) -> Result<(u32, u32), i32> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains('/')
+        || name == "."
+        || name == ".."
+        || name == "binder-control"
+    {
+        return Err(EINVAL);
+    }
+    if Device::from_path(&format!("/dev/{name}")).is_none() {
+        return Err(ENODEV);
+    }
+    let guest = format!("{mount}/{name}");
+    let (host, area) = crate::vfs::lookup(&guest);
+    if area == crate::vfs::Area::Image {
+        return Err(crate::errno::EROFS);
+    }
+    if host.is_file() {
+        return Err(crate::errno::EEXIST);
+    }
+    if let Some(parent) = host.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| crate::errno::EIO)?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&host)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                crate::errno::EEXIST
+            } else {
+                crate::errno::EIO
+            }
+        })?;
+    Ok(numbers(name))
+}
+
+fn control_ioctl(mount: &str, cmd: u64, arg: u64) -> i64 {
+    if (cmd >> 8) & 0xff != u64::from(b'b') {
+        return -(crate::errno::ENOTTY as i64);
+    }
+    if cmd as u32 != BINDER_CTL_ADD {
+        return -(EINVAL as i64);
+    }
+    let bytes = match super::user_memory::read_exact(arg, BINDERFS_DEVICE) {
+        Ok(bytes) => bytes,
+        Err(error) => return -(error as i64),
+    };
+    let name_bytes = &bytes[8..];
+    let end = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name_bytes.len());
+    let name = match std::str::from_utf8(&name_bytes[..end]) {
+        Ok(name) => name,
+        Err(_) => return -(EINVAL as i64),
+    };
+    match allocate(mount, name) {
+        Ok((major, minor)) => {
+            let mut out = bytes;
+            out[..4].copy_from_slice(&major.to_le_bytes());
+            out[4..8].copy_from_slice(&minor.to_le_bytes());
+            match super::user_memory::write_exact(arg, &out) {
+                Ok(()) => 0,
+                Err(error) => -(error as i64),
+            }
+        }
+        Err(error) => -(error as i64),
+    }
 }
 
 /// Binder ioctls are `_IOC(dir, 'b', nr, size)`.
 pub fn ioctl(fd: i32, cmd: u64, arg: u64) -> Option<i64> {
+    if let Some(Kind::BinderControl(mount)) = super::fdtab::get(fd) {
+        return Some(control_ioctl(&mount, cmd, arg));
+    }
     if (cmd >> 8) & 0xff != u64::from(b'b') {
         return None;
     }
@@ -892,5 +1113,93 @@ mod close_alias_tests {
         );
         assert_eq!(unsafe { libc::fcntl(own, libc::F_GETFD) }, -1);
         drop(h);
+    }
+}
+
+#[cfg(test)]
+mod binderfs_tests {
+    use std::ffi::CString;
+
+    use super::allocate;
+
+    fn mount_binder(target: &str, options: &str) -> i64 {
+        let target = CString::new(target).unwrap();
+        let fstype = CString::new("binder").unwrap();
+        let data = CString::new(options).unwrap();
+        crate::sys::mount::mount([
+            0,
+            target.as_ptr() as u64,
+            fstype.as_ptr() as u64,
+            0,
+            data.as_ptr() as u64,
+            0,
+        ])
+    }
+
+    #[test]
+    fn binderfs_allocates_only_the_three_contexts() {
+        let (_view, root) = crate::vfs::test_view();
+        std::fs::create_dir_all(root.join("data/binderfs")).unwrap();
+        std::fs::create_dir_all(root.join("data/binderfs-bad")).unwrap();
+        assert_eq!(mount_binder("/data/binderfs-bad", "nope"), -(libc::EINVAL as i64));
+        assert_eq!(mount_binder("/data/binderfs", "stats=global"), 0);
+        let missing = CString::new("/data/binderfs/hwbinder").unwrap();
+        assert_eq!(
+            crate::sys::fs::openat([
+                crate::vfs::LINUX_AT_FDCWD as u64,
+                missing.as_ptr() as u64,
+                2,
+                0,
+                0,
+                0,
+            ]),
+            -(libc::ENOENT as i64)
+        );
+        assert_eq!(allocate("/data/binderfs", "binder").unwrap(), (10, 59));
+        assert_eq!(allocate("/data/binderfs", "hwbinder").unwrap(), (10, 60));
+        assert_eq!(allocate("/data/binderfs", "vndbinder").unwrap(), (10, 61));
+        assert_eq!(
+            allocate("/data/binderfs", "binder"),
+            Err(crate::errno::EEXIST)
+        );
+        assert_eq!(
+            allocate("/data/binderfs", "not-a-context"),
+            Err(crate::errno::ENODEV)
+        );
+        assert_eq!(allocate("/data/binderfs", "a/b"), Err(crate::errno::EINVAL));
+        let st = super::stat("/data/binderfs/binder").unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR);
+        assert_eq!(st.st_rdev as u64 >> 24, 10);
+        assert_eq!(st.st_rdev as u64 & 0xff_ffff, 59);
+        let dev = CString::new("/data/binderfs/binder").unwrap();
+        assert_eq!(
+            crate::sys::fs::openat([
+                crate::vfs::LINUX_AT_FDCWD as u64,
+                dev.as_ptr() as u64,
+                2,
+                0,
+                0,
+                0,
+            ]),
+            -(libc::ENODEV as i64)
+        );
+        let control = CString::new("/data/binderfs/binder-control").unwrap();
+        let fd = crate::sys::fs::openat([
+            crate::vfs::LINUX_AT_FDCWD as u64,
+            control.as_ptr() as u64,
+            2,
+            0,
+            0,
+            0,
+        ]);
+        assert!(fd >= 0, "{fd}");
+        let st = super::fstat(fd as i32).unwrap();
+        assert_eq!(st.st_rdev as u64 & 0xff_ffff, 58);
+        unsafe { libc::close(fd as i32) };
+        let mounted = CString::new("/data/binderfs").unwrap();
+        assert_eq!(
+            crate::sys::mount::umount2([mounted.as_ptr() as u64, 0, 0, 0, 0, 0]),
+            0
+        );
     }
 }

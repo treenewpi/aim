@@ -468,7 +468,9 @@ git checkout cursor/binder-fd-elf-smoke-602d
 git rev-parse HEAD
 cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
 cargo build --locked -p aim-linux-abi --release --bin linux-run
+cargo build --locked -p aim-storage --release --bin aim-pty-holder
 cargo build --locked -p aim-binder-host --release --bin aim-binder-proc
+cargo build --locked -p aim-binder-host --release --bin aim-binderd
 ./target/release/bionic-smoke --prepare
 ./target/release/bionic-smoke --prepare-property
 ./target/release/bionic-smoke --property ./target/release/linux-run
@@ -590,7 +592,16 @@ Commit `88f3d34` on macmini (Darwin 25.5.0) captured the fd 2 abort
 text and exited 6 at call 2384 before `property_info` and before any
 second-stage `mount` (see below).
 
+`linux-run` looks for `aim-pty-holder` beside itself. The init probe
+also starts `aim-binderd` from that directory and passes `--binder`.
+Build both into `target/release` with `linux-run`. A missing binary is
+a harness error before init runs.
+
 ```sh
+cargo build --locked -p aim-linux-abi --release --bin linux-run
+cargo build --locked -p aim-storage --release --bin aim-pty-holder
+cargo build --locked -p aim-binder-host --release --bin aim-binderd
+cargo build --locked -p aim-bionic-smoke --release --bin bionic-smoke
 ./target/release/bionic-smoke --prepare-init
 ./target/release/bionic-smoke --init ./target/release/linux-run >"$PWD/_build/redroid-16-init/harness.stdout" 2>"$PWD/_build/redroid-16-init/harness.stderr"
 ```

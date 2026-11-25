@@ -656,7 +656,10 @@ peripheral mode and no `/sys/class/android_usb`.
 ### Kernel features to emulate
 
 binder, FUSE, `/proc` and `/sys` per the device contract, the netlink subset
-the remaining original daemons use, evdev, and memfd/ashmem. Loop
+the remaining original daemons use, evdev, and memfd/ashmem. Original
+init's `mount` of fstype `binder` is binderfs: `binder-control` and
+`BINDER_CTL_ADD` of `binder`, `hwbinder` and `vndbinder`. Those nodes
+open the binder host named by `linux-run --binder`. Loop
 (`/dev/loop-control` is 10:237, `/dev/loopN` is 7:N) and device-mapper
 (`/dev/device-mapper` is 10:236, `/dev/block/dm-N` is 253:N) record that
 device number at open; `stat` and `fstat` report it, and ioctl follows

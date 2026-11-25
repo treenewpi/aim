@@ -386,6 +386,8 @@ A dry run of the pinned image records 43 values (dry run, 2026-09-27):
 Kernel filesystems init mounts stay unmounted: `/dev/memcg` and
 `/dev/stune` (not in `cgroups.json`), configfs, tracefs, pstore, bpf,
 functionfs and binderfs. Commands on their files are logged as no-ops.
+Original `/system/bin/init` mounts binderfs with the `mount` syscall,
+which creates `binder-control` and serves `BINDER_CTL_ADD`.
 
 The cgroup v1 controllers of `cgroups.json` the layer provides (`blkio`,
 `cpu`, `cpuset`, `aim_storage::cgroup_v1`) are mounted by `SetupCgroups` as

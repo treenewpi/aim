@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1030,7 +1030,22 @@ pub fn run_init(linux_run: &Path, timeout: Duration) -> Result<(), String> {
         .map_err(|e| format!("create {}: {e}", stdout_path.display()))?;
     let stderr_file = File::create(&stderr_path)
         .map_err(|e| format!("create {}: {e}", stderr_path.display()))?;
-    let mut command = launch_command(linux_run, &root, INIT_IDENTITY, None, &[INIT_GUEST]);
+    let holder = linux_run.with_file_name("aim-pty-holder");
+    if !holder.is_file() {
+        return Err(format!(
+            "init-probe: aim-pty-holder is not a file at {} (cargo build --locked -p aim-storage --release --bin aim-pty-holder)",
+            holder.display()
+        ));
+    }
+    let daemon = start_binder(linux_run, &parent)?;
+    println!("init-probe: binder={}", daemon.name);
+    let mut command = launch_command(
+        linux_run,
+        &root,
+        INIT_IDENTITY,
+        Some(&daemon.name),
+        &[INIT_GUEST],
+    );
     command
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
@@ -1085,6 +1100,62 @@ pub fn run_init(linux_run: &Path, timeout: Duration) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+struct BinderDaemon {
+    name: String,
+    child: Child,
+}
+
+impl Drop for BinderDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The binder host the init process and the children it forks share.
+/// `linux-run` is given `--binder` of this daemon. A missing binary is a
+/// harness error: the guest open would be `ENODEV`.
+fn start_binder(linux_run: &Path, parent: &Path) -> Result<BinderDaemon, String> {
+    let binderd = linux_run.with_file_name("aim-binderd");
+    if !binderd.is_file() {
+        return Err(format!(
+            "init-probe: aim-binderd is not a file at {} (cargo build --locked -p aim-binder-host --release --bin aim-binderd)",
+            binderd.display()
+        ));
+    }
+    let name = format!("dev.aim.init.{}", std::process::id());
+    let ready = parent.join("binder-ready");
+    let _ = fs::remove_file(&ready);
+    let mut child = Command::new(&binderd)
+        .arg("--service")
+        .arg(&name)
+        .arg("--ready-file")
+        .arg(&ready)
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("start aim-binderd: {e}"))?;
+    let start = Instant::now();
+    loop {
+        if ready.is_file() {
+            return Ok(BinderDaemon { name, child });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "aim-binderd exited {status} before the binder host was ready"
+                ));
+            }
+            Ok(None) if start.elapsed() >= Duration::from_secs(2) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("aim-binderd did not become ready".into());
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Err(format!("aim-binderd: {error}")),
+        }
+    }
 }
 
 fn wait_child(child: &mut std::process::Child, limit: Duration) -> Option<i32> {

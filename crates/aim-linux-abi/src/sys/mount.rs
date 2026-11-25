@@ -254,6 +254,15 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
                 .map_err(|error| -(error as i64))?;
             Ok(())
         }
+        b"binder" => {
+            let data = if a[4] == 0 {
+                Vec::new()
+            } else {
+                super::user_memory::read_cstr(a[4], 4096).map_err(|error| -(error as i64))?
+            };
+            super::binder::mount_fs(&target.guest, &data)?;
+            Ok(())
+        }
         b"ext4" => {
             let source = super::guest_cstr(a[0]).map_err(|error| -(error as i64))?;
             let source = std::str::from_utf8(&source).map_err(|_| -(EINVAL as i64))?;

@@ -329,33 +329,34 @@ plus a bind) and exited 0: `Activated 4 packages`. `LOOP_CTL_ADD` was
 `EEXIST` eight times then 31 successes, `LOOP_CTL_GET_FREE` returned
 0..3, `LOOP_CONFIGURE` succeeded, and `DM_DEV_CREATE` / `DM_TABLE_LOAD`
 succeeded 35 times. Init then rebooted after 1.8s with
-`reboot,boringssl-self-check-failed`. The first failure was
-`clone(0x1200011)` = `ENOENT` at calls 8347 (`prng_seeder`) and 8365
-(`boringssl_self_test64_vendor`). Those are the first forks after the
-APEX mounts; the same clone had succeeded for vendor_init, ueventd and
-apexd. That `-2` is the parent's `clone` result, produced before the
-child runs a guest instruction: the handover returns the pid, and the
-child's `execve` of `boringssl_self_test64` is a later syscall in the
-child. A parent `ENOENT` from `aim-pty-holder` or from Darwin
-`posix_spawn` opening `.` is traced and is not returned as a guest
-path error. `/dev/ptmx` returns `ENODEV` when the helper binary is
-missing. The guest pty (`posix_openpt`, `TIOCGPTN`, `TIOCSPTLCK`,
-`/dev/pts/N`) is that helper. A fork without `CLONE_NEWNS` reloads the
-mount-namespace journal, so an apexd ext4 or bind in that namespace is
-the child's view; `setns` switches the journal and `unshare(CLONE_NEWNS)`
-copies it. The child's `execve` line names the program and, when the
-ELF has one, the interpreter (`/apex/com.android.runtime/bin/linker64`).
-Syscall trace lines carry `nr`, and an `ENOENT` or `EPERM` path lookup
-names the guest path. `LOOP_CONFIGURE` of a backing fd that is not
-open in the process is
-`EBADF`, including the first try on loop0 before that thread had opened
-the apex file; `CLONE_FILES` threads share the one table. `DM_DEV_STATUS`
-in init and ueventd is `ENXIO` because those processes did not see
-apexd's devices; the records are now in the runtime catalog, `LOOP_CTL_ADD`
-creates `/dev/loopN` and `/dev/block/loopN`, and `/sys/dev/block/M:N`
-names loop, dm and the image volume (`1:24` on that Mac is the volume's
-`st_dev`). The kobject uevent stays in the process that created the
-device. This fix is not Mac-remeasured. The pinned layer has 35
+`reboot,boringssl-self-check-failed`. The first failure in that archive
+was `clone(0x1200011)` = `ENOENT`.
+`391705d3076d482207f7d9bad26eefed40f0f451` (archive SHA256
+`4f0bf95ac8cf4da4178afbd5158e68864475766d4039c27ce5c0f4734e427184`)
+remeasured it. Every step exited 0. 43 forks, no `clone` `-2`, and both
+boringssl self-tests exited 0. Init reached post-fs, then vold aborted
+(`hw-ProcessState: Binder driver could not be opened`, `/dev/hwbinder`
+`-19` `ENODEV`) and init rebooted `reboot,vold-failed` at 5.0s. The
+init probe had not been given a binder host, so `/dev/binder`,
+`/dev/hwbinder`, `/dev/vndbinder` and `/dev/binderfs/{binder,hwbinder,vndbinder}`
+were `ENODEV`. `mount` of fstype `binder` was `ENODEV`, so
+`binder_alloc`'s `/dev/binderfs/binder-control` was `ENOENT`. The probe
+now starts `aim-binderd` beside `linux-run` and passes `--binder`. A
+`binder` mount creates `binder-control`, and `BINDER_CTL_ADD` of
+`binder`, `hwbinder` or `vndbinder` creates that context's node. Another
+name is `ENODEV`. A node that was not allocated stays `ENOENT`. Opening
+an allocated node with no binder host stays `ENODEV`. `/dev/binder`,
+`/dev/hwbinder` and `/dev/vndbinder` stay the same driver when a host
+is connected, which is how the standalone servicemanager steps open
+them. `aim-pty-holder` was not in `target/release`. `/dev/ptmx` is that
+helper (`posix_openpt`, `TIOCGPTN`, `TIOCSPTLCK`, `/dev/pts/N`); a
+missing helper is `ENODEV`. The early `mknod` of `/dev/ptmx` is `EPERM`
+because a device node is not created on the host. The open does not use
+that node: `/dev/ptmx` is the host device path. `/dev/hw_random` reads
+`getentropy`. logd's exit 127 is unchanged. `LOOP_CONFIGURE` of a
+backing fd that is not open in the process is `EBADF`. `DM_DEV_STATUS`
+of a device the catalog does not have is `ENXIO`. This fix is not
+Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

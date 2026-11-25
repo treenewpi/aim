@@ -75,6 +75,10 @@ pub enum Kind {
     /// A loop or device-mapper open. The major and minor were resolved
     /// from the path at open; ioctl and stat use those numbers.
     Dev(Arc<super::loopdev::OpenDev>),
+    /// binderfs `binder-control`. The string is the mount's guest path.
+    BinderControl(String),
+    /// `/dev/hw_random`: reads are `getentropy` of the host.
+    HwRng,
 }
 
 pub(super) struct PathProof(std::os::fd::OwnedFd);
@@ -1470,6 +1474,8 @@ pub fn anon_name(fd: i32) -> Option<String> {
             | Kind::Kmsg(_)
             | Kind::Cgroup(_)
             | Kind::Binder(_)
+            | Kind::BinderControl(_)
+            | Kind::HwRng
             | Kind::Dev(_) => {
                 return None;
             }
@@ -2126,7 +2132,9 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             | Kind::Bpf
             | Kind::ProxyFile
             | Kind::ProcMem(_)
-            | Kind::Path(_) => std::ptr::null(),
+            | Kind::Path(_)
+            | Kind::BinderControl(_)
+            | Kind::HwRng => std::ptr::null(),
             // A mount file's cursor and a namespace fd are the open file,
             // shared by dup. A plain content file is that description too:
             // the inherited host fd keeps the offset.
@@ -2275,6 +2283,11 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 w.u32(dev.minor);
                 w.u64(*dev.pos.lock().unwrap_or_else(|e| e.into_inner()));
             }
+            Kind::BinderControl(mount) => {
+                w.u32(27);
+                w.str(mount);
+            }
+            Kind::HwRng => w.u32(28),
             Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
         }
     });
@@ -2444,6 +2457,8 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 let pos = r.u64();
                 Kind::Dev(super::loopdev::restore_open(fd, major, minor, pos))
             }
+            27 => Kind::BinderControl(r.str()),
+            28 => Kind::HwRng,
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
