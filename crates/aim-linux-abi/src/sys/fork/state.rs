@@ -252,11 +252,139 @@ pub fn save_process(w: &mut Writer) {
     selinuxfs::fork_save(w);
 }
 
+fn save_area(w: &mut Writer, area: crate::vfs::Area) {
+    w.u64(match area {
+        crate::vfs::Area::Image => 0,
+        crate::vfs::Area::Writable => 1,
+        crate::vfs::Area::Kernfs => 2,
+        crate::vfs::Area::HostDevice => 3,
+        crate::vfs::Area::Input => 4,
+    });
+}
+
+fn load_area(r: &mut Reader) -> crate::vfs::Area {
+    match r.u64() {
+        0 => crate::vfs::Area::Image,
+        1 => crate::vfs::Area::Writable,
+        2 => crate::vfs::Area::Kernfs,
+        3 => crate::vfs::Area::HostDevice,
+        4 => crate::vfs::Area::Input,
+        _ => {
+            r.invalidate();
+            crate::vfs::Area::Image
+        }
+    }
+}
+
+fn save_fork_mount(w: &mut Writer, mount: &crate::vfs::ForkMount) {
+    w.str(&mount.guest);
+    w.path(&mount.host);
+    save_area(w, mount.area);
+    w.opt(mount.source.as_deref(), |w, source| w.str(source));
+    w.opt(mount.fstype.as_deref(), |w, fstype| w.str(fstype));
+    w.bool(mount.own);
+    w.u64(mount.seq);
+    w.bool(mount.shared_fuse);
+    w.bool(mount.projected_fuse);
+    w.opt(mount.bind_source.as_deref(), |w, source| w.str(source));
+    w.opt(mount.fuse.as_ref(), |w, route| {
+        w.path(&route.session);
+        w.str(&route.relative);
+        w.u64(route.uid as u64);
+        w.u64(route.gid as u64);
+        w.bool(route.allow_other);
+        w.bool(route.default_permissions);
+        w.bool(route.read_only);
+    });
+}
+
+fn load_fork_mount(r: &mut Reader) -> crate::vfs::ForkMount {
+    crate::vfs::ForkMount {
+        guest: r.str(),
+        host: r.path(),
+        area: load_area(r),
+        source: r.opt(|r| r.str()),
+        fstype: r.opt(|r| r.str()),
+        own: r.bool(),
+        seq: r.u64(),
+        shared_fuse: r.bool(),
+        projected_fuse: r.bool(),
+        bind_source: r.opt(|r| r.str()),
+        fuse: r.opt(|r| crate::vfs::FuseRoute {
+            session: r.path(),
+            relative: r.str(),
+            uid: r.u64() as u32,
+            gid: r.u64() as u32,
+            allow_other: r.bool(),
+            default_permissions: r.bool(),
+            read_only: r.bool(),
+        }),
+    }
+}
+
+/// Namespaces and the fds that name them. A guest fork is a new process, so
+/// the child's `MOUNT_NS_FDS` starts empty unless this image rebinds them.
+fn save_fork_namespaces(w: &mut Writer, new_namespace: bool) {
+    let image = crate::vfs::capture_fork_namespaces(new_namespace);
+    w.bool(image.new_namespace);
+    w.u64(image.current);
+    w.seq(image.namespaces.into_iter(), |w, ns| {
+        w.u64(ns.ino);
+        w.u64(ns.event);
+        w.opt(ns.journal_id, |w, id| w.str(&id));
+        w.bool(ns.private_mounts);
+        w.seq(ns.propagation.into_iter(), |w, (root, code)| {
+            w.str(&root);
+            w.u64(code as u64);
+        });
+        w.seq(ns.mounts.into_iter(), |w, mount| save_fork_mount(w, &mount));
+    });
+    w.seq(procfs::mount_namespace_fds().into_iter(), |w, (fd, ino)| {
+        w.i32(fd);
+        w.u64(ino);
+    });
+}
+
+fn restore_fork_namespaces(r: &mut Reader) -> bool {
+    let new_namespace = r.bool();
+    let current = r.u64();
+    let namespaces = r.seq(|r| crate::vfs::ForkNamespace {
+        ino: r.u64(),
+        event: r.u64(),
+        journal_id: r.opt(|r| r.str()),
+        private_mounts: r.bool(),
+        propagation: r.seq(|r| (r.str(), r.u64() as u8)),
+        mounts: r.seq(load_fork_mount),
+    });
+    let fds = r.seq(|r| (r.i32(), r.u64()));
+    if !r.intact() {
+        return false;
+    }
+    let image = crate::vfs::ForkNamespaces {
+        new_namespace,
+        current,
+        namespaces,
+    };
+    if !crate::vfs::install_fork_namespaces(&image) {
+        eprintln!("fork mount namespace image did not install");
+        return false;
+    }
+    for (fd, ino) in fds {
+        let Some(ns) = crate::vfs::mount_namespace(ino) else {
+            eprintln!("fork mount namespace fd {fd} names missing inode {ino}");
+            return false;
+        };
+        procfs::bind_mount_namespace(fd, ns);
+    }
+    true
+}
+
 /// The descriptors and what goes with them, which the child inherits when
 /// it is spawned: saved with the fd table, before the spawn; it follows
 /// [`save_process`] in the blob.
-pub fn save_files(w: &mut Writer, mounts: &str) {
+pub fn save_files(w: &mut Writer, mounts: &str, new_mount_namespace: bool) {
     w.str(mounts);
+    save_fork_namespaces(w, new_mount_namespace);
     fdtab::fork_save(w);
     ptrace::fork_save(w);
     sync_file::fork_save(w);
@@ -313,6 +441,10 @@ pub fn restore(r: &mut Reader) -> bool {
     r.stage("mount-namespace");
     if let Err(error) = crate::vfs::load_own_mounts(&r.str()) {
         eprintln!("fork mount namespace restore failed: errno={error}");
+        return false;
+    }
+    r.stage("mount-namespace-image");
+    if !restore_fork_namespaces(r) {
         return false;
     }
     r.stage("fdtab");

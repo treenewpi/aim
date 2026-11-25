@@ -728,7 +728,7 @@ pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Resu
     let writer_receipts = fdtab::fork_writer_receipts().map_err(|error| -(error as i64))?;
     let (fds, guest_receipts) = fdtab::fork_guest_snapshot().map_err(|error| -(error as i64))?;
     super::super::procfs::fork_prepare();
-    state::save_files(&mut w, &mount_text);
+    state::save_files(&mut w, &mount_text, setup.new_mount_namespace);
     let diag = crate::diag::log_fd();
     if !fds.iter().any(|(fd, ..)| *fd == diag) {
         w.retain_private(diag);

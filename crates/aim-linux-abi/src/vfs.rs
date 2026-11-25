@@ -1155,6 +1155,288 @@ pub(crate) fn switch_mount_namespace(target: &Arc<MountNs>) -> Result<(), Errno>
     Ok(())
 }
 
+/// One mount, as a forked child reconstructs it. `origin` stays unset: the
+/// child keeps this snapshot and pins the journal generation so a refresh
+/// does not replay over it.
+#[derive(Clone)]
+pub(crate) struct ForkMount {
+    pub guest: String,
+    pub host: PathBuf,
+    pub area: Area,
+    pub source: Option<String>,
+    pub fstype: Option<String>,
+    pub own: bool,
+    pub seq: u64,
+    pub shared_fuse: bool,
+    pub projected_fuse: bool,
+    pub bind_source: Option<String>,
+    pub fuse: Option<FuseRoute>,
+}
+
+/// A mount namespace the child must be able to name. The parent's current
+/// namespace is included so a `CLONE_NEWNS` child can still `setns` back to
+/// it through an inherited fd.
+#[derive(Clone)]
+pub(crate) struct ForkNamespace {
+    pub ino: u64,
+    pub event: u64,
+    pub journal_id: Option<String>,
+    pub private_mounts: bool,
+    pub propagation: Vec<(String, u8)>,
+    pub mounts: Vec<ForkMount>,
+}
+
+/// Namespaces and the parent's current inode, captured while the parent
+/// still holds them. `new_namespace` is the child's `CLONE_NEWNS`.
+pub(crate) struct ForkNamespaces {
+    pub new_namespace: bool,
+    pub current: u64,
+    pub namespaces: Vec<ForkNamespace>,
+}
+
+fn propagation_code(kind: Propagation) -> u8 {
+    match kind {
+        Propagation::Private => 0,
+        Propagation::Slave => 1,
+        Propagation::Shared => 2,
+    }
+}
+
+fn propagation_kind(code: u8) -> Option<Propagation> {
+    match code {
+        0 => Some(Propagation::Private),
+        1 => Some(Propagation::Slave),
+        2 => Some(Propagation::Shared),
+        _ => None,
+    }
+}
+
+fn snapshot_mount(mount: &Mount) -> ForkMount {
+    ForkMount {
+        guest: mount.guest.clone(),
+        host: mount.host.clone(),
+        area: mount.area,
+        source: mount.source.clone(),
+        fstype: mount.fstype.clone(),
+        own: mount.own,
+        seq: mount.seq,
+        shared_fuse: mount.shared_fuse,
+        projected_fuse: mount.projected_fuse,
+        bind_source: mount.bind_source.clone(),
+        fuse: mount.fuse.clone(),
+    }
+}
+
+fn restore_mount(saved: &ForkMount) -> Mount {
+    Mount {
+        guest: saved.guest.clone(),
+        host: saved.host.clone(),
+        area: saved.area,
+        source: saved.source.clone(),
+        fstype: saved.fstype.clone(),
+        own: saved.own,
+        seq: saved.seq,
+        shared_fuse: saved.shared_fuse,
+        projected_fuse: saved.projected_fuse,
+        bind_source: saved.bind_source.clone(),
+        fuse: saved.fuse.clone(),
+        origin: None,
+    }
+}
+
+/// The namespaces this process holds, including the current one. A guest
+/// fork is a new host process (`docs/fork.md`), so the child cannot see
+/// these `Arc`s unless the image carries them.
+pub(crate) fn capture_fork_namespaces(new_namespace: bool) -> ForkNamespaces {
+    let current = current_mount_namespace().ino;
+    let held: Vec<Arc<MountNs>> = NAMESPACES.lock().unwrap().values().cloned().collect();
+    let mut namespaces = Vec::with_capacity(held.len());
+    for ns in held {
+        let parked = ns.parked.lock().unwrap();
+        let (private_mounts, rules) = if JOURNAL_OWNER.load(Ordering::Relaxed) == ns.ino {
+            (
+                PRIVATE_MOUNTS.load(Ordering::Relaxed),
+                PROPAGATION_RULES.lock().unwrap().clone(),
+            )
+        } else if let Some(parked) = parked.as_ref() {
+            (parked.private_mounts, parked.propagation.clone())
+        } else {
+            (false, Vec::new())
+        };
+        let table = ns.table.read().unwrap();
+        namespaces.push(ForkNamespace {
+            ino: ns.ino,
+            event: ns.event.load(Ordering::Relaxed),
+            journal_id: ns.journal_id.lock().unwrap().clone(),
+            private_mounts,
+            propagation: rules
+                .into_iter()
+                .map(|(root, kind)| (root, propagation_code(kind)))
+                .collect(),
+            mounts: table.mounts.iter().map(snapshot_mount).collect(),
+        });
+    }
+    ForkNamespaces {
+        new_namespace,
+        current,
+        namespaces,
+    }
+}
+
+fn claim_inode(ino: u64) {
+    let mut next = NEXT_NS_INO.load(Ordering::Relaxed);
+    while next <= ino {
+        match NEXT_NS_INO.compare_exchange_weak(
+            next,
+            ino + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => next = actual,
+        }
+    }
+}
+
+/// Replace the calling task's namespace with the same table under `ino`.
+/// `MountNs::ino` is fixed at construction.
+fn retarget_namespace(old: Arc<MountNs>, ino: u64) {
+    claim_inode(ino);
+    if old.ino == ino {
+        return;
+    }
+    let table = duplicate_table(&old.table.read().unwrap());
+    let ns = Arc::new(MountNs {
+        ino,
+        table: RwLock::new(table),
+        event: AtomicU64::new(old.event.load(Ordering::Relaxed)),
+        parked: Mutex::new(old.parked.lock().unwrap().take()),
+        journal_id: Mutex::new(old.journal_id.lock().unwrap().clone()),
+    });
+    {
+        let mut map = NAMESPACES.lock().unwrap();
+        map.remove(&old.ino);
+        map.insert(ino, Arc::clone(&ns));
+    }
+    if BOOT_NS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|boot| boot.ino == old.ino)
+    {
+        *BOOT_NS.lock().unwrap() = Some(Arc::clone(&ns));
+    }
+    set_current_ns(ns);
+}
+
+fn park_saved(saved: &ForkNamespace) -> Option<ParkedJournal> {
+    let propagation = saved
+        .propagation
+        .iter()
+        .filter_map(|(root, code)| Some((root.clone(), propagation_kind(*code)?)))
+        .collect();
+    let id = saved.journal_id.as_deref()?;
+    let runtime = runtime_dir()?;
+    let owner = aim_storage::mount_namespace::Namespace::open(runtime, id).ok()?;
+    let generation = owner.generation().ok()?.current();
+    Some(ParkedJournal {
+        propagation,
+        private_mounts: saved.private_mounts,
+        view: Some(ParkedView {
+            owner,
+            records: Arc::new(Vec::new()),
+            generation,
+        }),
+    })
+}
+
+fn materialize_namespace(saved: &ForkNamespace) -> bool {
+    if NAMESPACES.lock().unwrap().contains_key(&saved.ino) {
+        claim_inode(saved.ino);
+        return true;
+    }
+    if saved
+        .propagation
+        .iter()
+        .any(|(_, code)| propagation_kind(*code).is_none())
+    {
+        return false;
+    }
+    let mounts: Vec<Mount> = saved.mounts.iter().map(restore_mount).collect();
+    let poll_stamp = mount_stamp(&mounts);
+    let ns = Arc::new(MountNs {
+        ino: saved.ino,
+        table: RwLock::new(Table {
+            mounts,
+            visible: OnceLock::new(),
+            generation: 0,
+            poll_stamp,
+        }),
+        event: AtomicU64::new(saved.event),
+        parked: Mutex::new(park_saved(saved)),
+        journal_id: Mutex::new(saved.journal_id.clone()),
+    });
+    NAMESPACES.lock().unwrap().insert(saved.ino, ns);
+    claim_inode(saved.ino);
+    true
+}
+
+/// Install captured namespaces into this process and give the calling task
+/// its own `fs_struct` (`users == 1`). Fork without `CLONE_FS` does that;
+/// the image never copies the parent's user count or its other threads.
+///
+/// Without `CLONE_NEWNS` the child's current namespace keeps the parent's
+/// current inode (the table `load_own_mounts` already filled). With
+/// `CLONE_NEWNS` that inode stays a separate namespace the inherited fds
+/// can still name, and the child's own namespace takes an inode that does
+/// not collide with any of them.
+pub(crate) fn install_fork_namespaces(image: &ForkNamespaces) -> bool {
+    let cwd = current_task().fs.cwd.lock().unwrap().clone();
+    let private = TaskState {
+        fs: Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        }),
+        ns: current_mount_namespace(),
+    };
+    store_task(private);
+    if image.new_namespace {
+        let boot = current_mount_namespace();
+        if image.namespaces.iter().any(|ns| ns.ino == boot.ino) {
+            let fresh = image
+                .namespaces
+                .iter()
+                .map(|ns| ns.ino)
+                .max()
+                .unwrap_or(boot.ino)
+                + 1;
+            retarget_namespace(boot, fresh);
+        }
+        for ns in &image.namespaces {
+            if !materialize_namespace(ns) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let boot = current_mount_namespace();
+    if boot.ino != image.current {
+        retarget_namespace(boot, image.current);
+    } else {
+        claim_inode(image.current);
+    }
+    for ns in &image.namespaces {
+        if ns.ino == image.current {
+            claim_inode(ns.ino);
+            continue;
+        }
+        if !materialize_namespace(ns) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 pub(crate) struct FsShare {
     fs: Arc<SharedFs>,
@@ -1196,6 +1478,18 @@ pub(crate) fn testing_share_fs() -> FsShare {
         ns: Arc::clone(&task.ns),
     }
 }
+
+/// Drop every namespace except the caller's, as a new process would before
+/// `install_fork_namespaces` rebuilds the ones an inherited fd names.
+#[cfg(test)]
+pub(crate) fn testing_forget_other_namespaces() {
+    let current = current_mount_namespace().ino;
+    NAMESPACES
+        .lock()
+        .unwrap()
+        .retain(|ino, _| *ino == current);
+}
+
 fn namespace_event(event: &str) -> Result<(), Errno> {
     let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {

@@ -2120,10 +2120,15 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             | Kind::Path(_) => std::ptr::null(),
             // A mount file's cursor is the open file, shared by dup. Another
             // content file stays the parent's.
-            Kind::Content => match super::procfs::mount_poll_ptr(*fd) {
-                Some(ptr) => ptr,
-                None => continue,
-            },
+            Kind::Content => {
+                if let Some(ptr) = super::procfs::mount_poll_ptr(*fd) {
+                    ptr
+                } else if let Some(ns) = super::procfs::mount_namespace_of(*fd) {
+                    Arc::as_ptr(&ns) as *const ()
+                } else {
+                    continue;
+                }
+            }
             Kind::Evdev(_) | Kind::Binder(_) => continue,
         };
         let (i, new) = match objects.iter().position(|&o| !p.is_null() && o == p) {
@@ -2239,8 +2244,13 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 pidfd.save(w);
             }
             Kind::Content => {
-                w.u32(23);
-                super::procfs::save_mount_poll(fd, w);
+                if super::procfs::mount_poll_ptr(fd).is_some() {
+                    w.u32(23);
+                    super::procfs::save_mount_poll(fd, w);
+                } else if let Some(ns) = super::procfs::mount_namespace_of(fd) {
+                    w.u32(24);
+                    w.u64(crate::vfs::mount_namespace_ino(&ns));
+                }
             }
             Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
         }
@@ -2259,7 +2269,9 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
 pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
     let mut objects: Vec<Kind> = Vec::new();
     let mut mount_files: Vec<Option<Arc<super::procfs::MountPoll>>> = Vec::new();
+    let mut ns_files: Vec<Option<Arc<crate::vfs::MountNs>>> = Vec::new();
     let mut pending_mount = None;
+    let mut pending_ns = None;
     let mut inherited_writers = Vec::new();
     let entries = r.seq(|r| {
         let fd = r.i32();
@@ -2268,9 +2280,13 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
             if let Some(Some(poll)) = mount_files.get(i) {
                 super::procfs::install_mount_poll(fd, Arc::clone(poll));
             }
+            if let Some(Some(ns)) = ns_files.get(i) {
+                super::procfs::bind_mount_namespace(fd, Arc::clone(ns));
+            }
             return (fd, objects.get(i).cloned());
         }
         pending_mount = None;
+        pending_ns = None;
         let k = match r.u32() {
             0 => Kind::Event(event::load_event(r)),
             1 => Kind::Timer(event::load_timer(r)),
@@ -2381,10 +2397,22 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 pending_mount = Some(poll);
                 Kind::Content
             }
+            24 => {
+                let ino = r.u64();
+                let Some(ns) = crate::vfs::mount_namespace(ino) else {
+                    eprintln!("fork namespace fd {fd} names missing inode {ino}");
+                    r.invalidate();
+                    return (fd, None);
+                };
+                super::procfs::bind_mount_namespace(fd, Arc::clone(&ns));
+                pending_ns = Some(ns);
+                Kind::Content
+            }
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
         mount_files.push(pending_mount.take());
+        ns_files.push(pending_ns.take());
         (fd, Some(k))
     });
     for (fd, k) in entries {

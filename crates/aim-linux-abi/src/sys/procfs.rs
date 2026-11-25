@@ -1836,6 +1836,26 @@ pub(super) fn mount_namespace_of(fd: i32) -> Option<Arc<vfs::MountNs>> {
     MOUNT_NS_FDS.lock().unwrap().get(&fd).cloned()
 }
 
+/// Inherited namespace fds. The host descriptor arrives by `dup2`; this is
+/// the namespace it named in the parent.
+pub(super) fn mount_namespace_fds() -> Vec<(i32, u64)> {
+    MOUNT_NS_FDS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(fd, ns)| (*fd, vfs::mount_namespace_ino(ns)))
+        .collect()
+}
+
+pub(super) fn bind_mount_namespace(fd: i32, ns: Arc<vfs::MountNs>) {
+    MOUNT_NS_FDS.lock().unwrap().insert(fd, ns);
+}
+
+#[cfg(test)]
+pub(super) fn testing_clear_namespace_fds() {
+    MOUNT_NS_FDS.lock().unwrap().clear();
+}
+
 fn open_mount_namespace(ino: u64, cloexec: bool) -> i64 {
     let Some(ns) = vfs::mount_namespace(ino) else {
         return -(ENOENT as i64);
@@ -3784,6 +3804,99 @@ mod tests {
             0
         );
         assert_eq!(crate::sys::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    /// vendor_init's fork is a new process. The inherited default-namespace
+    /// fd is unbound until the image reinstalls it, which is the `EINVAL`
+    /// from `mount_namespace_of`. Fork without `CLONE_FS` leaves `users == 1`
+    /// even when the parent still has a shared `fs_struct`, and the child's
+    /// `/proc/self/ns/mnt` stays the parent's current (bootstrap) inode.
+    #[test]
+    fn fork_child_rebinds_inherited_namespace_and_keeps_a_private_fs() {
+        let (_view, root) = crate::vfs::test_view();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        let host = root.join("ns-default");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-default",
+            &host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        let host = root.join("ns-boot");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-boot",
+            &host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        let share = crate::vfs::testing_share_fs();
+        assert!(crate::vfs::fs_is_shared());
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        assert!(!crate::vfs::fs_is_shared());
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), default_link);
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-default "));
+        assert!(!text.contains(" /mnt/ns-boot "));
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(mounts_text().contains(" /mnt/ns-boot "));
+        drop(share);
+        let _ = crate::vfs::remove_mount("/mnt/ns-boot");
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-default");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(root.join("ns-default"));
+        let _ = std::fs::remove_dir(root.join("ns-boot"));
     }
 
     /// Init's sequence with the property-service thread still alive:

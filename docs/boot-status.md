@@ -5,7 +5,7 @@ aim-guest-init on the syscall layer (ADR 0012, tracking #153). Update it
 with every boot-relevant change: the table, the date and the run it came
 from.
 
-Original `/system/bin/init` on macmini (commit `405572b`, macOS 26.5.1,
+Original `/system/bin/init` on macmini (commit `9eacf04`, macOS 26.5.1,
 Darwin 25.5.0, arm64, 16 KiB pages) printed both stage logs to `[kmsg]`.
 Guest init created the property sockets and exited 6. This is not a boot
 and there is no `init ok`. The first failed syscall, which the process
@@ -16,22 +16,34 @@ a new `Kind::Path` distinct from the bind socket. `fchmod` on that fd
 returned `-EBADF`, `F_GETFL` returned `0x208000`, and the proc-fd
 `fchmodat` fallback returned 0. `listen` on the bind socket returned 0.
 `openat("/proc/mounts")` returned a fd and `epoll_ctl` ADD of it returned
-0 (call 6100). No epoll wait on that fd ran before exit. Init's property
-service (tid 100001) was blocked in `epoll_pwait` on epfd 14.
-`SetupMountNamespaces` then stopped that run: `openat("/proc/self/ns/mnt")`
-returned fd 13 (call 6143), `readlinkat` returned 15 (call 6144; the
-bytes were not traced), `unshare(CLONE_NEWNS)` returned 0 (call 6146),
-the second `openat` returned fd 15 (call 6147), `readlinkat` returned 15
-(call 6148), and `setns(13, CLONE_NEWNS)` returned `-EINVAL` (call 6149).
-kmsg: `Cannot switch back to bootstrap mount namespace: Invalid argument`,
-then `SetupMountNamespaces failed: Invalid argument`, then abort and
-`exit_group(6)`. That `EINVAL` was the "more than one guest thread" check.
-Linux `mntns_install` returns `EINVAL` only when `current->fs->users != 1`,
-and `unshare(CLONE_NEWNS)` implies `CLONE_FS`, so the caller can switch
-back while the other thread stays in the namespace it already had. `setns`
-now follows that rule. The fd opened before `unshare` stays the namespace
-it named at open, and `readlink` of that fd keeps that inode. This path
-is not measured on macmini. `write` of fd 3 for 61 bytes returned 61
+0. On `9eacf04` that ADD is call 6091. `epoll_pwait` on epfd 4 (call 6228,
+timeout 0) then returned fd 12 with mask `0xa` after the mounts at calls
+6118-6141. Init's property service (tid 100001) stayed alive beside the
+leader (tid 100000).
+`SetupMountNamespaces` completed on `9eacf04`: `openat("/proc/self/ns/mnt")`
+returned fd 13 (call 6134), `readlinkat` returned `mnt:[268435457]` (call
+6135), `unshare(CLONE_NEWNS)` returned 0 (call 6137), the second `openat`
+returned fd 15 (call 6138), `readlinkat` returned `mnt:[268435458]` (call
+6139), and `setns(13, CLONE_NEWNS)` returned 0 (call 6140). kmsg:
+`SetupMountNamespaces done`. Linux `mntns_install` returns `EINVAL` only
+when `current->fs->users != 1`, and `unshare(CLONE_NEWNS)` implies
+`CLONE_FS`, so the caller can switch back while the other thread stays in
+the namespace it already had. The fd opened before `unshare` stays the
+namespace it named at open, and `readlink` of that fd keeps that inode.
+vendor_init (host pid 47019, restarted as 47020) then forked and its
+`setns(15, CLONE_NEWNS)` returned `-EINVAL` (child call 7). The child's
+`readlink` of `/proc/self/ns/mnt` was `mnt:[268435457]` (child call 6),
+the bootstrap namespace the parent had switched back to. kmsg:
+`Could not switch to "default" mount namespace`, then abort and
+`exit_group(6)`. That `EINVAL` is `mount_namespace_of` returning none
+(`sys/mount.rs`): the host fd was inherited, and the child's namespace
+table was empty. It is not a leftover thread count and not `fs->users`.
+Fork without `CLONE_FS` already gives the child its own `fs_struct` with
+`users == 1`. The fork image now carries each namespace and rebinds the
+inherited fds. That child path is not measured on macmini. The same run's
+next stop is `openat("/proc/sys/kernel/kptr_restrict")` returning ENOENT
+(call 6284) and `Unable to set adequate kptr_restrict value!`. `write` of
+fd 3 for 61 bytes returned 61
 on the earlier `11bbedf` run; the raw guest buffer was not captured, and
 the 2200-byte diagnostic marker does not contain that text. Property,
 integrated 2/2, and independent android/libbinder passed on `11bbedf`;
@@ -49,9 +61,10 @@ and the ctl is consumed, and `EPOLLIN` is current state (once for
 copies that cursor and the namespace generation. exec keeps a
 non-`CLOEXEC` mount fd's cursor. A blocking wait whose wake pipe cannot
 be created returns that errno and does not invent an edge. Another
-regular file stays `EPERM`. The `405572b` macmini run measured ADD
-returning 0 (call 6100) and then the `setns` `EINVAL` above. The insert,
-fork, and wake behavior is not measured on macmini.
+regular file stays `EPERM`. The `9eacf04` macmini run measured ADD
+returning 0 (call 6091) and a later `epoll_pwait` reporting mask `0xa`
+(call 6228). The insert, fork, and wake behavior is not measured beyond
+that one wait.
 
 The rebuilt libart compiles ART's original `metrics/statsd.cc` and the Android
 `libodrstatslog` with `statslog_art`/`statslog_odrefresh`, generated by the
@@ -153,19 +166,23 @@ still report a map file's host readiness.
 polls the file, so a change already pending is consumed there. fork and
 exec keep the cursor with the generation. A blocking wait without a wake
 pipe returns the pipe errno. Another regular file stays EPERM. The
-`405572b` macmini run measured ADD returning 0 (call 6100); the insert,
-fork, and wake behavior is not measured on macmini. `/proc/self/ns/mnt`
+`9eacf04` macmini run measured ADD returning 0 (call 6091) and one
+`epoll_pwait` of mask `0xa` (call 6228). `/proc/self/ns/mnt`
 is the thread-group leader's mount namespace; `/proc/thread-self/ns/mnt`
 is that task's. Path `readlink` is computed then (`mnt:[inode]`). An open
 ns fd keeps the namespace it named at open, so its `readlink` keeps that
 inode across a later `unshare`. `setns` of that fd with `CLONE_NEWNS` or
 0 switches only the caller and sets its cwd to `/`. It returns `EINVAL`
-when the caller's `fs_struct` is shared (`users != 1`).
-`unshare(CLONE_NEWNS)` unshares `fs` first and leaves other threads in
-the previous namespace.
+when the caller's `fs_struct` is shared (`users != 1`), and also when the
+fd is not a mount-namespace fd. A guest fork is a new process, so the
+image carries each namespace and rebinds inherited ns fds; the child gets
+its own `fs_struct` (`users == 1`) and the parent's current namespace
+inode. `unshare(CLONE_NEWNS)` unshares `fs` first and leaves other threads
+in the previous namespace.
 A bad fd is `EBADF`, another kind of fd or `nstype` is `EINVAL`, and the
 caller needs `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT`. An open `/proc/mounts`
-follows the namespace it named at open. Not measured on macmini.
+follows the namespace it named at open. The parent sequence is measured
+on `9eacf04`; the forked child is not.
 A pidfd's state is its open file's (the fd table's), so a dup, dup3 or
 F_DUPFD copy, and a fork child's copy of either, is the same pidfd for
 pidfd_send_signal, waitid(P_PIDFD) and poll/epoll, sharing one reap watch
