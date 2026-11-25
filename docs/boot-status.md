@@ -52,15 +52,20 @@ return `EIO` before procfs read the exe link. The parked view now keeps
 those records. `/proc/self/exe` stays the executed file across `setns`.
 A plain `/proc` content fd is in the fork image, and an evdev socket is
 adopted from the inherited fd. A binder file's mach send right is not
-in that socket. This is not remeasured. On `9eacf04` the run
-then stopped on `openat("/proc/sys/kernel/kptr_restrict")` returning ENOENT
-(call 6284) and `Unable to set adequate kptr_restrict value!`.
-`kptr_restrict` is now a mode-0644 integer, 0..=2, default 0: a write
-outside that range is `EINVAL` and leaves the stored value, a write needs
-`CAP_SYS_ADMIN`, and a read of an already-open fd returns the stored text.
-`mmap_rnd_bits` (18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same
-kind of file. Guest mmap does not consult those two values. None of the
-three is measured on macmini. `write` of
+in that socket. This is not remeasured. On `96f65ff` the main init opened `kptr_restrict` read-only (fd 17, call
+6296) and wrote 2 bytes three times on fd 18: `EINVAL`, `EINVAL`,
+`EACCES` (calls 6299, 6307, 6316). kmsg: `Unable to set minimum option
+value 2 in /proc/sys/kernel/kptr_restrict`. Those `EINVAL` results are
+the `proc_dointvec` range check, so fd 18 was open for write and
+`CAP_SYS_ADMIN` was held: a missing cap is `EPERM`, and a write on a
+read-only open is `EBADF`. The `EACCES` was the store refusing a path
+lookup that was not the kernfs area. An in-range write now stores the
+value for that proc file either way, and the already-open read fd sees
+it. `kptr_restrict` stays mode 0644, 0..=2, default 0. `mmap_rnd_bits`
+(18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same kind of file.
+Guest mmap does not consult those two values. The trace logs a bounded
+`/proc/sys` read or write payload, including a failed write, and a
+`readlinkat` result on failure. This is not remeasured. `write` of
 fd 3 for 61 bytes returned 61
 on the earlier `11bbedf` run; the raw guest buffer was not captured, and
 the 2200-byte diagnostic marker does not contain that text. Property,

@@ -2342,7 +2342,7 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     if canonical(guest) == super::memfd::NOEXEC_SYSCTL {
         return Some(super::memfd::open_noexec(write, cloexec));
     }
-    if let Some(result) = super::sysctl::open(&canonical(guest), write, cloexec) {
+    if let Some(result) = super::sysctl::open(&canonical(guest), flags & O_ACCMODE, cloexec) {
         return Some(result);
     }
     if canonical(guest) == "/proc/kmsg" {

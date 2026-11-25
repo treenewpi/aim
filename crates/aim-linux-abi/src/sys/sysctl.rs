@@ -2,11 +2,16 @@
 //!
 //! `kptr_restrict`, `mmap_rnd_bits` and `mmap_rnd_compat_bits` are
 //! `proc_dointvec_minmax` files, mode 0644. A write outside the range is
-//! `EINVAL` and leaves the stored value. A write needs `CAP_SYS_ADMIN`;
-//! opening for write needs the mode (root or `CAP_DAC_OVERRIDE`). The value
-//! lives in the runtime kernfs, one for every guest of that runtime, and a
+//! `EINVAL` and leaves the stored value. A write needs `CAP_SYS_ADMIN`
+//! (`proc_dointvec_minmax_sysadmin` returns `EPERM` without it). Opening
+//! for write needs the mode (root or `CAP_DAC_OVERRIDE`), which is
+//! `EACCES`. A write on a descriptor opened read-only is `EBADF`. The
+//! value lives in the runtime kernfs, one for every guest of that runtime,
+//! whether or not the path lookup currently reports the kernfs area. A
 //! read of any open fd copies it again so an ifstream opened before the
 //! write sees the new text.
+
+use std::path::PathBuf;
 
 use crate::errno::{self, Errno};
 use crate::sys::cred::{self, CAP_DAC_OVERRIDE, CAP_SYS_ADMIN};
@@ -61,12 +66,22 @@ pub(super) fn text(path: &str) -> Result<Vec<u8>, Errno> {
     Ok(format!("{}\n", value(spec)?).into_bytes())
 }
 
-fn value(spec: &Spec) -> Result<i64, Errno> {
+/// Host file for `spec`. A kernfs mount of the path is that mount's file.
+/// Otherwise the runtime kernfs holds it: a covering mount must not turn
+/// an in-range write into `EACCES`.
+fn store_path(spec: &Spec) -> PathBuf {
     let (host, area) = crate::vfs::lookup(spec.path);
-    if area != crate::vfs::Area::Kernfs {
-        return Ok(spec.default);
+    if area == crate::vfs::Area::Kernfs {
+        return host;
     }
-    match std::fs::read(host) {
+    match crate::vfs::runtime_dir() {
+        Some(runtime) => runtime.join("kernfs").join(spec.path.trim_start_matches('/')),
+        None => host,
+    }
+}
+
+fn value(spec: &Spec) -> Result<i64, Errno> {
+    match std::fs::read(store_path(spec)) {
         Ok(bytes) => parse_stored(&bytes, spec),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(spec.default),
         Err(error) => Err(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))),
@@ -95,10 +110,14 @@ fn parse_write(bytes: &[u8], spec: &Spec) -> Result<i64, Errno> {
     }
 }
 
-pub fn open(path: &str, write: bool, cloexec: bool) -> Option<i64> {
+pub fn open(path: &str, accmode: u64, cloexec: bool) -> Option<i64> {
     let spec = spec(path)?;
+    let accmode = (accmode & 0o3) as i32;
     let id = cred::current();
-    if write && id.uid[super::attrs::FS] != 0 && !cred::capable(CAP_DAC_OVERRIDE) {
+    if accmode != libc::O_RDONLY
+        && id.uid[super::attrs::FS] != 0
+        && !cred::capable(CAP_DAC_OVERRIDE)
+    {
         return Some(-(errno::EACCES as i64));
     }
     let bytes = match text(path) {
@@ -107,6 +126,7 @@ pub fn open(path: &str, write: bool, cloexec: bool) -> Option<i64> {
     };
     let fd = super::knob::open(&bytes, cloexec, super::knob::Knob::Sysctl(spec.path));
     if fd >= 0 {
+        super::knob::set_access(fd as i32, accmode);
         // SAFETY: the fd is the one just published.
         unsafe {
             libc::fchmod(fd as i32, 0o644);
@@ -121,10 +141,7 @@ pub(super) fn write(path: &str, bytes: &[u8]) -> Result<Option<Vec<u8>>, Errno> 
         return Err(errno::EPERM);
     }
     let parsed = parse_write(bytes, spec)?;
-    let (host, area) = crate::vfs::lookup(spec.path);
-    if area != crate::vfs::Area::Kernfs {
-        return Err(errno::EACCES);
-    }
+    let host = store_path(spec);
     let store = || -> std::io::Result<()> {
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent)?;
@@ -192,6 +209,9 @@ mod tests {
         let read = super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
         assert!(read >= 0);
         assert_eq!(read_fd(read), "0\n");
+        // The host file is O_RDWR. The guest open was read-only, so a
+        // write is EBADF, not the handler's EACCES or EPERM.
+        assert_eq!(write_fd(read, "2\n"), -(errno::EBADF as i64));
         let write = super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
         assert!(write >= 0);
         assert_eq!(write_fd(write, "4\n"), -(errno::EINVAL as i64));
@@ -275,5 +295,54 @@ mod tests {
         for fd in [read, write, compat_write] {
             assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
         }
+    }
+
+    /// A mount that hides `/proc` is not the sysctl. Init's write of `2`
+    /// still persists, and a missing `CAP_SYS_ADMIN` is still `EPERM`.
+    #[test]
+    fn kptr_restrict_persists_when_proc_is_not_the_kernfs_mount() {
+        let (_view, root) = crate::vfs::test_view();
+        let path = "/proc/sys/kernel/kptr_restrict";
+        let cover = root.join("cover-proc-sys");
+        std::fs::create_dir_all(&cover).unwrap();
+        crate::vfs::add_mount(
+            "/proc/sys",
+            cover,
+            crate::vfs::Area::Image,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert_ne!(
+            crate::vfs::lookup(path).1,
+            crate::vfs::Area::Kernfs
+        );
+        let host = super::store_path(super::spec(path).unwrap());
+        let previous = std::fs::read(&host).ok();
+        let read = super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
+        let write = super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
+        assert!(read >= 0 && write >= 0, "{read} {write}");
+        assert_eq!(write_fd(write, "4\n"), -(errno::EINVAL as i64));
+        assert_eq!(write_fd(write, "2\n"), 2);
+        assert_eq!(crate::sys::fs::lseek([read as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(read_fd(read), "2\n");
+        let mut weak = crate::sys::cred::current();
+        weak.cap_eff &= !(1 << CAP_SYS_ADMIN);
+        let saved = crate::sys::cred::current();
+        crate::sys::cred::init(weak, None);
+        assert_eq!(write_fd(write, "0\n"), -(errno::EPERM as i64));
+        crate::sys::cred::init(saved, None);
+        assert_eq!(crate::sys::fs::lseek([read as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(read_fd(read), "2\n");
+        for fd in [read, write] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        match previous {
+            Some(bytes) => std::fs::write(&host, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&host);
+            }
+        }
+        let _ = crate::vfs::remove_mount("/proc/sys");
     }
 }

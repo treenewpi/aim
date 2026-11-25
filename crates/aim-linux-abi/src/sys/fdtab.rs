@@ -1211,6 +1211,7 @@ pub fn get(fd: i32) -> Option<Kind> {
 
 /// The guest closed `fd` (or is about to replace it with dup2).
 pub fn on_close(fd: i32) {
+    super::knob::clear_access(fd);
     clear_regular_access(fd);
     super::procfs::close_mount_poll(fd);
     super::procfs::close_mount_namespace(fd);
@@ -1242,6 +1243,7 @@ pub fn on_dup(old: i32, new: i32) {
     }
     super::procfs::dup_mount_poll(old, new);
     super::procfs::dup_mount_namespace(old, new);
+    super::knob::dup_access(old, new);
 }
 
 /// Recognize an fd that arrived from elsewhere (exec, `SCM_RIGHTS`,
@@ -2239,6 +2241,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             Kind::Knob(owner) => {
                 w.u32(17);
                 knob::save(owner, w);
+                w.i32(knob::access(fd).unwrap_or(-1));
             }
             Kind::Cgroup(open) => {
                 w.u32(15);
@@ -2342,7 +2345,13 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 None => return (fd, None),
             },
             17 => match knob::load(r) {
-                Some(owner) => Kind::Knob(owner),
+                Some(owner) => {
+                    let mode = r.i32();
+                    if mode >= 0 {
+                        knob::set_access(fd, mode);
+                    }
+                    Kind::Knob(owner)
+                }
                 None => return (fd, None),
             },
             10 => {

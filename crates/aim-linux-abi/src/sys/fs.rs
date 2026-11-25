@@ -878,7 +878,19 @@ pub(super) fn is_path_fd(fd: i32) -> bool {
 }
 
 /// read/readv on an fd with Linux state. None: a plain host fd.
+fn knob_direction(fd: i32, write: bool) -> Option<i64> {
+    let mode = super::knob::access(fd)?;
+    if write && mode == libc::O_RDONLY || !write && mode == libc::O_WRONLY {
+        Some(-(EBADF as i64))
+    } else {
+        None
+    }
+}
+
 fn special_read(fd: i32, iov: &[libc::iovec]) -> Option<i64> {
+    if let Some(error) = knob_direction(fd, false) {
+        return Some(error);
+    }
     super::procfs::refresh_mount_file(fd);
     let pin = match fdtab::pin_guest_io(fd) {
         Ok(pin) => pin,
@@ -899,6 +911,9 @@ fn special_read(fd: i32, iov: &[libc::iovec]) -> Option<i64> {
     }))
 }
 fn special_write(fd: i32, iov: &[libc::iovec]) -> Option<i64> {
+    if let Some(error) = knob_direction(fd, true) {
+        return Some(error);
+    }
     let pin = match fdtab::pin_guest_io(fd) {
         Ok(pin) => pin,
         Err(error) => return Some(-(error as i64)),
@@ -951,6 +966,9 @@ fn append_end(actual: i32) -> Option<Result<i64, i64>> {
 }
 
 fn special_pio(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> Option<i64> {
+    if let Some(error) = knob_direction(fd, write) {
+        return Some(error);
+    }
     if !write {
         super::procfs::refresh_mount_file(fd);
     }
@@ -1468,12 +1486,29 @@ pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<
 /// Bounded `readlinkat` result. `returned` is the syscall result and is
 /// not rewritten. The path is already on the enter line; this is the bytes
 /// written into the guest buffer, so `mnt:[inode]` can be compared across
-/// the two opens in `SetupMountNamespaces`.
+/// the two opens in `SetupMountNamespaces`. A failure logs the path and
+/// the errno as well: the result buffer was not written.
 pub(super) fn trace_readlinkat(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
-    if nr != 78 || returned <= 0 {
+    if nr != 78 {
         return None;
     }
     const CAP: usize = 128;
+    if returned <= 0 {
+        let path = match guest_cstr(a[1]) {
+            Ok(path) => {
+                let shown = path.len().min(CAP);
+                let mut text = escape_stdio(&path[..shown]);
+                if path.len() > CAP {
+                    text.push_str(&format!(" truncated cap={CAP}"));
+                }
+                text
+            }
+            Err(_) => "unreadable".into(),
+        };
+        return Some(format!(
+            "[linux-trace] readlinkat result returned={returned} path=\"{path}\""
+        ));
+    }
     let want = (returned as usize).min(CAP);
     match super::user_memory::read_exact(a[2], want) {
         Ok(bytes) => {
@@ -1490,6 +1525,52 @@ pub(super) fn trace_readlinkat(nr: u64, a: &[u64; 6], returned: i64) -> Option<S
             "[linux-trace] readlinkat result returned={returned} unreadable"
         )),
     }
+}
+
+/// Bounded payload of a read or write of a `/proc/sys` knob. `returned` is
+/// the syscall result and is not rewritten. A failed write still logs the
+/// bytes the guest offered, so `4`, `3` and `2` can be told apart.
+pub(super) fn trace_proc_sys(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    let fd = a[0] as i32;
+    let path = match fdtab::get(fd)? {
+        Kind::Knob(owner) => match owner.as_ref() {
+            super::knob::Knob::Sysctl(path) if path.starts_with("/proc/sys/") => *path,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    const CAP: usize = 128;
+    let (op, addr, requested, copy_request) = match nr {
+        63 | 67 => ("read", a[1], a[2], false),
+        64 | 68 => ("write", a[1], a[2], true),
+        _ => return None,
+    };
+    if !copy_request && returned <= 0 {
+        return Some(format!(
+            "[linux-trace] proc-sys {path} {op} fd={fd} returned={returned}"
+        ));
+    }
+    let want = if copy_request {
+        (requested as usize).min(CAP)
+    } else {
+        (returned as usize).min(CAP)
+    };
+    let payload = match super::user_memory::read_exact(addr, want) {
+        Ok(bytes) => escape_stdio(&bytes),
+        Err(_) => "unreadable".into(),
+    };
+    let mut line = format!(
+        "[linux-trace] proc-sys {path} {op} fd={fd} returned={returned} len={requested} payload=\"{payload}\""
+    );
+    let full = if copy_request {
+        requested as usize
+    } else {
+        returned as usize
+    };
+    if full > CAP {
+        line.push_str(&format!(" truncated cap={CAP}"));
+    }
+    Some(line)
 }
 
 fn stdio_write_note(enabled: bool, nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {

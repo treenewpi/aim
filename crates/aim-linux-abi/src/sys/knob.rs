@@ -7,10 +7,47 @@
 //! transaction file answers the write that precedes the read. A refused
 //! write fails with the handler's errno.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::fdtab::{self, Kind};
 use crate::errno::{self, Errno};
+
+/// Guest `O_ACCMODE` for a knob. The host file is `O_RDWR` so that a reply
+/// can be rewritten; Linux still returns `EBADF` for the direction the
+/// guest did not open.
+static ACCESS: Mutex<BTreeMap<i32, i32>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn set_access(fd: i32, accmode: i32) {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fd, accmode & 0o3);
+}
+
+pub(super) fn access(fd: i32) -> Option<i32> {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&fd)
+        .copied()
+}
+
+pub(super) fn clear_access(fd: i32) {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&fd);
+}
+
+pub(super) fn dup_access(old: i32, new: i32) {
+    let mut map = ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mode) = map.get(&old).copied() {
+        map.insert(new, mode);
+    } else {
+        map.remove(&new);
+    }
+}
 
 /// The owner of the open file, independent of the process writing it.
 /// Fork carries this identity, never a callback or the opener's credentials.
