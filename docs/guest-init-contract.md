@@ -92,8 +92,8 @@ kernfs	/proc	<runtime>/kernfs/proc
 
 `<runtime>` defaults to `<data>.run`, beside the data directory and not
 in its image (docs/storage.md), and is recreated on every boot. linux-run
-refuses to start unless that directory, the writable layers, and `TMPDIR`
-are on a case-sensitive volume. Runtime
+refuses to start unless that directory, the writable layers, `TMPDIR`,
+and an unmapped guest root are on a case-sensitive volume. Runtime
 preparation creates `/dev/pts` as an actual directory for ancestor permission
 checks. Its numeric entries are the guest's own devpts instance (`sys/tty.rs`):
 the PTY owner numbers the guest's pairs, the lowest free index first, and

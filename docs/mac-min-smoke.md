@@ -527,26 +527,25 @@ and the later `arcturus.ogg` is 7908. On a case-insensitive volume the
 later file replaces the earlier one, and prepare-init then fails the
 size check. prepare-init refuses that volume before it copies.
 `--prepare` can stay on the default volume: it does not copy those
-pairs. `--prepare-init` writes `_build/redroid-16-init/root`, so that
-parent has to be a case-sensitive APFS image. If that directory already
-holds a root, move it aside first. The mountpoint has to be empty.
-Creating the image and attaching it there does not need sudo:
+pairs. linux-run probes the guest root of every round. property, integrated,
+servicemanager, and init each probe their own `_build` root, and
+`TMPDIR` holds the standalone runtime. An image mounted only on
+`_build/redroid-16-init` leaves `_build/redroid-16-property/root` on
+the default volume. Put the whole worktree, every `_build` root, and
+`TMPDIR` on one case-sensitive APFS sparse image. Creating and
+attaching it does not need sudo. The mountpoint has to be empty:
 
 ```sh
-mkdir -p "$PWD/_build/redroid-16-init"
-hdiutil create -size 8g -fs 'Case-sensitive APFS' -volname aim-init -type SPARSE "$PWD/_build/aim-init.sparseimage"
-hdiutil attach -nobrowse -mountpoint "$PWD/_build/redroid-16-init" "$PWD/_build/aim-init.sparseimage"
+mkdir -p "$HOME/aim-volume"
+hdiutil create -size 64g -fs 'Case-sensitive APFS' -volname aim -type SPARSE "$HOME/aim.sparseimage"
+hdiutil attach -nobrowse -mountpoint "$HOME/aim-volume" "$HOME/aim.sparseimage"
 ```
 
-linux-run uses the same probe on every host directory the guest creates
-files in. For this probe that is the init root and `TMPDIR`: the
-standalone runtime, its `<runtime>/tmpfs` backing directories, scratch,
-and socket directories live under `TMPDIR`. Put `TMPDIR` on that image
-before `--init`:
+Check the tree out on that volume and point `TMPDIR` inside it:
 
 ```sh
-mkdir -p "$PWD/_build/redroid-16-init/tmp"
-export TMPDIR="$PWD/_build/redroid-16-init/tmp"
+mkdir -p "$HOME/aim-volume/aim/_build/tmp"
+export TMPDIR="$HOME/aim-volume/aim/_build/tmp"
 ```
 
 A guest-init boot has the same requirement for `<data>.run` (`/dev`,

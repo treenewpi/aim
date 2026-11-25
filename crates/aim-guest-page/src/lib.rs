@@ -97,9 +97,76 @@ pub fn shifted_file_map(offset: u64, length: u64) -> Result<ShiftedFileMap, i32>
     })
 }
 
+/// One host page of a shifted file map, relative to EOF.
+///
+/// A 4 KiB slice is past EOF when it starts at or after `file_len`. Linux
+/// `mmap` still succeeds; a touch of that slice raises SIGBUS. A slice that
+/// starts before EOF is file data, and the bytes after EOF in that slice
+/// are zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EofHost {
+    /// Every guest-visible slice starts before EOF.
+    File,
+    /// Every guest-visible slice starts at or after EOF.
+    Bus,
+    /// File slices and past-EOF slices share this host page. `bus_at` is
+    /// the file offset of the first past-EOF slice.
+    Mixed { bus_at: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EofHostPage {
+    /// File offset of the host page (`offset` cleared to 16 KiB, plus a
+    /// multiple of 16 KiB).
+    pub file_offset: u64,
+    pub kind: EofHost,
+}
+
+/// Classify each host page of `plan` that the guest range touches.
+pub fn eof_host_pages(plan: &ShiftedFileMap, file_len: u64) -> Vec<EofHostPage> {
+    let guest_lo = plan.host_offset + plan.displacement;
+    let guest_hi = guest_lo + plan.guest_length;
+    let mut pages = Vec::new();
+    let mut host = plan.host_offset;
+    let host_end = plan.host_offset + plan.host_length;
+    while host < host_end {
+        let mut file_slices = 0u8;
+        let mut bus_slices = 0u8;
+        let mut bus_at = 0u64;
+        for slot in 0..4 {
+            let at = host + slot * GUEST_PAGE;
+            if at >= guest_lo && at + GUEST_PAGE <= guest_hi {
+                if at >= file_len {
+                    if bus_slices == 0 {
+                        bus_at = at;
+                    }
+                    bus_slices |= 1 << slot;
+                } else {
+                    file_slices |= 1 << slot;
+                }
+            }
+        }
+        let kind = if file_slices == 0 && bus_slices == 0 {
+            host += PAGE;
+            continue;
+        } else if bus_slices == 0 {
+            EofHost::File
+        } else if file_slices == 0 {
+            EofHost::Bus
+        } else {
+            EofHost::Mixed { bus_at }
+        };
+        pages.push(EofHostPage {
+            file_offset: host,
+            kind,
+        });
+        host += PAGE;
+    }
+    pages
+}
+
 /// True when a 4 KiB page of `[offset, offset+guest_length)` starts at or
-/// after `file_len`. Linux raises SIGBUS for a touch of that page. Mapping
-/// it as zeros would widen the file.
+/// after `file_len`. Linux raises SIGBUS for a touch of that page.
 pub fn guest_page_wholly_past_eof(offset: u64, guest_length: u64, file_len: u64) -> bool {
     if guest_length == 0 {
         return false;
@@ -124,6 +191,33 @@ pub fn guest_page_wholly_past_eof(offset: u64, guest_length: u64, file_len: u64)
 /// file page.
 pub fn fixed_residue_matches(addr: u64, offset: u64) -> bool {
     addr & (PAGE - 1) == offset & (PAGE - 1)
+}
+
+/// A file `mmap` whose address and offset disagree modulo 16 KiB.
+///
+/// `MAP_SHARED` cannot be a copy and still be shared. `MAP_PRIVATE` is a
+/// copy at every protection: a private write never reaches the file.
+/// `PROT_EXEC` without `PROT_WRITE` is filled read-write and then
+/// `mprotect`'d, so the copy is never writable and executable at once.
+/// Requesting both is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidueMismatch {
+    SharedRefused,
+    PrivateCopy { fill_rw_then_protect: bool },
+}
+
+pub fn residue_mismatch(shared: bool, prot: u32) -> ResidueMismatch {
+    if shared {
+        ResidueMismatch::SharedRefused
+    } else {
+        ResidueMismatch::PrivateCopy {
+            fill_rw_then_protect: prot & PROT_EXEC != 0 && prot & PROT_WRITE == 0,
+        }
+    }
+}
+
+pub fn private_copy_is_wx(prot: u32) -> bool {
+    prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC
 }
 
 /// The union of two 4 KiB slices newly makes the host page both writable
@@ -506,6 +600,38 @@ mod tests {
             0x5a000 + 0x24a9
         ));
         assert!(guest_page_wholly_past_eof(0x5a000, plan.guest_length, 0x5c000));
+        let inside = eof_host_pages(&plan, 0x5a000 + 0x24a9);
+        assert!(inside.iter().all(|page| page.kind == EofHost::File));
+        let past = eof_host_pages(&plan, 0x5c000);
+        assert_eq!(
+            past,
+            vec![
+                EofHostPage {
+                    file_offset: 0x58000,
+                    kind: EofHost::File
+                },
+                EofHostPage {
+                    file_offset: 0x5c000,
+                    kind: EofHost::Bus
+                },
+            ]
+        );
+        let at_eof = shifted_file_map(0x5000, 0x1000).unwrap();
+        assert_eq!(
+            eof_host_pages(&at_eof, 0x5000),
+            vec![EofHostPage {
+                file_offset: 0x4000,
+                kind: EofHost::Bus
+            }]
+        );
+        let mixed = shifted_file_map(0x5000, 0x2000).unwrap();
+        assert_eq!(
+            eof_host_pages(&mixed, 0x5100),
+            vec![EofHostPage {
+                file_offset: 0x4000,
+                kind: EofHost::Mixed { bus_at: 0x6000 }
+            }]
+        );
         assert_eq!(shifted_file_map(0x5a100, 0x24a9), Err(EINVAL));
         assert!(!fixed_residue_matches(0x1000, 0x5a000));
         assert!(fixed_residue_matches(0x2000, 0x5a000));
@@ -516,6 +642,54 @@ mod tests {
         assert!(union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE | PROT_EXEC));
         assert!(!union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE));
         assert!(!union_creates_wx(PROT_READ | PROT_WRITE | PROT_EXEC, PROT_READ | PROT_EXEC));
+    }
+
+    #[test]
+    fn libcpp_fixed_private_segments_are_copies() {
+        // property-r1 getprop-after, /system/lib64/libc++.so.
+        // PT_LOAD (p_vaddr, p_offset), each (p_vaddr - p_offset) ≡ 0 (mod 16 KiB):
+        // (0, 0), (0x7b8c0, 0x778c0), (0xfed80, 0xf6d80), (0x109c88, 0xfdc88).
+        // p_align is 0x4000. One load bias ≡ 0 (mod 16 KiB) would make every
+        // segment a file mapping. The measured bias 0x8006206000 ≡ 0x2000, so
+        // these MAP_FIXED calls do not.
+        for (vaddr, offset) in [
+            (0u64, 0u64),
+            (0x7b8c0, 0x778c0),
+            (0xfed80, 0xf6d80),
+            (0x109c88, 0xfdc88),
+        ] {
+            assert_eq!(vaddr.wrapping_sub(offset) & (PAGE - 1), 0);
+        }
+        assert_eq!(0x8006206000u64 & (PAGE - 1), 0x2000);
+        // mmap(0x8006281000, 0x7fd80, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED, fd, 0x77000)
+        let rx = (0x8006281000u64, 0x7fd80u64, 0x77000u64, PROT_READ | PROT_EXEC);
+        // mmap(0x8006304000, 0x7c88, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED, fd, 0xf6000)
+        let rw = (0x8006304000u64, 0x7c88u64, 0xf6000u64, PROT_READ | PROT_WRITE);
+        for (addr, len, off, prot) in [rx, rw] {
+            assert!(matches!(
+                private_file_map(off, len),
+                Ok(PrivateFileMap::Copy { .. })
+            ));
+            assert!(!fixed_residue_matches(addr, off));
+            assert!(!private_copy_is_wx(prot));
+        }
+        assert_eq!(
+            residue_mismatch(false, PROT_READ | PROT_EXEC),
+            ResidueMismatch::PrivateCopy {
+                fill_rw_then_protect: true
+            }
+        );
+        assert_eq!(
+            residue_mismatch(false, PROT_READ | PROT_WRITE),
+            ResidueMismatch::PrivateCopy {
+                fill_rw_then_protect: false
+            }
+        );
+        assert_eq!(
+            residue_mismatch(true, PROT_READ),
+            ResidueMismatch::SharedRefused
+        );
+        assert!(private_copy_is_wx(PROT_READ | PROT_WRITE | PROT_EXEC));
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct Copy {
     pub offset: u64,
     pub dev: u64,
     pub ino: u64,
+    /// Anonymous memory filled from the file. A host file mapping is
+    /// `false`: the guest range is the file, not a copy.
+    pub anonymous: bool,
 }
 
 static COPIES: Mutex<BTreeMap<u64, Copy>> = Mutex::new(BTreeMap::new());
@@ -56,11 +59,23 @@ pub fn note(start: u64, len: u64, host: &Path, guest: &str, offset: u64) {
         use std::os::unix::fs::MetadataExt;
         (m.dev() as u32 as u64, m.ino())
     });
-    note_file(start, len, host, guest, offset, (dev, ino));
+    note_file(start, len, host, guest, offset, (dev, ino), true);
 }
 
 /// As [`note`], for the file with device and inode `id`.
-pub fn note_file(start: u64, len: u64, host: &Path, guest: &str, offset: u64, id: (u64, u64)) {
+///
+/// `anonymous` is set when the guest range is a private copy rather than
+/// a host file mapping. `/proc/self/maps` still names the file it was
+/// filled from.
+pub fn note_file(
+    start: u64,
+    len: u64,
+    host: &Path,
+    guest: &str,
+    offset: u64,
+    id: (u64, u64),
+    anonymous: bool,
+) {
     let (dev, ino) = id;
     forget(start, start + len);
     COPIES.lock().unwrap().insert(
@@ -72,8 +87,16 @@ pub fn note_file(start: u64, len: u64, host: &Path, guest: &str, offset: u64, id
             offset,
             dev,
             ino,
+            anonymous,
         },
     );
+}
+
+/// True when `[lo, hi)` overlaps a private copy that is not a file mapping.
+pub fn covers_anonymous(lo: u64, hi: u64) -> bool {
+    covered(lo, hi).into_iter().any(|(_, _, copy)| {
+        copy.is_some_and(|(c, _)| c.anonymous)
+    })
 }
 
 /// The copy containing `addr`, with the file offset of `addr`.
@@ -153,6 +176,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
         w.u64(c.offset);
         w.u64(c.dev);
         w.u64(c.ino);
+        w.bool(c.anonymous);
     });
 }
 
@@ -167,6 +191,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 offset: r.u64(),
                 dev: r.u64(),
                 ino: r.u64(),
+                anonymous: r.bool(),
             },
         )
     });
@@ -190,6 +215,7 @@ mod tests {
             "/system/bin/init",
             0x4c_4000,
             (1, 2),
+            true,
         );
         note_file(
             0x8000_2f80_00,
@@ -198,6 +224,7 @@ mod tests {
             "/system/bin/init",
             0x2f_8000,
             (1, 2),
+            true,
         );
         assert!(
             covered(0x8000_4c50_00, 0x8000_4d80_00)

@@ -52,7 +52,10 @@ bench`) keeps everything of `DATA` in `DATA.asif` beside it:
   `linux-run` still requires `DATA.run` and `TMPDIR` to be
   case-sensitive: it refuses a case-folding volume for `/data`,
   `/cache`, `<runtime>/tmpfs`, socket directories, writable layers, and
-  `TMPDIR`.
+  `TMPDIR`. A round with no path map also probes its guest root, so
+  every bionic-smoke root under `_build` is probed the same way. The
+  worktree, those roots, and `TMPDIR` belong on one case-sensitive APFS
+  sparse image (docs/mac-min-smoke.md).
 - **One user**: guest-init holds an exclusive lock on `DATA.lock` while the
   image is attached. A second guest-init on the same data fails at once.
 - **Crash recovery**: an image found attached at start belongs to a

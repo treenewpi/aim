@@ -93,6 +93,11 @@ come from that servicemanager's SetProperty.
 needs. --init runs it for at most eight seconds and prints the trace.
 init-probe: not a boot is the result. A historical list of mremap,
 SOCK_SEQPACKET, and rt_tgsigqueueinfo is not that observation.
+linux-run probes every round's guest root. That includes
+_build/redroid-16-property/root and the other _build roots, plus
+TMPDIR. Those directories and the worktree have to sit on one
+case-sensitive APFS sparse image. An image mounted only on
+_build/redroid-16-init leaves the other roots on the default volume.
 Acceptance of that stage is a real Apple Silicon Mac running them under
 linux-run on XNU. A Linux compile, unit test, this staging, a Linux VM,
 or a Linux container is not that run. A Mac log has to include the host

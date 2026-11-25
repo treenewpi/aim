@@ -104,17 +104,20 @@ above. The layer has seven such pairs and no other case-only
 collisions. macOS APFS is case-insensitive, so the later write replaces
 the earlier file. prepare-init now stops before copying when the root's
 volume is case-insensitive (`pathconf(_PC_CASE_SENSITIVE)` on macOS,
-and a probe file). The init root has to be a case-sensitive APFS image
-mounted on the empty `_build/redroid-16-init` directory. Creating and
-attaching that image does not need sudo. linux-run applies the same
-probe at startup to every host directory the guest can create files in:
-the path map's writable directories (`/data`, `/cache`, and the other
-writable layers), kernfs host trees, `<runtime>/tmpfs`, socket
-directories, scratch, and `TMPDIR`. A folding volume fails startup and
-the message names each directory. `<runtime>` (`<data>.run`) is not
-inside the data image, and a linux-run without a path map keeps its
-runtime in `TMPDIR`, so those directories have to sit on a
-case-sensitive APFS image as well. This is not remeasured on macmini.
+and a probe file). linux-run probes the guest root of every round, including a round
+with no path map, and it probes the writable directories, kernfs host
+trees, `<runtime>/tmpfs`, socket directories, scratch, and `TMPDIR`.
+A folding volume fails startup and the message names each directory.
+`<runtime>` (`<data>.run`) is not inside the data image. A linux-run
+without a path map keeps its runtime in `TMPDIR`. Archive
+`c2c05f4c5c152be64684ec32478df657d5267054b3546a819caebfa35689ff6b`
+refused `_build/redroid-16-property/root` because that root was on the
+default volume. The worktree, every `_build` root, and `TMPDIR` belong
+on one case-sensitive APFS sparse image. Mounting an image only on
+`_build/redroid-16-init` leaves the other roots on the default volume.
+Archive
+`b88ba955e98f48f3549330c69e88a1a0d4ff8aa24e4d40030a7971cdc6537f61`
+had the worktree on that image and the probe passed.
 APFS stays normalization-insensitive on a case-sensitive volume: NFC
 and NFD of one name are one file, and Linux compares bytes. The pinned
 layer's 3743 paths are all ASCII. An offline NFC and NFD comparison
@@ -138,10 +141,40 @@ the capability and continues. A cgroup namespace is not invented here.
 Guest mmap does not consult those two values. A shared file map whose
 offset is a multiple of 4096 but not of 16384 is the enclosing host
 pages, and the pointer is `base + (offset & 0x3fff)`. It stays a real
-`MAP_SHARED` of the file. `MAP_FIXED` whose address and offset disagree
-modulo 16 KiB returns `EINVAL` and is not replaced by a copy. A
-read-only `MAP_PRIVATE` at that residue stays the private copy, and the
-trace says so. A 4 KiB page that starts at or past EOF returns `EIO`.
+`MAP_SHARED` of the file. `MAP_FIXED` `MAP_SHARED` whose address and offset disagree
+modulo 16 KiB returns `EINVAL` and is not replaced by a copy.
+`MAP_PRIVATE` at that residue is a copy at any protection, and the
+trace names the range as not a file mapping. A `PROT_EXEC` copy is
+filled read-write and then `mprotect`'d so it is never writable and
+executable at once. A later `mprotect` that would make a copy both
+writable and executable returns `EINVAL`. On archive
+`b88ba955e98f48f3549330c69e88a1a0d4ff8aa24e4d40030a7971cdc6537f61`,
+property-r1's getprop-after child loaded `/system/lib64/libc++.so`.
+`mmap(0x8006281000, 0x7fd80, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED, fd, 0x77000)`
+was copied. `mmap(0x8006304000, 0x7c88, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED, fd, 0xf6000)`
+returned `EINVAL` from the writable-copy refusal; that refusal is gone.
+That library's four `PT_LOAD` headers have `p_align` `0x4000`, and
+`(p_vaddr - p_offset) mod 16384` is 0 for every one of them
+(`0/0`, `0x7b8c0/0x778c0`, `0xfed80/0xf6d80`, `0x109c88/0xfdc88`).
+One load bias congruent to 0 modulo 16 KiB would make every segment a
+file mapping. The bias reconstructed from those calls is
+`0x8006206000`, which is `0x2000` modulo 16 KiB. The image's
+`/apex/com.android.runtime/bin/linker64` (`getpagesize` is `mov w0, #0x1000`)
+loads at a 4 KiB page. It took the normal file-map path, not compat
+mode: compat reads the segment with `pread` into the anonymous
+reservation (`ElfReader::CompatMapSegment` in
+`linker/linker_phdr_16kib_compat.cpp`). This binary has no
+`bionic.linker.16kb.app_compat.enabled` string. AOSP
+`android-16.0.0_r1` `ElfReader::Read` in `linker/linker_phdr.cpp`
+enables compat when `page_size() == 16384`, `min_align_ == 4096`, and
+that property or `get_16kb_appcompat_mode()` is set, and
+`ElfReader::LoadSegments` otherwise refuses a smaller `min_align_`.
+`ReserveAddressSpace` then steps the reservation by `page_size()`.
+A 16 KiB-aligned `mmap(NULL)` does not choose this linker's bias.
+A guest page that starts at or after EOF is mapped, and a touch raises
+`SIGBUS`. A past-EOF 4 KiB slice that shares its 16 KiB host page with
+a slice that still contains file bytes stays that shared mapping, and
+Darwin zero-fills the past-EOF slice.
 `mprotect` keeps the union of the slices in one host page and refuses a
 union that newly makes that page writable and executable. `msync`
 accepts a 4 KiB address and syncs the covering host pages. `AT_PAGESZ`

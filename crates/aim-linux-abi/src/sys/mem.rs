@@ -20,6 +20,9 @@
 //!   and the pointer is displaced into that mapping. `mmap_rnd_bits` does
 //!   not move the file offset. A `MAP_FIXED` request whose address and
 //!   offset disagree modulo 16 KiB is `EINVAL`: a copy would not be shared.
+//!   A guest page that starts at or after EOF is installed, and a touch
+//!   raises SIGBUS. A past-EOF page that shares a host page with a guest
+//!   page that still contains file bytes stays that shared mapping.
 //! - A BoringSSL FIPS module rewritten at load time gets its integrity hash
 //!   recomputed in memory, as the translator does for cached files.
 
@@ -28,7 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::context::GuestContext;
-use crate::errno::{self, EEXIST, EINVAL, EIO, ENOMEM};
+use crate::errno::{self, EEXIST, EINVAL, ENOMEM};
 use crate::patch;
 use crate::xlate::fips;
 use crate::xrt::{self, ExecSource};
@@ -572,33 +575,43 @@ fn mmap_shifted_shared(addr: u64, len: u64, prot: u64, _flags: u64, fd: i32, off
         Ok(len) => len,
         Err(error) => return error,
     };
-    if aim_guest_page::guest_page_wholly_past_eof(off, plan.guest_length, file_len) {
-        crate::diag!(
-            "[linux-abi] mmap: file offset {off:#x} length {:#x} includes a 4 KiB page wholly past EOF {file_len:#x}; refusing a zero-filled page",
-            plan.guest_length
-        );
-        return -(EIO as i64);
-    }
-    if plan.host_offset.saturating_add(plan.host_length) > file_len {
-        crate::diag!(
-            "[linux-abi] mmap: shared file map offset {off:#x} guest length {:#x} host {:#x}+{:#x} extends past EOF {file_len:#x}; the guest range stays {:#x} bytes and is not widened",
-            plan.guest_length,
-            plan.host_offset,
-            plan.host_length,
-            plan.guest_length
-        );
+    let eof_pages = aim_guest_page::eof_host_pages(&plan, file_len);
+    let any_file = eof_pages
+        .iter()
+        .any(|page| !matches!(page.kind, aim_guest_page::EofHost::Bus));
+    let any_bus = eof_pages
+        .iter()
+        .any(|page| matches!(page.kind, aim_guest_page::EofHost::Bus));
+    for page in &eof_pages {
+        if let aim_guest_page::EofHost::Mixed { bus_at } = page.kind {
+            crate::diag!(
+                "[linux-abi] mmap: 4 KiB page at file offset {bus_at:#x} is past EOF {file_len:#x} and shares a 16 KiB page with file bytes; that slice stays the shared mapping's zero-fill"
+            );
+        }
     }
     let hint = arena::hint(addr.wrapping_sub(plan.displacement), plan.host_length);
     let placing = arena::placing();
-    let base = match host_mmap(
+    let file_map = host_mmap(
         hint,
         plan.host_length,
         host_prot(prot),
         libc::MAP_SHARED,
         fd,
         plan.host_offset as i64,
-    ) {
+    );
+    let base = match file_map {
         Ok(base) => base,
+        Err(error) if !any_file => match host_mmap(
+            hint,
+            plan.host_length,
+            libc::PROT_NONE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        ) {
+            Ok(base) => base,
+            Err(_) => return error,
+        },
         Err(error) => return error,
     };
     if !arena::contains(base, plan.host_length) {
@@ -606,10 +619,81 @@ fn mmap_shifted_shared(addr: u64, len: u64, prot: u64, _flags: u64, fd: i32, off
         return -(ENOMEM as i64);
     }
     drop(placing);
+    if file_map.is_ok() {
+        for page in &eof_pages {
+            if !matches!(page.kind, aim_guest_page::EofHost::Bus) {
+                continue;
+            }
+            let host = base + (page.file_offset - plan.host_offset);
+            let result = host_mprotect(host, PAGE, libc::PROT_NONE);
+            if result < 0 {
+                unsafe { libc::munmap(base as *mut _, plan.host_length as usize) };
+                return result;
+            }
+        }
+    }
     let guest = base + plan.displacement;
+    if any_bus {
+        crate::diag!(
+            "[linux-abi] mmap: file offset {off:#x} length {:#x} includes a page at or past EOF {file_len:#x}; a touch raises SIGBUS",
+            plan.guest_length
+        );
+        note_eof_bus(base, &plan, file_len);
+    }
     note_shifted_slack(base, guest, &plan, prot);
-    note_file_copy(guest, plan.guest_length, fd, off);
+    if file_map.is_ok() {
+        note_file_copy(guest, plan.guest_length, fd, off, false);
+    }
     guest as i64
+}
+
+fn note_eof_bus(base: u64, plan: &aim_guest_page::ShiftedFileMap, file_len: u64) {
+    let guest_lo = plan.host_offset + plan.displacement;
+    let guest_hi = guest_lo + plan.guest_length;
+    for page in aim_guest_page::eof_host_pages(plan, file_len) {
+        if !matches!(page.kind, aim_guest_page::EofHost::Bus) {
+            continue;
+        }
+        let host = base + (page.file_offset - plan.host_offset);
+        for slot in 0..4 {
+            let at = page.file_offset + slot * aim_guest_page::GUEST_PAGE;
+            if at >= guest_lo && at + aim_guest_page::GUEST_PAGE <= guest_hi {
+                let addr = host + slot * aim_guest_page::GUEST_PAGE;
+                EOF_BUS
+                    .lock()
+                    .unwrap()
+                    .push((addr, addr + aim_guest_page::GUEST_PAGE));
+            }
+        }
+    }
+}
+
+pub(super) fn past_eof_bus(addr: u64) -> bool {
+    EOF_BUS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|&(lo, hi)| addr >= lo && addr < hi)
+}
+
+fn forget_eof_bus(lo: u64, hi: u64) {
+    if lo >= hi {
+        return;
+    }
+    let mut ranges = EOF_BUS.lock().unwrap();
+    let old = std::mem::take(&mut *ranges);
+    for (start, end) in old {
+        if end <= lo || start >= hi {
+            ranges.push((start, end));
+            continue;
+        }
+        if start < lo {
+            ranges.push((start, lo));
+        }
+        if hi < end {
+            ranges.push((hi, end));
+        }
+    }
 }
 
 fn note_shifted_slack(
@@ -663,15 +747,15 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
         match aim_guest_page::private_file_map(off, len) {
             Ok(aim_guest_page::PrivateFileMap::Copy { .. }) => {
                 let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
-                if fixed && !aim_guest_page::fixed_residue_matches(addr, off) {
-                    if prot & PROT_WRITE != 0 {
-                        crate::diag!(
-                            "[linux-abi] mmap: MAP_FIXED writable private map at {addr:#x} offset {off:#x} is not a host file mapping; refusing a copy"
-                        );
-                        return -(EINVAL as i64);
-                    }
+                if aim_guest_page::private_copy_is_wx(prot as u32) {
                     crate::diag!(
-                        "[linux-abi] mmap: read-only MAP_PRIVATE at {addr:#x} offset {off:#x} copied; address and offset differ mod 16 KiB"
+                        "[linux-abi] mmap: MAP_PRIVATE copy at {addr:#x} offset {off:#x} prot {prot:#x} would be writable and executable; refusing"
+                    );
+                    return -(EINVAL as i64);
+                }
+                if fixed && !aim_guest_page::fixed_residue_matches(addr, off) {
+                    crate::diag!(
+                        "[linux-abi] mmap: MAP_PRIVATE at {addr:#x} offset {off:#x} prot {prot:#x} copied; address and offset differ mod 16 KiB"
                     );
                 }
                 true
@@ -974,6 +1058,12 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
     match finish {
         Finish::Nothing => {}
         Finish::Protect => {
+            if copy_file && exec && !writable {
+                crate::diag!(
+                    "[linux-abi] mmap: private copy {base:#x}..{:#x} filled RW, mprotect {prot:#x}; W and X are not set together",
+                    base + len
+                );
+            }
             let r = if writable && exec {
                 super::jit::protect_rwx(base, len)
             } else {
@@ -991,7 +1081,7 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
     copies::forget(base, base + len);
     super::fuse_cache::forget(base, len);
     if noted {
-        note_file_copy(base, len, fd, off);
+        note_file_copy(base, len, fd, off, copy_file);
     }
     base as i64
 }
@@ -1024,7 +1114,7 @@ pub fn exec_reset() {
 
 /// Record that `[base, base+len)` maps (or holds a copy of) `fd` from
 /// `off`.
-fn note_file_copy(base: u64, len: u64, fd: i32, off: u64) {
+fn note_file_copy(base: u64, len: u64, fd: i32, off: u64, anonymous: bool) {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes; fstat into a local
     // buffer.
@@ -1039,7 +1129,18 @@ fn note_file_copy(base: u64, len: u64, fd: i32, off: u64) {
     let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n]));
     let guest = super::procfs::fd_guest_path(fd).unwrap_or_default();
     let id = (st.st_dev as u32 as u64, st.st_ino);
-    copies::note_file(base, len, &host, &guest, off, id);
+    if anonymous {
+        crate::diag!(
+            "[linux-abi] mmap: private copy {base:#x}..{:#x} of {} offset {off:#x} is not a file mapping",
+            base + len,
+            if guest.is_empty() {
+                host.display().to_string()
+            } else {
+                guest.clone()
+            }
+        );
+    }
+    copies::note_file(base, len, &host, &guest, off, id, anonymous);
 }
 
 thread_local! {
@@ -1191,10 +1292,16 @@ const GUEST_PAGE: u64 = aim_guest_page::GUEST_PAGE;
 /// Absence means the slice has the host page's protection.
 static GUEST_SLICES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
 
+/// Guest addresses whose 4 KiB page starts at or after EOF. A touch is
+/// SIGBUS. The host page is `PROT_NONE`, which Darwin reports as a
+/// protection fault, so the translator consults this set.
+static EOF_BUS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
 fn forget_guest_slices(lo: u64, hi: u64) {
     if lo >= hi {
         return;
     }
+    forget_eof_bus(lo, hi);
     let mut slices = GUEST_SLICES.lock().unwrap();
     let keys: Vec<u64> = slices
         .range(lo.saturating_sub(GUEST_PAGE - 1)..hi)
@@ -1235,6 +1342,12 @@ fn page_prot(host: u64) -> Option<u32> {
 fn punch_page(host: u64, cover: u8) -> i64 {
     if cover == 0 {
         return 0;
+    }
+    for slot in 0..4 {
+        if cover & (1 << slot) != 0 {
+            let at = host + slot * GUEST_PAGE;
+            forget_eof_bus(at, at + GUEST_PAGE);
+        }
     }
     if cover == 0b1111 {
         return release_aligned(host, PAGE);
@@ -1337,6 +1450,23 @@ fn map_covered_slices(
         }
         union
     };
+    if !anon && union & (PROT_WRITE | PROT_EXEC) as u32 == (PROT_WRITE | PROT_EXEC) as u32 {
+        crate::diag!(
+            "[linux-abi] mmap: private copy host page {host:#x} would be writable and executable; refusing"
+        );
+        if existed.is_none() {
+            PAGE_PIECES.lock().unwrap().remove(&host);
+            unsafe { libc::munmap(host as *mut _, PAGE as usize) };
+        } else {
+            host_mprotect(host, PAGE, host_prot(existed.unwrap() as u64));
+        }
+        return -(EINVAL as i64);
+    }
+    if !anon && union & libc::PROT_EXEC as u32 != 0 && union & libc::PROT_WRITE as u32 == 0 {
+        crate::diag!(
+            "[linux-abi] mmap: private copy host page {host:#x} filled RW, mprotect {union:#x}; W and X are not set together"
+        );
+    }
     if union & (PROT_WRITE | PROT_EXEC) as u32 == (PROT_WRITE | PROT_EXEC) as u32 {
         super::jit::protect_rwx(host, PAGE)
     } else {
@@ -1389,7 +1519,11 @@ fn mmap_partial_fixed(
         }
     }
     if !anon && let Ok(span) = aim_guest_page::guest_page_len(len) {
-        note_file_copy(addr, span, fd, off);
+        let anonymous = matches!(
+            aim_guest_page::private_file_map(off, len),
+            Ok(aim_guest_page::PrivateFileMap::Copy { .. })
+        );
+        note_file_copy(addr, span, fd, off, anonymous);
     }
     addr as i64
 }
@@ -1622,6 +1756,13 @@ fn mprotect_owned(a: [u64; 6]) -> i64 {
         return 0;
     }
     let rwx = prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC;
+    if rwx && copies::covers_anonymous(addr, addr + len) {
+        crate::diag!(
+            "[linux-abi] mprotect: refusing W+X on private copy {addr:#x}..{:#x}",
+            addr + len
+        );
+        return -(EINVAL as i64);
+    }
     if prot & PROT_EXEC != 0 {
         if let Err(error) = super::memfd::before_exec_protect(addr, addr + len) {
             return error;
@@ -2285,7 +2426,7 @@ fn extend_at(addr: u64, len: u64, like: u64, replace: bool) -> Result<(), i64> {
         return Err(e);
     }
     if let Some((c, _)) = copy {
-        copies::note_file(addr, len, &c.host, &c.guest, off, (c.dev, c.ino));
+        copies::note_file(addr, len, &c.host, &c.guest, off, (c.dev, c.ino), c.anonymous);
     }
     Ok(())
 }

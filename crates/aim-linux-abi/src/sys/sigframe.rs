@@ -471,6 +471,8 @@ pub fn translate_fault(hsig: i32, host_code: i32, si_addr: u64, m: &DarwinMconte
             let addr = if stale { si_addr } else { m.far };
             if data_abort && esr & 0x3f == 0x21 {
                 (SIGBUS, BUS_ADRALN, addr)
+            } else if super::mem::past_eof_bus(addr) {
+                (SIGBUS, BUS_ADRERR, addr)
             } else if (super::window::BASE..super::window::BASE + 0x1000).contains(&addr) {
                 // The first page of ART's heap window is the null page of
                 // heap references (offset 0 is null): report the access
