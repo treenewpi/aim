@@ -35,6 +35,8 @@ pub enum Node {
     MountTable {
         host_pid: i32,
         info: bool,
+        /// `None` is the thread-group leader (`/proc/self/mounts`).
+        thread: Option<i32>,
     },
     Dir(Vec<Entry>),
     Link(String),
@@ -1239,6 +1241,26 @@ fn mountinfo(points: Vec<vfs::MountPoint>) -> String {
     }).collect()
 }
 
+fn poll_generation(poll: &MountPoll) -> u64 {
+    poll.ns
+        .as_ref()
+        .map(|ns| vfs::mount_namespace_event(ns))
+        .unwrap_or_else(vfs::mount_event)
+}
+
+fn mount_poll_points(
+    host_pid: i32,
+    ns: Option<&Arc<vfs::MountNs>>,
+) -> Result<Vec<vfs::MountPoint>, Errno> {
+    if host_pid == pid()
+        && let Some(ns) = ns
+    {
+        vfs::refresh_fuse_mounts()?;
+        return vfs::mount_points_of(ns);
+    }
+    process_mount_points(host_pid)
+}
+
 fn process_mount_points(host_pid: i32) -> Result<Vec<vfs::MountPoint>, Errno> {
     if host_pid == pid() {
         vfs::refresh_fuse_mounts()?;
@@ -1288,7 +1310,7 @@ fn pid_node(p: i32, rest: &str, thread: Option<i32>, listed: bool) -> Option<Nod
             Node::Dir(e)
         }
         "ns" if me => Node::Dir(entries(&[("mnt", dir::DT_LNK)])),
-        "ns/mnt" if me => Node::Link(vfs::mount_namespace_link()),
+        "ns/mnt" if me => Node::Link(vfs::proc_namespace_link(thread)),
         "net" => Node::Dir(
             NET_FILES
                 .iter()
@@ -1327,10 +1349,12 @@ fn pid_node(p: i32, rest: &str, thread: Option<i32>, listed: bool) -> Option<Nod
         "mounts" => Node::MountTable {
             host_pid: p,
             info: false,
+            thread,
         },
         "mountinfo" => Node::MountTable {
             host_pid: p,
             info: true,
+            thread,
         },
         "oom_score_adj" => {
             Node::File(format!("{}\n", super::cred::oom_score_adj_of(p).unwrap_or(0)).into_bytes())
@@ -1661,6 +1685,8 @@ pub(super) struct MountPoll {
     info: bool,
     seen: AtomicU64,
     filled: AtomicU64,
+    /// Namespace the path named at open. Later `unshare` does not retarget it.
+    ns: Option<Arc<vfs::MountNs>>,
 }
 
 static MOUNT_POLLS: Mutex<BTreeMap<i32, Arc<MountPoll>>> = Mutex::new(BTreeMap::new());
@@ -1670,14 +1696,19 @@ const MOUNT_PRI: i16 = 0x2;
 const MOUNT_ERR: i16 = 0x8;
 const MOUNT_RDNORM: i16 = 0x40;
 
-fn open_mount_table(host_pid: i32, info: bool, cloexec: bool) -> i64 {
+fn open_mount_table(host_pid: i32, info: bool, thread: Option<i32>, cloexec: bool) -> i64 {
     // Sample the generation around the read. A mount during the read
     // retries so the file does not open already holding an edge. A storm
     // that never settles still opens: the next change remains visible.
+    // `/proc/self/mounts` is the leader's namespace, captured here.
+    let ns = (host_pid == pid()).then(|| vfs::proc_mount_namespace(thread));
     let mut prepared = (String::new(), 0u64);
     for _ in 0..8 {
-        let event = vfs::mount_event();
-        let text = match process_mount_points(host_pid) {
+        let event = ns
+            .as_ref()
+            .map(|ns| vfs::mount_namespace_event(ns))
+            .unwrap_or(0);
+        let text = match mount_poll_points(host_pid, ns.as_ref()) {
             Ok(points) => {
                 if info {
                     mountinfo(points)
@@ -1687,7 +1718,11 @@ fn open_mount_table(host_pid: i32, info: bool, cloexec: bool) -> i64 {
             }
             Err(error) => return -(error as i64),
         };
-        let stable = vfs::mount_event() == event;
+        let now = ns
+            .as_ref()
+            .map(|ns| vfs::mount_namespace_event(ns))
+            .unwrap_or(0);
+        let stable = now == event;
         prepared = (text, event);
         if stable {
             break;
@@ -1706,6 +1741,7 @@ fn open_mount_table(host_pid: i32, info: bool, cloexec: bool) -> i64 {
             info,
             seen: AtomicU64::new(event),
             filled: AtomicU64::new(event),
+            ns,
         }),
     );
     if let Err(error) = fdtab::publish_guest(fd_i) {
@@ -1726,7 +1762,7 @@ pub(super) fn mount_poll_bits(fd: i32) -> Option<i16> {
     let mut bits = MOUNT_IN | MOUNT_RDNORM;
     // Another process's table is not this process's `ns->event`. The file
     // is still pollable; it does not invent a priority edge.
-    if poll.host_pid == pid() && poll.seen.load(Ordering::Acquire) != vfs::mount_event() {
+    if poll.host_pid == pid() && poll.seen.load(Ordering::Acquire) != poll_generation(poll) {
         bits |= MOUNT_ERR | MOUNT_PRI;
     }
     Some(bits)
@@ -1742,7 +1778,7 @@ pub(super) fn take_mount_edge(fd: i32) -> bool {
     if poll.host_pid != pid() {
         return false;
     }
-    let current = vfs::mount_event();
+    let current = poll_generation(poll);
     let seen = poll.seen.load(Ordering::Acquire);
     if seen == current {
         return false;
@@ -1856,6 +1892,7 @@ pub(super) fn load_mount_poll(r: &mut super::fork_state::Reader) -> Arc<MountPol
         info: r.bool(),
         seen: AtomicU64::new(r.u64()),
         filled: AtomicU64::new(r.u64()),
+        ns: Some(vfs::proc_mount_namespace(None)),
     })
 }
 
@@ -1889,6 +1926,7 @@ pub(super) fn restore_mount_exec(
                 info,
                 seen: AtomicU64::new(seen),
                 filled: AtomicU64::new(filled),
+                ns: Some(vfs::proc_mount_namespace(None)),
             })
         })
         .clone();
@@ -1914,11 +1952,11 @@ pub(super) fn refresh_mount_file(fd: i32) {
         return;
     }
     for _ in 0..4 {
-        let event = vfs::mount_event();
+        let event = poll_generation(&poll);
         if poll.filled.load(Ordering::Acquire) == event {
             return;
         }
-        let text = match process_mount_points(poll.host_pid) {
+        let text = match mount_poll_points(poll.host_pid, poll.ns.as_ref()) {
             Ok(points) => {
                 if poll.info {
                     mountinfo(points)
@@ -1928,7 +1966,7 @@ pub(super) fn refresh_mount_file(fd: i32) {
             }
             Err(_) => return,
         };
-        if vfs::mount_event() != event {
+        if poll_generation(&poll) != event {
             continue;
         }
         // SAFETY: the content file's offset, restored after the rewrite.
@@ -2414,11 +2452,15 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     }
     Some(match node(&canon) {
         Some(Node::Mem(pid)) => super::proc_mem::open(pid, flags),
-        Some(Node::MountTable { host_pid, info }) => {
+        Some(Node::MountTable {
+            host_pid,
+            info,
+            thread,
+        }) => {
             if write {
                 return Some(-(EACCES as i64));
             }
-            open_mount_table(host_pid, info, cloexec)
+            open_mount_table(host_pid, info, thread, cloexec)
         }
         Some(Node::NetTable(kind)) => {
             if write {
@@ -2461,11 +2503,16 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
                 format!("/proc/{t}")
             };
             let linked = node(&canonical(&target));
-            if let Some(Node::MountTable { host_pid, info }) = linked {
+            if let Some(Node::MountTable {
+                host_pid,
+                info,
+                thread,
+            }) = linked
+            {
                 if write {
                     return Some(-(EACCES as i64));
                 }
-                open_mount_table(host_pid, info, cloexec)
+                open_mount_table(host_pid, info, thread, cloexec)
             } else if let Some(Node::Dir(list)) = linked {
                 dir_fd(&canonical(&target), list, cloexec)
             } else if let Some(Node::File(data)) = linked.filter(|_| !write) {
@@ -3718,5 +3765,86 @@ mod tests {
         }
         let _ = std::fs::remove_dir(root.join("ns-default"));
         let _ = std::fs::remove_dir(root.join("ns-boot"));
+    }
+
+    /// `mntns_install` rejects a shared `fs_struct` (`users != 1`), including
+    /// `setns` back into the namespace the caller is already in.
+    #[test]
+    fn mount_namespace_setns_with_a_shared_fs_is_einval() {
+        let (_view, _root) = crate::vfs::test_view();
+        let share = crate::vfs::testing_share_fs();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        drop(share);
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::sys::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    /// Init's sequence with the property-service thread still alive:
+    /// `unshare(CLONE_NEWNS)` unshares `fs`, the pre-unshare fd keeps its
+    /// inode, and `setns` of that fd succeeds.
+    #[test]
+    fn mount_namespace_unshare_then_setns_with_another_thread() {
+        let (_view, root) = crate::vfs::test_view();
+        let share = crate::vfs::testing_share_fs();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+
+        let host = root.join("ns-other-thread");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-other-thread",
+            &host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert!(mounts_text().contains(" /mnt/ns-other-thread "));
+        assert!(!share.mounts_contain("/mnt/ns-other-thread"));
+
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+        assert!(!mounts_text().contains(" /mnt/ns-other-thread "));
+        assert_eq!(
+            crate::sys::mount::setns([(-1i32) as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-other-thread");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        drop(share);
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(host);
     }
 }

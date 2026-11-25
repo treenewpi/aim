@@ -15,18 +15,18 @@
 //! - `/dev/input` is the display server's device directory
 //!   ([`set_input_dir`], `sys::evdev`).
 //! - The process's own mounts (`mount(2)` with `MS_BIND` or `tmpfs`,
-//!   `sys/mount.rs`) are entries over the same table. They belong to this
-//!   process and its children, as after `unshare(CLONE_NEWNS)`. A mount
-//!   hides the older ones at and below its mount point, as mounting over a
-//!   directory does (zygote's tmpfs over `/data/user` hides the path map's
-//!   `/data/user/0`).
+//!   `sys/mount.rs`) are entries over the calling thread's mount namespace.
+//!   Threads share that namespace until `unshare(CLONE_NEWNS)`, which also
+//!   unshares the caller's `fs_struct`. A mount hides the older ones at and
+//!   below its mount point, as mounting over a directory does (zygote's
+//!   tmpfs over `/data/user` hides the path map's `/data/user/0`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::errno::{self, Errno};
@@ -427,6 +427,7 @@ fn fuse_table_identity() -> Result<Option<(u64, i64, i64, i64, i64)>, Errno> {
     }
 }
 pub fn refresh_fuse_mounts() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     refresh_namespace()?;
     if fuse_table().is_none() {
         return Ok(());
@@ -674,6 +675,9 @@ pub fn private_mount_namespace() -> Result<(), Errno> {
         publish_process_namespace()?;
     }
     PRIVATE_MOUNTS.store(true, Ordering::Release);
+    if let Some(id) = mount_namespace_id_locked() {
+        *current_mount_namespace().journal_id.lock().unwrap() = Some(id);
+    }
     Ok(())
 }
 
@@ -706,137 +710,494 @@ fn namespace_error(error: std::io::Error) -> Errno {
     errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
-/// One mount namespace this process can name with `/proc/self/ns/mnt`.
-/// `saved` is the table while another namespace is live. `None` means this
-/// namespace is the process's current table.
+/// One mount namespace a thread can name with `/proc/<pid>/ns/mnt`.
+/// The open fd holds this `Arc` from the moment of `open`. `table` stays
+/// with the namespace; it is not looked up again from the calling thread
+/// at `setns`. `parked` is the propagation journal while another namespace
+/// owns the process-wide journal slot.
 pub(crate) struct MountNs {
     ino: u64,
-    saved: Mutex<Option<NsImage>>,
+    table: RwLock<Table>,
+    event: AtomicU64,
+    parked: Mutex<Option<ParkedJournal>>,
+    journal_id: Mutex<Option<String>>,
 }
 
-struct NsImage {
-    mounts: Vec<Mount>,
+struct ParkedView {
+    owner: aim_storage::mount_namespace::Namespace,
+    records: std::sync::Arc<Vec<aim_storage::mount_namespace::MountRecord>>,
     generation: u64,
+}
+
+struct ParkedJournal {
     propagation: Vec<(String, Propagation)>,
     private_mounts: bool,
-    owner: Option<aim_storage::mount_namespace::Namespace>,
-    records: Option<std::sync::Arc<Vec<aim_storage::mount_namespace::MountRecord>>>,
-    view_generation: u64,
+    view: Option<ParkedView>,
 }
 
-static NS_SWITCH: Mutex<()> = Mutex::new(());
-static CURRENT_NS: Mutex<Option<std::sync::Arc<MountNs>>> = Mutex::new(None);
-static NAMESPACES: Mutex<BTreeMap<u64, std::sync::Arc<MountNs>>> = Mutex::new(BTreeMap::new());
+/// `fs_struct`. `users` is Linux `fs->users`: `CLONE_FS` shares one, and
+/// `unshare(CLONE_FS)` (implied by `CLONE_NEWNS`) gives the caller a private
+/// one. `mntns_install` returns `EINVAL` while `users != 1`.
+struct SharedFs {
+    users: AtomicU32,
+    cwd: Mutex<String>,
+}
+
+#[derive(Clone)]
+struct TaskState {
+    fs: Arc<SharedFs>,
+    ns: Arc<MountNs>,
+}
+
+thread_local! {
+    static TASK: std::cell::RefCell<Option<TaskState>> = const { std::cell::RefCell::new(None) };
+    static JOURNAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static JOURNAL_GUARD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+static TASKS: Mutex<BTreeMap<i32, TaskState>> = Mutex::new(BTreeMap::new());
+static JOURNAL: Mutex<()> = Mutex::new(());
+static JOURNAL_OWNER: AtomicU64 = AtomicU64::new(0);
+static BOOT_NS: Mutex<Option<Arc<MountNs>>> = Mutex::new(None);
+static BOOT_TABLE: Mutex<Option<Table>> = Mutex::new(None);
+static NAMESPACES: Mutex<BTreeMap<u64, Arc<MountNs>>> = Mutex::new(BTreeMap::new());
 static NEXT_NS_INO: AtomicU64 = AtomicU64::new(0x1000_0001);
 
 fn next_ns_ino() -> u64 {
     NEXT_NS_INO.fetch_add(1, Ordering::Relaxed)
 }
 
-fn current_mount_namespace() -> std::sync::Arc<MountNs> {
-    let mut current = CURRENT_NS.lock().unwrap();
-    if let Some(ns) = current.as_ref() {
-        return std::sync::Arc::clone(ns);
+fn mount_namespace_id_locked() -> Option<String> {
+    NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.id().to_owned())
+}
+
+fn boot_namespace() -> Arc<MountNs> {
+    let mut slot = BOOT_NS.lock().unwrap();
+    if let Some(ns) = slot.as_ref() {
+        return Arc::clone(ns);
     }
-    let ns = std::sync::Arc::new(MountNs {
+    let table = BOOT_TABLE.lock().unwrap().take().unwrap_or(Table {
+        mounts: Vec::new(),
+        visible: OnceLock::new(),
+        generation: 0,
+        poll_stamp: 0,
+    });
+    let ns = Arc::new(MountNs {
         ino: next_ns_ino(),
-        saved: Mutex::new(None),
+        table: RwLock::new(table),
+        event: AtomicU64::new(0),
+        parked: Mutex::new(None),
+        journal_id: Mutex::new(mount_namespace_id_locked()),
     });
     NAMESPACES
         .lock()
         .unwrap()
-        .insert(ns.ino, std::sync::Arc::clone(&ns));
-    *current = Some(std::sync::Arc::clone(&ns));
+        .insert(ns.ino, Arc::clone(&ns));
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    *slot = Some(Arc::clone(&ns));
     ns
 }
 
-/// `readlink` text of the process's current mount namespace.
-pub fn mount_namespace_link() -> String {
-    let _switch = NS_SWITCH.lock().unwrap();
-    format!("mnt:[{}]", current_mount_namespace().ino)
+fn fresh_task() -> TaskState {
+    let cwd = VFS
+        .get()
+        .map(|vfs| vfs.cwd.lock().unwrap().clone())
+        .unwrap_or_else(|| "/".to_owned());
+    TaskState {
+        fs: Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        }),
+        ns: boot_namespace(),
+    }
 }
 
-pub(crate) fn mount_namespace(ino: u64) -> Option<std::sync::Arc<MountNs>> {
-    NAMESPACES.lock().unwrap().get(&ino).map(std::sync::Arc::clone)
+fn current_task() -> TaskState {
+    if let Some(tid) = crate::sys::current_guest_tid()
+        && let Some(task) = TASKS.lock().unwrap().get(&tid).cloned()
+    {
+        return task;
+    }
+    TASK.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(fresh_task());
+        }
+        slot.borrow().as_ref().unwrap().clone()
+    })
+}
+
+fn store_task(task: TaskState) {
+    if let Some(tid) = crate::sys::current_guest_tid() {
+        TASKS.lock().unwrap().insert(tid, task.clone());
+    }
+    TASK.with(|slot| *slot.borrow_mut() = Some(task));
+}
+
+fn current_mount_namespace() -> Arc<MountNs> {
+    current_task().ns
+}
+
+fn set_current_ns(ns: Arc<MountNs>) {
+    let mut task = current_task();
+    task.ns = ns;
+    store_task(task);
+}
+
+/// The main thread's mount namespace, so `/proc/self` names the leader
+/// after `register_current`.
+pub(crate) fn note_leader(tid: i32) {
+    let task = current_task();
+    TASKS.lock().unwrap().insert(tid, task);
+}
+
+/// A new guest thread. `share_fs` is `CLONE_FS`: one `fs_struct`, and the
+/// same mount namespace until this thread `unshare`s or `setns`s.
+pub(crate) fn bind_spawned_thread(tid: i32, share_fs: bool) {
+    let parent = current_task();
+    let fs = if share_fs {
+        parent.fs.users.fetch_add(1, Ordering::AcqRel);
+        Arc::clone(&parent.fs)
+    } else {
+        Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(parent.fs.cwd.lock().unwrap().clone()),
+        })
+    };
+    TASKS.lock().unwrap().insert(
+        tid,
+        TaskState {
+            fs,
+            ns: Arc::clone(&parent.ns),
+        },
+    );
+}
+
+/// The child host thread adopts the `TaskState` `spawn` stored for it.
+pub(crate) fn adopt_thread_task(tid: i32) {
+    if let Some(task) = TASKS.lock().unwrap().get(&tid).cloned() {
+        TASK.with(|slot| *slot.borrow_mut() = Some(task));
+    }
+}
+
+/// `exit` drops this thread's `CLONE_FS` hold.
+pub(crate) fn unbind_thread(tid: i32) {
+    if let Some(task) = TASKS.lock().unwrap().remove(&tid) {
+        task.fs.users.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `true` when `current->fs->users != 1`: `setns` of a mount namespace
+/// returns `EINVAL`.
+pub(crate) fn fs_is_shared() -> bool {
+    current_task().fs.users.load(Ordering::Acquire) != 1
+}
+
+/// `unshare(CLONE_FS)`. `CLONE_NEWNS` implies it. A private `fs_struct`
+/// (`users == 1`) is unchanged.
+pub fn unshare_fs() {
+    let task = current_task();
+    loop {
+        let users = task.fs.users.load(Ordering::Acquire);
+        if users <= 1 {
+            return;
+        }
+        if task
+            .fs
+            .users
+            .compare_exchange(users, users - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let cwd = task.fs.cwd.lock().unwrap().clone();
+        let mut updated = task;
+        updated.fs = Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        });
+        store_task(updated);
+        return;
+    }
+}
+
+fn task_namespace(tid: i32) -> Option<Arc<MountNs>> {
+    TASKS
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .map(|task| Arc::clone(&task.ns))
+}
+
+/// Mount namespace named by `/proc/<pid>/ns/mnt` or `task/<tid>/ns/mnt`.
+/// `None` is the thread-group leader (`/proc/self`).
+pub(crate) fn proc_mount_namespace(thread: Option<i32>) -> Arc<MountNs> {
+    let tid = thread.unwrap_or_else(crate::sys::main_guest_tid);
+    task_namespace(tid).unwrap_or_else(current_mount_namespace)
+}
+
+pub(crate) fn proc_namespace_link(thread: Option<i32>) -> String {
+    format!("mnt:[{}]", proc_mount_namespace(thread).ino)
+}
+
+/// `readlink` text of the leader's mount namespace (`/proc/self/ns/mnt`).
+pub fn mount_namespace_link() -> String {
+    proc_namespace_link(None)
+}
+
+pub(crate) fn mount_namespace(ino: u64) -> Option<Arc<MountNs>> {
+    NAMESPACES.lock().unwrap().get(&ino).map(Arc::clone)
 }
 
 pub(crate) fn mount_namespace_ino(ns: &MountNs) -> u64 {
     ns.ino
 }
 
-fn capture_namespace() -> NsImage {
-    let table = vfs().mounts.read().unwrap();
+pub(crate) fn mount_namespace_event(ns: &MountNs) -> u64 {
+    ns.event.load(Ordering::Acquire)
+}
+
+/// Journal id captured for this namespace, so an open mounts file keeps
+/// reading the namespace it named at `open`.
+pub(crate) fn mount_points_of(ns: &MountNs) -> Result<Vec<MountPoint>, Errno> {
+    if let Some(id) = ns.journal_id.lock().unwrap().clone() {
+        return namespace_mount_points(&id);
+    }
+    mount_points()
+}
+
+struct JournalEntered;
+
+impl Drop for JournalEntered {
+    fn drop(&mut self) {
+        JOURNAL_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                JOURNAL_GUARD.with(|guard| *guard.borrow_mut() = None);
+            }
+        });
+    }
+}
+
+fn journal_enter() -> Result<JournalEntered, Errno> {
+    let depth = JOURNAL_DEPTH.with(|depth| depth.get());
+    if depth == 0 {
+        let guard = JOURNAL.lock().unwrap_or_else(|error| error.into_inner());
+        // SAFETY: `JOURNAL` is static. The guard stays in this thread until
+        // the outermost `journal_enter` drops it.
+        let guard: std::sync::MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
+        JOURNAL_GUARD.with(|slot| *slot.borrow_mut() = Some(guard));
+        // Depth is raised before `align` so a nested enter (publish, refresh)
+        // does not lock `JOURNAL` again on this thread.
+        JOURNAL_DEPTH.with(|depth| depth.set(1));
+        if let Err(error) = align_locked() {
+            JOURNAL_DEPTH.with(|depth| depth.set(0));
+            JOURNAL_GUARD.with(|slot| *slot.borrow_mut() = None);
+            return Err(error);
+        }
+        return Ok(JournalEntered);
+    }
+    JOURNAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    Ok(JournalEntered)
+}
+
+fn copy_journal() -> ParkedJournal {
     let view = NAMESPACE_VIEW.lock().unwrap();
-    NsImage {
-        mounts: table.0.mounts.clone(),
-        generation: table.0.generation,
+    ParkedJournal {
         propagation: PROPAGATION_RULES.lock().unwrap().clone(),
         private_mounts: PRIVATE_MOUNTS.load(Ordering::Acquire),
-        owner: view.as_ref().map(|view| view.owner.clone()),
-        records: view.as_ref().map(|view| std::sync::Arc::clone(&view.records)),
-        view_generation: view.as_ref().map(|view| view.generation).unwrap_or(0),
+        view: view.as_ref().map(|view| ParkedView {
+            owner: view.owner.clone(),
+            records: Arc::clone(&view.records),
+            generation: view.generation,
+        }),
     }
 }
 
-fn install_namespace(image: NsImage) -> Result<(), Errno> {
-    {
-        let mut table = vfs().mounts.write().unwrap();
-        table.0.mounts = image.mounts;
-        table.0.generation = image.generation;
-        table.0.visible = OnceLock::new();
+fn take_journal() -> ParkedJournal {
+    let view = NAMESPACE_VIEW.lock().unwrap().take();
+    ParkedJournal {
+        propagation: std::mem::take(&mut *PROPAGATION_RULES.lock().unwrap()),
+        private_mounts: PRIVATE_MOUNTS.swap(false, Ordering::AcqRel),
+        view: view.map(|view| ParkedView {
+            owner: view.owner,
+            records: view.records,
+            generation: view.generation,
+        }),
     }
-    *PROPAGATION_RULES.lock().unwrap() = image.propagation;
-    PRIVATE_MOUNTS.store(image.private_mounts, Ordering::Release);
-    if let Some(owner) = image.owner {
-        let page = owner.generation().map_err(namespace_error)?;
+}
+
+fn install_parked(parked: ParkedJournal) -> Result<(), Errno> {
+    *PROPAGATION_RULES.lock().unwrap() = parked.propagation;
+    PRIVATE_MOUNTS.store(parked.private_mounts, Ordering::Release);
+    if let Some(view) = parked.view {
+        let page = view.owner.generation().map_err(namespace_error)?;
         *NAMESPACE_VIEW.lock().unwrap() = Some(NamespaceView {
             page,
-            owner,
-            generation: image.view_generation,
-            records: image
-                .records
-                .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
+            owner: view.owner,
+            generation: view.generation,
+            records: view.records,
         });
         publish_process_namespace()?;
+    } else {
+        *NAMESPACE_VIEW.lock().unwrap() = None;
     }
     Ok(())
 }
 
-/// `unshare(CLONE_NEWNS)`: keep the current namespace for any fd that
-/// already names it, and make a copy the process's current namespace.
-pub fn split_mount_namespace() -> Result<(), Errno> {
-    let _switch = NS_SWITCH.lock().unwrap();
-    refresh_fuse_mounts()?;
-    let old = current_mount_namespace();
-    *old.saved.lock().unwrap() = Some(capture_namespace());
-    private_mount_namespace()?;
-    let ns = std::sync::Arc::new(MountNs {
-        ino: next_ns_ino(),
-        saved: Mutex::new(None),
-    });
-    NAMESPACES
-        .lock()
-        .unwrap()
-        .insert(ns.ino, std::sync::Arc::clone(&ns));
-    *CURRENT_NS.lock().unwrap() = Some(ns);
+fn park_owner(ns: &MountNs) {
+    if JOURNAL_OWNER.load(Ordering::Acquire) != ns.ino {
+        return;
+    }
+    *ns.parked.lock().unwrap() = Some(take_journal());
+    JOURNAL_OWNER.store(0, Ordering::Release);
+}
+
+fn unpark(ns: &MountNs) -> Result<(), Errno> {
+    if let Some(parked) = ns.parked.lock().unwrap().take() {
+        install_parked(parked)?;
+    }
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    if ns.journal_id.lock().unwrap().is_none()
+        && let Some(id) = mount_namespace_id_locked()
+    {
+        *ns.journal_id.lock().unwrap() = Some(id);
+    }
     Ok(())
 }
 
-/// `setns` into `target`. The same namespace is success.
-pub fn switch_mount_namespace(target: &std::sync::Arc<MountNs>) -> Result<(), Errno> {
-    let _switch = NS_SWITCH.lock().unwrap();
-    let current = current_mount_namespace();
-    if std::sync::Arc::ptr_eq(&current, target) {
+fn align_locked() -> Result<(), Errno> {
+    let ns = current_mount_namespace();
+    let owner = JOURNAL_OWNER.load(Ordering::Acquire);
+    if owner == ns.ino {
+        if ns.journal_id.lock().unwrap().is_none()
+            && let Some(id) = mount_namespace_id_locked()
+        {
+            *ns.journal_id.lock().unwrap() = Some(id);
+        }
         return Ok(());
     }
-    let incoming = target.saved.lock().unwrap().take();
-    let Some(incoming) = incoming else {
-        return Err(errno::EINVAL);
+    if owner != 0 {
+        if let Some(previous) = NAMESPACES.lock().unwrap().get(&owner).cloned() {
+            park_owner(&previous);
+        } else {
+            JOURNAL_OWNER.store(0, Ordering::Release);
+        }
+    }
+    unpark(&ns)
+}
+
+fn duplicate_table(table: &Table) -> Table {
+    Table {
+        mounts: table.mounts.clone(),
+        visible: OnceLock::new(),
+        generation: table.generation,
+        poll_stamp: table.poll_stamp,
+    }
+}
+
+/// `unshare(CLONE_NEWNS)`: the caller's new namespace is a copy. Fds and
+/// other threads keep the namespace from before the call.
+pub fn split_mount_namespace() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
+    refresh_fuse_mounts()?;
+    let old = current_mount_namespace();
+    let old_id = old.journal_id.lock().unwrap().clone();
+    *old.parked.lock().unwrap() = Some(copy_journal());
+    if let Err(error) = private_mount_namespace() {
+        *old.parked.lock().unwrap() = None;
+        return Err(error);
+    }
+    let new_id = old.journal_id.lock().unwrap().clone();
+    *old.journal_id.lock().unwrap() = old_id;
+    let table = {
+        let guard = old.table.read().unwrap_or_else(|error| error.into_inner());
+        duplicate_table(&guard)
     };
-    *current.saved.lock().unwrap() = Some(capture_namespace());
-    install_namespace(incoming)
+    let ns = Arc::new(MountNs {
+        ino: next_ns_ino(),
+        table: RwLock::new(table),
+        event: AtomicU64::new(old.event.load(Ordering::Acquire)),
+        parked: Mutex::new(None),
+        journal_id: Mutex::new(new_id),
+    });
+    NAMESPACES.lock().unwrap().insert(ns.ino, Arc::clone(&ns));
+    set_current_ns(Arc::clone(&ns));
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    Ok(())
+}
+
+/// `setns` into `target` for this thread only. `fs->users != 1` is
+/// `EINVAL`. The same namespace still sets the caller's cwd to `/`.
+pub(crate) fn switch_mount_namespace(target: &Arc<MountNs>) -> Result<(), Errno> {
+    if fs_is_shared() {
+        return Err(errno::EINVAL);
+    }
+    let _hold = journal_enter()?;
+    let current = current_mount_namespace();
+    if Arc::ptr_eq(&current, target) {
+        *current_task().fs.cwd.lock().unwrap() = "/".to_owned();
+        return Ok(());
+    }
+    park_owner(&current);
+    set_current_ns(Arc::clone(target));
+    if let Err(error) = unpark(target) {
+        set_current_ns(Arc::clone(&current));
+        let _ = unpark(&current);
+        return Err(error);
+    }
+    *current_task().fs.cwd.lock().unwrap() = "/".to_owned();
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) struct FsShare {
+    fs: Arc<SharedFs>,
+    ns: Arc<MountNs>,
+}
+
+#[cfg(test)]
+impl Drop for FsShare {
+    fn drop(&mut self) {
+        self.fs.users.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+impl FsShare {
+    pub(crate) fn namespace_link(&self) -> String {
+        format!("mnt:[{}]", self.ns.ino)
+    }
+
+    pub(crate) fn mounts_contain(&self, guest: &str) -> bool {
+        self.ns
+            .table
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .mounts
+            .iter()
+            .any(|mount| mount.guest == guest)
+    }
+}
+
+/// One extra `fs->users` and a hold on the namespace at this moment, the
+/// way a `CLONE_FS` sibling still lives in the pre-`unshare` namespace.
+#[cfg(test)]
+pub(crate) fn testing_share_fs() -> FsShare {
+    let task = current_task();
+    task.fs.users.fetch_add(1, Ordering::AcqRel);
+    FsShare {
+        fs: Arc::clone(&task.fs),
+        ns: Arc::clone(&task.ns),
+    }
 }
 fn namespace_event(event: &str) -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
         return Ok(());
     }
@@ -971,6 +1332,7 @@ fn publish_mount_policy(guest: &str) -> Result<(), Errno> {
 }
 
 fn refresh_namespace() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
         return Ok(());
     }
@@ -1011,11 +1373,8 @@ fn refresh_namespace() -> Result<(), Errno> {
     Ok(())
 }
 pub fn mount_namespace_id() -> Option<String> {
-    NAMESPACE_VIEW
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|view| view.owner.id().to_owned())
+    let _hold = journal_enter().ok()?;
+    mount_namespace_id_locked()
 }
 
 pub(crate) fn publish_process_namespace() -> Result<(), Errno> {
@@ -1248,7 +1607,7 @@ struct Vfs {
 /// at the first lookup after a change) and a count of its changes:
 /// lookups ask visibility for every path, and the table changes far less
 /// often.
-struct MountTable(RwLock<Table>);
+struct MountTable;
 struct Table {
     mounts: Vec<Mount>,
     visible: OnceLock<Vec<bool>>,
@@ -1261,24 +1620,70 @@ struct Table {
 impl MountTable {
     fn new(mounts: Vec<Mount>) -> Self {
         let poll_stamp = mount_stamp(&mounts);
-        Self(RwLock::new(Table {
+        let table = Table {
             mounts,
             visible: OnceLock::new(),
             generation: 0,
             poll_stamp,
-        }))
+        };
+        if let Some(ns) = BOOT_NS.lock().unwrap().as_ref().cloned() {
+            *ns.table.write().unwrap_or_else(|error| error.into_inner()) = table;
+        } else {
+            *BOOT_TABLE.lock().unwrap() = Some(table);
+        }
+        Self
     }
-    fn read(&self) -> std::sync::LockResult<MountsRead<'_>> {
-        self.0
-            .read()
-            .map(MountsRead)
-            .map_err(|error| std::sync::PoisonError::new(MountsRead(error.into_inner())))
+    fn read(&self) -> std::sync::LockResult<MountsRead<'static>> {
+        let ns = current_mount_namespace();
+        match detach_read(&ns) {
+            Ok(guard) => Ok(MountsRead { guard, _ns: ns }),
+            Err(error) => {
+                let guard = error.into_inner();
+                Err(std::sync::PoisonError::new(MountsRead { guard, _ns: ns }))
+            }
+        }
     }
-    fn write(&self) -> std::sync::LockResult<MountsWrite<'_>> {
-        self.0
-            .write()
-            .map(MountsWrite)
-            .map_err(|error| std::sync::PoisonError::new(MountsWrite(error.into_inner())))
+    fn write(&self) -> std::sync::LockResult<MountsWrite<'static>> {
+        let ns = current_mount_namespace();
+        match detach_write(&ns) {
+            Ok(guard) => Ok(MountsWrite { guard, _ns: ns }),
+            Err(error) => {
+                let guard = error.into_inner();
+                Err(std::sync::PoisonError::new(MountsWrite { guard, _ns: ns }))
+            }
+        }
+    }
+}
+
+fn detach_read(
+    ns: &MountNs,
+) -> std::sync::LockResult<std::sync::RwLockReadGuard<'static, Table>> {
+    match ns.table.read() {
+        // SAFETY: the caller keeps `ns`'s `Arc` alive until the guard drops.
+        Ok(guard) => Ok(unsafe { std::mem::transmute(guard) }),
+        Err(error) => {
+            let guard = error.into_inner();
+            // SAFETY: same as the unpoisoned path.
+            Err(std::sync::PoisonError::new(unsafe {
+                std::mem::transmute(guard)
+            }))
+        }
+    }
+}
+
+fn detach_write(
+    ns: &MountNs,
+) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'static, Table>> {
+    match ns.table.write() {
+        // SAFETY: the caller keeps `ns`'s `Arc` alive until the guard drops.
+        Ok(guard) => Ok(unsafe { std::mem::transmute(guard) }),
+        Err(error) => {
+            let guard = error.into_inner();
+            // SAFETY: same as the unpoisoned path.
+            Err(std::sync::PoisonError::new(unsafe {
+                std::mem::transmute(guard)
+            }))
+        }
     }
 }
 impl Table {
@@ -1289,11 +1694,16 @@ impl Table {
         self.generation += 1;
     }
 }
-struct MountsRead<'a>(std::sync::RwLockReadGuard<'a, Table>);
+struct MountsRead<'a> {
+    // Fields drop in declaration order. Unlock before the `Arc` can free the
+    // `RwLock`.
+    guard: std::sync::RwLockReadGuard<'a, Table>,
+    _ns: Arc<MountNs>,
+}
 impl MountsRead<'_> {
     /// Whether no later mount hides the `index`th.
     fn visible(&self, index: usize) -> bool {
-        let table = &self.0;
+        let table = &*self.guard;
         table.visible.get_or_init(|| {
             table
                 .mounts
@@ -1303,41 +1713,44 @@ impl MountsRead<'_> {
         })[index]
     }
     fn generation(&self) -> u64 {
-        self.0.generation
+        self.guard.generation
     }
 }
 impl std::ops::Deref for MountsRead<'_> {
     type Target = Vec<Mount>;
     fn deref(&self) -> &Vec<Mount> {
-        &self.0.mounts
+        &self.guard.mounts
     }
 }
-struct MountsWrite<'a>(std::sync::RwLockWriteGuard<'a, Table>);
+struct MountsWrite<'a> {
+    // Fields drop in declaration order. Unlock before the `Arc` can free the
+    // `RwLock`.
+    guard: std::sync::RwLockWriteGuard<'a, Table>,
+    _ns: Arc<MountNs>,
+}
 impl std::ops::Deref for MountsWrite<'_> {
     type Target = Vec<Mount>;
     fn deref(&self) -> &Vec<Mount> {
-        &self.0.mounts
+        &self.guard.mounts
     }
 }
 impl std::ops::DerefMut for MountsWrite<'_> {
     fn deref_mut(&mut self) -> &mut Vec<Mount> {
-        &mut self.0.mounts
+        &mut self.guard.mounts
     }
 }
 impl Drop for MountsWrite<'_> {
     fn drop(&mut self) {
-        let stamp = mount_stamp(&self.0.mounts);
-        let changed = stamp != self.0.poll_stamp;
-        self.0.poll_stamp = stamp;
-        self.0.changed();
+        let stamp = mount_stamp(&self.guard.mounts);
+        let changed = stamp != self.guard.poll_stamp;
+        self.guard.poll_stamp = stamp;
+        self.guard.changed();
         if changed {
             note_mount_table();
         }
     }
 }
 
-/// `ns->event` for this process's mount namespace (`touch_mnt_namespace`).
-static MOUNT_EVENT: AtomicU64 = AtomicU64::new(0);
 static MOUNT_WAKE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static MOUNT_WAKE_ERRNO: AtomicI32 = AtomicI32::new(0);
 /// Tests force the wake pipe closed. A failure is not remembered: the next
@@ -1345,15 +1758,17 @@ static MOUNT_WAKE_ERRNO: AtomicI32 = AtomicI32::new(0);
 #[cfg(test)]
 static FAIL_MOUNT_WAKE: AtomicBool = AtomicBool::new(false);
 
-/// The mount generation an open `/proc/mounts` file samples (`p->event`).
+/// The mount generation of the calling thread's namespace (`ns->event`).
 pub fn mount_event() -> u64 {
-    MOUNT_EVENT.load(Ordering::Acquire)
+    current_mount_namespace().event.load(Ordering::Acquire)
 }
 
 /// A fork child starts from the parent's generation, so a copied `p->event`
 /// does not become a new edge.
 pub(crate) fn restore_mount_event(event: u64) {
-    MOUNT_EVENT.store(event, Ordering::Release);
+    current_mount_namespace()
+        .event
+        .store(event, Ordering::Release);
 }
 
 /// Read end of the pipe `note_mount_table` writes. Hidden from the guest.
@@ -1425,7 +1840,9 @@ pub(crate) fn testing_fail_mount_wake(fail: bool) {
 /// poll are one edge: the file stores the generation it observes. The
 /// generation moves even when the pipe cannot be written.
 fn note_mount_table() {
-    MOUNT_EVENT.fetch_add(1, Ordering::Release);
+    current_mount_namespace()
+        .event
+        .fetch_add(1, Ordering::Release);
     let Ok((_, fd)) = mount_wake() else {
         return;
     };
@@ -2324,11 +2741,11 @@ pub fn writable_hosts() -> Option<Vec<PathBuf>> {
 }
 
 pub fn cwd() -> String {
-    vfs().cwd.lock().unwrap().clone()
+    current_task().fs.cwd.lock().unwrap().clone()
 }
 
 pub fn set_cwd(guest: String) {
-    *vfs().cwd.lock().unwrap() = guest;
+    *current_task().fs.cwd.lock().unwrap() = guest;
 }
 
 /// The rest of `path` below the mount point `at`, if it is there.

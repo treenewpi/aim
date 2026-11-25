@@ -1454,6 +1454,33 @@ pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<
     stdio_write_note(super::tracing(), nr, a, returned)
 }
 
+/// Bounded `readlinkat` result. `returned` is the syscall result and is
+/// not rewritten. The path is already on the enter line; this is the bytes
+/// written into the guest buffer, so `mnt:[inode]` can be compared across
+/// the two opens in `SetupMountNamespaces`.
+pub(super) fn trace_readlinkat(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    if nr != 78 || returned <= 0 {
+        return None;
+    }
+    const CAP: usize = 128;
+    let want = (returned as usize).min(CAP);
+    match super::user_memory::read_exact(a[2], want) {
+        Ok(bytes) => {
+            let mut line = format!(
+                "[linux-trace] readlinkat result returned={returned} payload=\"{}\"",
+                escape_stdio(&bytes)
+            );
+            if (returned as usize) > CAP {
+                line.push_str(&format!(" truncated cap={CAP}"));
+            }
+            Some(line)
+        }
+        Err(_) => Some(format!(
+            "[linux-trace] readlinkat result returned={returned} unreadable"
+        )),
+    }
+}
+
 fn stdio_write_note(enabled: bool, nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
     if !enabled {
         return None;

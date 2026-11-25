@@ -487,6 +487,7 @@ pub fn register_current(ctx: *mut GuestContext, stacks: HostStacks) {
     th.pthread
         .store(unsafe { libc::pthread_self() } as usize, SeqCst);
     super::procrec::running(th.tid, host_id(th.pthread.load(SeqCst)));
+    crate::vfs::note_leader(th.tid);
     // SAFETY: `ctx` is the caller's fresh context.
     unsafe {
         (*ctx).tid = th.tid as u64;
@@ -592,6 +593,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
         }
     };
     let tid = th.tid;
+    crate::vfs::bind_spawned_thread(tid, flags & CLONE_FS != 0);
     if let Err(error) = super::cgroup::thread_created(parent.tid, tid) {
         with_table_mut(|t| {
             super::procrec::gone(tid);
@@ -599,6 +601,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
             super::cred::forget_nice(tid);
         });
         super::cgroup::thread_gone(tid);
+        crate::vfs::unbind_thread(tid);
         // SAFETY: the child context has not been handed to a pthread.
         drop(unsafe { Box::from_raw(child_ctx) });
         return -(error as i64);
@@ -653,6 +656,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
         });
         super::cgroup::thread_gone(tid);
         super::ptrace::forget(tid);
+        crate::vfs::unbind_thread(tid);
         // SAFETY: the child never started; reclaim what it would own.
         unsafe {
             drop(Box::from_raw(boot));
@@ -681,6 +685,7 @@ extern "C" fn thread_start(arg: *mut libc::c_void) -> *mut libc::c_void {
         th.pthread.store(libc::pthread_self() as usize, SeqCst);
     }
     super::procrec::running(th.tid, host_id(th.pthread.load(SeqCst)));
+    crate::vfs::adopt_thread_task(th.tid);
     if let Err(error) = super::cgroup::refresh_own() {
         eprintln!("cgroup thread start: errno {error}");
         std::process::abort();
@@ -710,6 +715,7 @@ pub fn exit(a: [u64; 6]) -> ! {
     super::run_deferred_unmaps();
     super::futex::exit_robust_list(th.robust_list.load(SeqCst), th.tid);
     let main = th.tid == pid();
+    crate::vfs::unbind_thread(th.tid);
     // Out of the table before a joiner wakes: its tid is gone for tgkill.
     let left = with_table_mut(|t| {
         let (user, system) = sample_cpu_times(th).expect("exiting thread CPU time");

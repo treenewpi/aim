@@ -120,6 +120,14 @@ pub(crate) mod space;
 mod sync_file;
 mod tcp_shutdown;
 mod thread;
+
+pub(crate) fn current_guest_tid() -> Option<i32> {
+    thread::current().map(|thread| thread.tid)
+}
+
+pub(crate) fn main_guest_tid() -> i32 {
+    thread::main_tid()
+}
 mod tmpfile;
 pub(crate) mod tty;
 mod uevent;
@@ -266,6 +274,9 @@ pub fn dispatch(ctx: &mut GuestContext) {
         // After the call: a bounded copy of a write to guest fd 0, 1, or 2.
         // `r` is already the syscall result and is not assigned here.
         if let Some(payload) = fs::trace_stdio_write(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+        }
+        if let Some(payload) = fs::trace_readlinkat(nr, &a, r) {
             crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
         }
         if (-4095..0).contains(&r) {

@@ -47,13 +47,17 @@ fn remove_mount(guest: &str, flags: u64) -> Result<bool, crate::errno::Errno> {
 }
 
 pub fn unshare(a: [u64; 6]) -> i64 {
-    // A process's files, cwd, SysV semaphore undo list and mount table are
-    // already its own.
+    // Files and the SysV undo list are already this process's. `CLONE_FS`
+    // gives the caller a private `fs_struct`. `CLONE_NEWNS` implies that,
+    // then copies the mount namespace for this thread only.
     if a[0] & !(CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_NEWNS) != 0 {
         return -(EINVAL as i64);
     }
     if a[0] & CLONE_NEWNS != 0 && !super::cred::capable(CAP_SYS_ADMIN) {
         return -(EPERM as i64);
+    }
+    if a[0] & (CLONE_FS | CLONE_NEWNS) != 0 {
+        vfs::unshare_fs();
     }
     if a[0] & CLONE_NEWNS != 0 {
         if let Err(error) = vfs::split_mount_namespace() {
@@ -85,11 +89,13 @@ pub fn setns(a: [u64; 6]) -> i64 {
         return -(EINVAL as i64);
     }
     // setns(2) for a mount namespace: CAP_SYS_ADMIN and CAP_SYS_CHROOT.
-    // More than one thread is EINVAL.
+    // `mntns_install` returns EINVAL when `current->fs->users != 1`.
+    // Another thread in the group is not that check: `unshare(CLONE_NEWNS)`
+    // has already unshared `fs`, so this thread can switch while it lives.
     if !super::cred::capable(CAP_SYS_ADMIN) || !super::cred::capable(CAP_SYS_CHROOT) {
         return -(EPERM as i64);
     }
-    if super::thread::tids().len() > 1 {
+    if vfs::fs_is_shared() {
         return -(EINVAL as i64);
     }
     match vfs::switch_mount_namespace(&ns) {
