@@ -239,18 +239,20 @@ fn dst_if_load(op: u8, dst: usize, src: usize) -> usize {
 }
 
 fn identity(group: &Path, root: &Path) -> Result<String, Errno> {
-    use std::os::macos::fs::MetadataExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     group.strip_prefix(root).map_err(|_| EBADF)?;
     let stat = std::fs::metadata(group).map_err(io)?;
+    let file = std::fs::File::open(group).map_err(io)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: local stat of an open directory.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(io(std::io::Error::last_os_error()));
+    }
+    let (born, born_nsec) = aim_storage::host::birth(&st);
     // Cgroup identity, rather than its reusable pathname. Birth time also
     // distinguishes a removed directory if Darwin reuses its inode.
-    Ok(format!(
-        "{}-{}-{}-{}",
-        stat.st_dev(),
-        stat.st_ino(),
-        stat.st_birthtime(),
-        stat.st_birthtime_nsec()
-    ))
+    Ok(format!("{}-{}-{}-{}", stat.dev(), stat.ino(), born, born_nsec))
 }
 
 fn attachment(group: &Path, root: &Path, hook: u32) -> Result<PathBuf, Errno> {

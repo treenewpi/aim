@@ -118,7 +118,7 @@ impl Description {
                 libc::setsockopt(
                     s.as_raw_fd(),
                     libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
+                    aim_storage::host::SO_NOSIGPIPE,
                     (&on as *const i32).cast(),
                     size_of::<i32>() as libc::socklen_t,
                 )
@@ -530,7 +530,7 @@ fn mark(fd: i32, desc: &Descriptor, clock: i32, writable: bool) {
     };
     let tv = libc::timeval {
         tv_sec: desc.client as libc::time_t,
-        tv_usec: (clock + 1) | (writable as i32) << 4,
+        tv_usec: ((clock + 1) | (writable as i32) << 4) as _,
     };
     // SAFETY: socket options on our socket from locals.
     unsafe {
@@ -602,7 +602,7 @@ pub fn adopt(fd: i32) {
         description: Mutex::new(Description::New),
         client: Mutex::new(Client {
             state: live.state,
-            clock: (tv.tv_usec & 0xf) - 1,
+            clock: (tv.tv_usec as i32 & 0xf) - 1,
             revoked: false,
             stale: false,
             masks: None,
@@ -669,7 +669,7 @@ pub fn open(r: &Resolved, flags: u64) -> Option<i64> {
         libc::setsockopt(
             std::os::fd::AsRawFd::as_raw_fd(&stream),
             libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
+            aim_storage::host::SO_NOSIGPIPE,
             (&on as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -1074,7 +1074,7 @@ fn mt_slots(d: &Descriptor, state: &State, size: usize, arg: u64) -> i64 {
 fn as_device(st: &mut libc::stat, index: u32) {
     st.st_mode = libc::S_IFCHR | 0o660;
     // Darwin's dev_t encoding (major in the top byte); stat converts it.
-    st.st_rdev = ((INPUT_MAJOR << 24) | (EVDEV_MINOR_BASE + index)) as i32;
+    st.st_rdev = ((INPUT_MAJOR << 24) | (EVDEV_MINOR_BASE + index)) as _;
     st.st_uid = 0;
     st.st_gid = AID_INPUT;
     st.st_size = 0;

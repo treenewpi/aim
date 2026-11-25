@@ -1810,7 +1810,7 @@ fn work_source(ws: Option<WorkSource>) -> Result<WorkSource, Exception> {
 }
 
 fn uptime() -> i64 {
-    super::clock_ms(libc::CLOCK_UPTIME_RAW)
+    super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW)
 }
 
 /// `SystemClock.elapsedRealtime`, as the app host keeps it.

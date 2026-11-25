@@ -995,22 +995,32 @@ fn spawn_program_suspended(
     struct Setup {
         attr: libc::posix_spawnattr_t,
         actions: libc::posix_spawn_file_actions_t,
+        attr_on: bool,
+        actions_on: bool,
     }
     impl Drop for Setup {
         fn drop(&mut self) {
             unsafe {
-                if !self.actions.is_null() {
+                if self.actions_on {
                     libc::posix_spawn_file_actions_destroy(&mut self.actions);
                 }
-                if !self.attr.is_null() {
+                if self.attr_on {
                     libc::posix_spawnattr_destroy(&mut self.attr);
                 }
             }
         }
     }
     let mut setup = Setup {
+        #[cfg(target_os = "macos")]
         attr: std::ptr::null_mut(),
+        #[cfg(target_os = "macos")]
         actions: std::ptr::null_mut(),
+        #[cfg(not(target_os = "macos"))]
+        attr: unsafe { std::mem::zeroed() },
+        #[cfg(not(target_os = "macos"))]
+        actions: unsafe { std::mem::zeroed() },
+        attr_on: false,
+        actions_on: false,
     };
     let mut pid = 0;
     let checked = |error: i32| {
@@ -1022,21 +1032,23 @@ fn spawn_program_suspended(
     };
     unsafe {
         checked(libc::posix_spawnattr_init(&mut setup.attr))?;
+        setup.attr_on = true;
         aim_process::disclaim(&mut setup.attr).map_err(|error| {
             -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::ENOSYS)) as i64)
         })?;
         checked(libc::posix_spawn_file_actions_init(&mut setup.actions))?;
-        let mut all: libc::sigset_t = 0;
+        setup.actions_on = true;
+        let mut all = crate::hostlibc::empty_sigset();
         libc::sigfillset(&mut all);
-        let none: libc::sigset_t = 0;
+        let none = crate::hostlibc::empty_sigset();
         checked(libc::posix_spawnattr_setsigdefault(&mut setup.attr, &all))?;
         checked(libc::posix_spawnattr_setsigmask(&mut setup.attr, &none))?;
         checked(libc::posix_spawnattr_setflags(
             &mut setup.attr,
-            (libc::POSIX_SPAWN_CLOEXEC_DEFAULT
-                | libc::POSIX_SPAWN_SETSIGDEF
-                | libc::POSIX_SPAWN_SETSIGMASK
-                | if suspended { 0x80 } else { 0 }) as i16,
+            (aim_storage::host::POSIX_SPAWN_CLOEXEC_DEFAULT as i32
+                | libc::POSIX_SPAWN_SETSIGDEF as i32
+                | libc::POSIX_SPAWN_SETSIGMASK as i32
+                | if suspended { 0x80 } else { 0 }) as _,
         ))?;
         let mut ports = [port];
         checked(posix_spawnattr_set_registered_ports_np(

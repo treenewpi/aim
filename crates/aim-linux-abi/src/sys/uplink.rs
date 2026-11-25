@@ -170,7 +170,7 @@ pub fn watch(changed: fn()) {
             // SAFETY: this host thread takes no signals, so the kernel
             // never picks it for a process-directed one.
             unsafe {
-                let mut all: libc::sigset_t = 0;
+                let mut all = crate::hostlibc::empty_sigset();
                 libc::sigfillset(&mut all);
                 libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
             }

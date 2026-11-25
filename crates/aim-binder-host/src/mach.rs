@@ -48,6 +48,7 @@ const TRAILER: usize = 52;
 /// A receive buffer that holds any message of this format.
 pub const BUFFER: usize = HEADER + 4 + MAX_PORTS * PORT_DESC + OOL_DESC + 4 + INLINE_MAX + TRAILER;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     static mach_task_self_: Port;
     static bootstrap_port: Port;
@@ -91,6 +92,94 @@ unsafe extern "C" {
         inheritance: u32,
     ) -> Kern;
     fn mach_vm_deallocate(task: Port, address: u64, size: u64) -> Kern;
+}
+
+#[cfg(not(target_os = "macos"))]
+static mach_task_self_: Port = 0;
+#[cfg(not(target_os = "macos"))]
+static bootstrap_port: Port = 0;
+#[cfg(not(target_os = "macos"))]
+const fn kern() -> Kern {
+    5
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_msg(
+    _msg: *mut u8,
+    _option: i32,
+    _send_size: u32,
+    _rcv_size: u32,
+    _rcv_name: Port,
+    _timeout: u32,
+    _notify: Port,
+) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_allocate(_task: Port, _right: u32, _name: *mut Port) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_insert_right(_task: Port, _name: Port, _right: Port, _kind: u32) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_deallocate(_task: Port, _name: Port) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_mod_refs(_task: Port, _name: Port, _right: u32, _delta: i32) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_move_member(_task: Port, _member: Port, _after: Port) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn bootstrap_check_in(_bp: Port, _name: *const libc::c_char, _sp: *mut Port) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn bootstrap_look_up(_bp: Port, _name: *const libc::c_char, _sp: *mut Port) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn fileport_makeport(_fd: libc::c_int, _port: *mut Port) -> libc::c_int {
+    -1
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn fileport_makefd(_port: Port) -> libc::c_int {
+    -1
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_make_memory_entry_64(
+    _task: Port,
+    _size: *mut u64,
+    _offset: u64,
+    _permission: i32,
+    _handle: *mut Port,
+    _parent: Port,
+) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_vm_map(
+    _task: Port,
+    _address: *mut u64,
+    _size: u64,
+    _mask: u64,
+    _flags: i32,
+    _object: Port,
+    _offset: u64,
+    _copy: i32,
+    _cur: i32,
+    _max: i32,
+    _inheritance: u32,
+) -> Kern {
+    kern()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_vm_deallocate(_task: Port, _address: u64, _size: u64) -> Kern {
+    kern()
 }
 
 fn task() -> Port {
@@ -183,9 +272,9 @@ pub fn port_to_fd(p: Port) -> Option<i32> {
         }
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-            let error = *libc::__error();
+            let error = *aim_storage::host::__error();
             libc::close(fd);
-            *libc::__error() = error;
+            *aim_storage::host::__error() = error;
             return None;
         }
         Some(fd)

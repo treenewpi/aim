@@ -172,7 +172,7 @@ impl Sessions {
             return Err(self::state("Too many active sessions"));
         }
         for _ in 0..33 {
-            let id = unsafe { libc::arc4random_uniform(i32::MAX as u32 - 1) } as i32 + 1;
+            let id = unsafe { crate::host_os::arc4random_uniform(i32::MAX as u32 - 1) } as i32 + 1;
             if state.allocated.insert(id) {
                 state.sessions.insert(
                     id,

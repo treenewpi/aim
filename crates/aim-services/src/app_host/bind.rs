@@ -277,7 +277,7 @@ impl ApplicationSharedMemory {
 /// `SharedMemory` set to `PROT_READ` gives the processes it is passed to.
 pub(super) fn read_only_memory(bytes: &[u8]) -> std::io::Result<OwnedFd> {
     let name = CString::new(format!("/aim-asm-{:x}-{:x}", std::process::id(), unsafe {
-        libc::arc4random()
+        crate::host_os::arc4random()
     }))
     .unwrap();
     // SAFETY: a fresh name; the descriptors are owned below.

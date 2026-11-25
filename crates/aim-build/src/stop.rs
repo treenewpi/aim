@@ -44,9 +44,9 @@ extern "C" fn caught(signal: libc::c_int) {
     // (a full pipe already holds a wake-up), with the interrupted code's
     // errno kept.
     unsafe {
-        let errno = *libc::__error();
+        let errno = *aim_storage::host::__error();
         libc::write(WAKE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1);
-        *libc::__error() = errno;
+        *aim_storage::host::__error() = errno;
     }
 }
 

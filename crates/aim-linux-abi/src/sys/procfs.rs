@@ -135,7 +135,7 @@ pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
     }
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return Err(errno::last());
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
@@ -195,16 +195,16 @@ pub(super) fn fd_link(fd: i32) -> Option<String> {
 
 // ---- process information ---------------------------------------------------
 
-fn task_info(pid: i32) -> Option<libc::proc_taskallinfo> {
-    let mut t: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskallinfo>() as i32;
+fn task_info(pid: i32) -> Option<crate::hostlibc::proc_taskallinfo> {
+    let mut t: crate::hostlibc::proc_taskallinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<crate::hostlibc::proc_taskallinfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             pid,
-            libc::PROC_PIDTASKALLINFO,
+            crate::hostlibc::PROC_PIDTASKALLINFO,
             0,
-            (&mut t as *mut libc::proc_taskallinfo).cast(),
+            (&mut t as *mut crate::hostlibc::proc_taskallinfo).cast(),
             size,
         )
     };
@@ -213,12 +213,12 @@ fn task_info(pid: i32) -> Option<libc::proc_taskallinfo> {
 
 /// argv of a host process running `linux-run`, without its own options.
 fn host_argv(pid: i32) -> Vec<Vec<u8>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut mib = [crate::hostlibc::CTL_KERN, crate::hostlibc::KERN_PROCARGS2, pid];
     let mut buf = vec![0u8; 256 << 10];
     let mut len = buf.len();
     // SAFETY: sysctl into our buffer.
     if unsafe {
-        libc::sysctl(
+        crate::hostlibc::sysctl(
             mib.as_mut_ptr(),
             3,
             buf.as_mut_ptr().cast(),
@@ -281,8 +281,8 @@ fn read_guest(lo: u64, hi: u64) -> Vec<u8> {
 }
 
 unsafe extern "C" {
-    static mach_task_self_: libc::mach_port_t;
-    fn mach_vm_read_overwrite(t: libc::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
+    static mach_task_self_: crate::mach_port_t;
+    fn mach_vm_read_overwrite(t: crate::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
 }
 
 /// A command line as Linux's `get_mm_cmdline` reads it from the memory
@@ -391,15 +391,15 @@ fn thread_times(p: i32, tid: i32) -> Option<(u64, u64, char)> {
             .find(|t| t.tid == tid)?
             .host
     };
-    let mut ti: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_threadinfo>() as i32;
+    let mut ti: crate::hostlibc::proc_threadinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<crate::hostlibc::proc_threadinfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             p,
             PROC_PIDTHREADID64INFO,
             host,
-            (&mut ti as *mut libc::proc_threadinfo).cast(),
+            (&mut ti as *mut crate::hostlibc::proc_threadinfo).cast(),
             size,
         )
     };
@@ -787,7 +787,7 @@ fn sysctl_u64(name: &str) -> u64 {
     let mut len = 8usize;
     // SAFETY: sysctlbyname into a u64.
     unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c.as_ptr(),
             (&mut v as *mut u64).cast(),
             &mut len,
@@ -804,7 +804,7 @@ fn sysctl_string(name: &str) -> String {
     let mut len = buf.len();
     // SAFETY: sysctlbyname into our buffer.
     unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c.as_ptr(),
             buf.as_mut_ptr().cast(),
             &mut len,
@@ -827,7 +827,7 @@ unsafe extern "C" {
         info: *mut *mut i32,
         n: *mut u32,
     ) -> i32;
-    fn mach_vm_deallocate(t: libc::mach_port_t, a: u64, s: u64) -> i32;
+    fn mach_vm_deallocate(t: crate::mach_port_t, a: u64, s: u64) -> i32;
 }
 
 fn meminfo() -> String {
@@ -1076,9 +1076,9 @@ pub(super) fn pids() -> Vec<i32> {
         }
         // SAFETY: sizing call then a buffer of that size.
         None => unsafe {
-            let n = libc::proc_listallpids(std::ptr::null_mut(), 0);
+            let n = crate::hostlibc::proc_listallpids(std::ptr::null_mut(), 0);
             let mut v = vec![0i32; n.max(0) as usize + 64];
-            let n = libc::proc_listallpids(v.as_mut_ptr().cast(), (v.len() * 4) as i32);
+            let n = crate::hostlibc::proc_listallpids(v.as_mut_ptr().cast(), (v.len() * 4) as i32);
             v.truncate(n.max(0) as usize);
             v
         },
@@ -2162,7 +2162,7 @@ fn shared(fd: i32) -> bool {
     let mut info = [0u32; 44];
     // SAFETY: a buffer of the flavour's size.
     let n = unsafe {
-        libc::proc_pidfdinfo(
+        crate::hostlibc::proc_pidfdinfo(
             libc::getpid(),
             fd,
             PROC_PIDFDVNODEINFO,
@@ -2470,7 +2470,7 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
         let mut path = [0u8; libc::PATH_MAX as usize];
         // SAFETY: F_GETPATH into a local buffer; then open or dup.
         return Some(unsafe {
-            if libc::fcntl(n, libc::F_GETPATH, path.as_mut_ptr()) == 0 {
+            if crate::sys::fgetpath(n, path.as_mut_ptr()) == 0 {
                 errno::check(
                     libc::open(path.as_ptr().cast(), host_flags & !libc::O_CREAT, 0) as i64,
                 )
@@ -2704,7 +2704,7 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
             st.st_nlink = 1;
         }
         Some(Node::File(_)) if conf6.is_some() => {
-            st.st_mode = libc::S_IFREG as u16 | conf6.unwrap() as u16;
+            st.st_mode = libc::S_IFREG as libc::mode_t | conf6.unwrap() as libc::mode_t;
             st.st_nlink = 1;
         }
         Some(Node::File(_) | Node::NetTable(_) | Node::MountTable { .. }) => {
@@ -3714,7 +3714,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
             "/mnt/ns-default",
-            &host,
+            host.clone(),
             crate::vfs::Area::Writable,
             "tmpfs",
             "tmpfs",
@@ -3849,7 +3849,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
             "/mnt/ns-default",
-            &host,
+            host.clone(),
             crate::vfs::Area::Writable,
             "tmpfs",
             "tmpfs",
@@ -3864,7 +3864,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
             "/mnt/ns-boot",
-            &host,
+            host.clone(),
             crate::vfs::Area::Writable,
             "tmpfs",
             "tmpfs",
@@ -4227,7 +4227,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
             "/mnt/ns-other-thread",
-            &host,
+            host.clone(),
             crate::vfs::Area::Writable,
             "tmpfs",
             "tmpfs",

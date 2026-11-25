@@ -655,7 +655,7 @@ fn host_counters(index: u32) -> Result<[u64; 16], Errno> {
         libc::PF_ROUTE,
         0,
         0,
-        libc::NET_RT_IFLIST2,
+        aim_storage::host::NET_RT_IFLIST2,
         index as i32,
     ];
     let mut table = Vec::new();
@@ -663,7 +663,7 @@ fn host_counters(index: u32) -> Result<[u64; 16], Errno> {
         let mut len = 0;
         // SAFETY: sizing call, with no output buffer.
         if unsafe {
-            libc::sysctl(
+            crate::hostlibc::sysctl(
                 mib.as_mut_ptr(),
                 6,
                 std::ptr::null_mut(),
@@ -683,7 +683,7 @@ fn host_counters(index: u32) -> Result<[u64; 16], Errno> {
         table.resize(len, 0u8);
         // SAFETY: sysctl writes at most len bytes into our table.
         if unsafe {
-            libc::sysctl(
+            crate::hostlibc::sysctl(
                 mib.as_mut_ptr(),
                 6,
                 table.as_mut_ptr().cast(),
@@ -715,12 +715,12 @@ fn counters_from_iflist(mut table: &[u8], index: u32) -> Result<[u64; 16], Errno
         if len < 4 || len > table.len() {
             return Err(crate::errno::EIO);
         }
-        if prefix[2] as i32 == libc::RTM_VERSION && prefix[3] as i32 == libc::RTM_IFINFO2 {
-            if len < std::mem::size_of::<libc::if_msghdr2>() {
+        if prefix[2] as i32 == aim_storage::host::RTM_VERSION && prefix[3] as i32 == aim_storage::host::RTM_IFINFO2 {
+            if len < std::mem::size_of::<aim_storage::host::if_msghdr2>() {
                 return Err(crate::errno::EIO);
             }
             // SAFETY: the whole header is inside this routing message.
-            let h = unsafe { table.as_ptr().cast::<libc::if_msghdr2>().read_unaligned() };
+            let h = unsafe { table.as_ptr().cast::<aim_storage::host::if_msghdr2>().read_unaligned() };
             if h.ifm_index as u32 == index {
                 return Ok(dev_counters(&h));
             }
@@ -730,7 +730,7 @@ fn counters_from_iflist(mut table: &[u8], index: u32) -> Result<[u64; 16], Errno
     Ok([0; 16])
 }
 
-fn dev_counters(data: &libc::if_msghdr2) -> [u64; 16] {
+fn dev_counters(data: &aim_storage::host::if_msghdr2) -> [u64; 16] {
     let d = data.ifm_data;
     [
         d.ifi_ibytes,
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn proc_dev_maps_host_counters_without_truncation() {
-        let mut data: libc::if_msghdr2 = unsafe { std::mem::zeroed() };
+        let mut data: aim_storage::host::if_msghdr2 = unsafe { std::mem::zeroed() };
         data.ifm_data.ifi_ibytes = 1 << 40;
         data.ifm_data.ifi_ipackets = 2;
         data.ifm_data.ifi_ierrors = 3;
@@ -1234,13 +1234,13 @@ mod tests {
         data.ifm_snd_drops = 12;
         data.ifm_data.ifi_collisions = 14;
         data.ifm_msglen = std::mem::size_of_val(&data) as u16;
-        data.ifm_version = libc::RTM_VERSION as u8;
-        data.ifm_type = libc::RTM_IFINFO2 as u8;
+        data.ifm_version = aim_storage::host::RTM_VERSION as u8;
+        data.ifm_type = aim_storage::host::RTM_IFINFO2 as u8;
         data.ifm_index = 1;
         // SAFETY: a byte view of our initialized routing-message header.
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                (&data as *const libc::if_msghdr2).cast::<u8>(),
+                (&data as *const aim_storage::host::if_msghdr2).cast::<u8>(),
                 std::mem::size_of_val(&data),
             )
         };

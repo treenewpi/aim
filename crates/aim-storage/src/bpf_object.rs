@@ -422,7 +422,7 @@ struct Holder;
 /// `PROC_PIDT_BSDINFOWITHUNIQID`.
 #[repr(C)]
 struct BsdWithIdentity {
-    bsd: libc::proc_bsdinfo,
+    bsd: crate::host::proc_bsdinfo,
     uuid: [u8; 16],
     unique_id: u64,
     parent_unique_id: u64,
@@ -454,7 +454,7 @@ impl Holder {
         let size = std::mem::size_of::<BsdWithIdentity>() as i32;
         // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
         let n = unsafe {
-            libc::proc_pidinfo(
+            crate::host::proc_pidinfo(
                 i32::try_from(pid).ok()?,
                 PROC_PIDT_BSDINFOWITHUNIQID,
                 0,
@@ -462,7 +462,7 @@ impl Holder {
                 size,
             )
         };
-        (n == size && info.bsd.pbi_status != libc::SZOMB)
+        (n == size && info.bsd.pbi_status != crate::host::SZOMB)
             .then_some((info.id_version as u32 as u64) << 32 | pid as u64)
     }
 
@@ -525,7 +525,7 @@ pub fn make_pin_template(object: &Path) -> io::Result<()> {
         .open(&path)?;
     // SAFETY: the attribute's name and value outlive the call.
     if unsafe {
-        libc::fsetxattr(
+        crate::host::fsetxattr(
             file.as_raw_fd(),
             PIN.as_ptr(),
             name.as_bytes().as_ptr().cast(),
@@ -551,7 +551,7 @@ pub fn pin(pin: &Path, object: &Path) -> io::Result<()> {
     let from = std::ffi::CString::new(template(object).as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(pin.as_os_str().as_bytes())?;
     // SAFETY: two paths; clonefile fails with EEXIST on an existing `to`.
-    if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } != 0 {
+    if unsafe { crate::host::clonefile(from.as_ptr(), to.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -570,13 +570,13 @@ pub fn object(pin: &Path, objects: &Path) -> io::Result<std::path::PathBuf> {
     let mut name = [0u8; 256];
     // SAFETY: a bounded read of the attribute into the local buffer.
     let n = unsafe {
-        libc::getxattr(
+        crate::host::getxattr(
             path.as_ptr(),
             PIN.as_ptr(),
             name.as_mut_ptr().cast(),
             name.len(),
             0,
-            libc::XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         )
     };
     let not_pin = || {
@@ -771,7 +771,7 @@ mod tests {
         // SAFETY: a path, an attribute name and value.
         assert_eq!(
             unsafe {
-                libc::setxattr(
+                crate::host::setxattr(
                     outside.as_ptr(),
                     PIN.as_ptr(),
                     b"../bpf/map".as_ptr().cast(),

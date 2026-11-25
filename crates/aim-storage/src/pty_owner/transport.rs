@@ -25,6 +25,7 @@ struct Header {
     voucher: u32,
     id: i32,
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_msg_destroy(message: *mut Header);
     fn mach_port_allocate(task: u32, right: u32, name: *mut u32) -> i32;
@@ -49,6 +50,48 @@ unsafe extern "C" {
         timeout: u32,
         notify: u32,
     ) -> i32;
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_msg_destroy(_message: *mut Header) {}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_allocate(_task: u32, _right: u32, _name: *mut u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_insert_right(_task: u32, _name: u32, _right: u32, _kind: u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_mod_refs(_task: u32, _name: u32, _right: u32, _delta: i32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_move_member(_task: u32, _name: u32, _set: u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_request_notification(
+    _task: u32,
+    _name: u32,
+    _id: i32,
+    _sync: u32,
+    _notify: u32,
+    _kind: u32,
+    _previous: *mut u32,
+) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_msg(
+    _message: *mut u8,
+    _options: i32,
+    _send_size: u32,
+    _receive_size: u32,
+    _name: u32,
+    _timeout: u32,
+    _notify: u32,
+) -> i32 {
+    libc::ENOTSUP
 }
 struct Port {
     name: u32,

@@ -580,7 +580,7 @@ fn in_bpffs(guest: &str) -> bool {
 fn fd_in_bpffs(fd: i32) -> bool {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } != 0 {
         return false;
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -642,14 +642,14 @@ pub fn renameat2(a: [u64; 6]) -> i64 {
         return -(error as i64);
     }
     let hflags = if flags & RENAME_NOREPLACE != 0 {
-        libc::RENAME_EXCL
+        aim_storage::host::RENAME_EXCL
     } else if flags & RENAME_EXCHANGE != 0 {
-        libc::RENAME_SWAP
+        aim_storage::host::RENAME_SWAP
     } else {
         0
     };
     // SAFETY: host paths.
-    let r = unsafe { libc::renamex_np(old.host.as_ptr(), new.host.as_ptr(), hflags) };
+    let r = unsafe { aim_storage::host::renamex_np(old.host.as_ptr(), new.host.as_ptr(), hflags) };
     if r < 0 {
         let e = errno::last();
         return if e == libc::EXDEV {
@@ -669,16 +669,16 @@ pub fn renameat(a: [u64; 6]) -> i64 {
 /// The host mode for a guest chmod. Under a path map the guest's mode is
 /// the recorded one (`attrs`), and the host user keeps owner access: guest
 /// root, which Linux lets past the mode bits, runs as that user.
-fn host_mode(mode: u32, st_mode: u16) -> u16 {
+fn host_mode(mode: u32, st_mode: libc::mode_t) -> libc::mode_t {
     if !attrs::recording() {
-        return mode as u16;
+        return mode as _;
     }
     let owner = if st_mode & libc::S_IFMT == libc::S_IFDIR {
         0o700
     } else {
         0o600
     };
-    (mode | owner) as u16
+    (mode | owner) as _
 }
 
 fn resolve_metadata(
@@ -778,13 +778,13 @@ fn metadata_anchor(resolved: &Resolved, follow: bool, write: bool) -> Result<Met
     let _creating = super::fork::spawn::own_fds();
     // O_EVTONLY does not require content-read access. O_NOFOLLOW prevents a
     // swapped final symlink from redirecting the authenticated inode change.
-    let flags = libc::O_EVTONLY
+    let flags = aim_storage::host::O_EVTONLY
         | libc::O_NONBLOCK
         | libc::O_CLOEXEC
         | if follow {
             libc::O_NOFOLLOW
         } else {
-            libc::O_SYMLINK
+            aim_storage::host::O_SYMLINK
         };
     let fd = unsafe { libc::open(resolved.host.as_ptr(), flags) };
     if fd < 0 {
@@ -857,7 +857,7 @@ pub(super) fn writable_fd_metadata(fd: i32, stat: &libc::stat) -> Result<(), i64
     }
     let guest = crate::xrt::original_guest_path(fd).or_else(|| {
         let mut path = [0u8; libc::PATH_MAX as usize];
-        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+        if unsafe { crate::sys::fgetpath(fd, path.as_mut_ptr()) } < 0 {
             return None;
         }
         let length = path.iter().position(|byte| *byte == 0)?;
@@ -938,15 +938,15 @@ fn kill_file_capabilities(host: Host, stat: &libc::stat) -> Result<(), i64> {
     let name = c"dev.aim.xattr.security.capability";
     let size = unsafe {
         match host {
-            Host::Path(path) => libc::getxattr(
+            Host::Path(path) => aim_storage::host::getxattr(
                 path.as_ptr(),
                 name.as_ptr(),
                 std::ptr::null_mut(),
                 0,
                 0,
-                libc::XATTR_NOFOLLOW,
+                aim_storage::host::XATTR_NOFOLLOW,
             ),
-            Host::Fd(fd) => libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, 0),
+            Host::Fd(fd) => aim_storage::host::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, 0),
             Host::Image(_) => return Err(-(crate::errno::EROFS as i64)),
         }
     };
@@ -964,9 +964,9 @@ fn kill_file_capabilities(host: Host, stat: &libc::stat) -> Result<(), i64> {
     let result = unsafe {
         match host {
             Host::Path(path) => {
-                libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW)
+                aim_storage::host::removexattr(path.as_ptr(), name.as_ptr(), aim_storage::host::XATTR_NOFOLLOW)
             }
-            Host::Fd(fd) => libc::fremovexattr(fd, name.as_ptr(), 0),
+            Host::Fd(fd) => aim_storage::host::fremovexattr(fd, name.as_ptr(), 0),
             Host::Image(_) => return Err(-(crate::errno::EROFS as i64)),
         }
     };
@@ -1682,14 +1682,9 @@ pub fn fallocate(a: [u64; 6]) -> i64 {
                 return result;
             }
         }
-        let ph = libc::fpunchhole_t {
-            fp_flags: 0,
-            reserved: 0,
-            fp_offset: off,
-            fp_length: len,
-        };
-        // SAFETY: F_PUNCHHOLE with a local struct.
-        return errno::check(unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &ph) } as i64);
+        // SAFETY: punch a hole in the file. Darwin uses F_PUNCHHOLE;
+        // Linux uses fallocate(FALLOC_FL_PUNCH_HOLE).
+        return errno::check(unsafe { aim_storage::host::punch_hole(fd, off, len) } as i64);
     }
     if mode & !FALLOC_FL_KEEP_SIZE != 0 {
         return -EOPNOTSUPP;
@@ -1712,21 +1707,31 @@ pub fn fallocate(a: [u64; 6]) -> i64 {
     // where the filesystem cannot): reserve from the file's physical end,
     // what it has allocated, and report the reservation's failure.
     let allocated = st.st_blocks * 512;
-    let mut fs = libc::fstore_t {
-        fst_flags: libc::F_ALLOCATEALL,
-        fst_posmode: libc::F_PEOFPOSMODE,
-        fst_offset: 0,
-        fst_length: (end - allocated).max(0),
-        fst_bytesalloc: 0,
-    };
-    if fs.fst_length > 0 {
-        match super::space::charge(fd, fs.fst_length as u64) {
-            Ok(n) if n == fs.fst_length as u64 => {}
+    let length = (end - allocated).max(0);
+    if length > 0 {
+        match super::space::charge(fd, length as u64) {
+            Ok(n) if n == length as u64 => {}
             Ok(_) => return -(ENOSPC as i64),
             Err(e) => return e,
         }
-        // SAFETY: F_PREALLOCATE with a local fstore.
-        if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut fs) } < 0 {
+        // Darwin reserves with F_PREALLOCATE. Linux fallocate reserves the
+        // same range; a filesystem that cannot is EOPNOTSUPP.
+        #[cfg(target_os = "macos")]
+        {
+            let mut fs = libc::fstore_t {
+                fst_flags: libc::F_ALLOCATEALL,
+                fst_posmode: libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: length,
+                fst_bytesalloc: 0,
+            };
+            // SAFETY: F_PREALLOCATE with a local fstore.
+            if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut fs) } < 0 {
+                return -(errno::last() as i64);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if unsafe { libc::fallocate(fd, 0, allocated, length) } < 0 {
             return -(errno::last() as i64);
         }
     }
@@ -2767,7 +2772,7 @@ mod tests {
         ];
         assert_eq!(
             unsafe {
-                libc::fsetxattr(
+                aim_storage::host::fsetxattr(
                     rw.as_raw_fd(),
                     cap_name.as_ptr(),
                     caps.as_ptr().cast(),
@@ -2787,7 +2792,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                libc::fgetxattr(
+                aim_storage::host::fgetxattr(
                     rw.as_raw_fd(),
                     cap_name.as_ptr(),
                     std::ptr::null_mut(),
@@ -2802,7 +2807,7 @@ mod tests {
         record("file", 5000, 5100, 0o6750);
         assert_eq!(
             unsafe {
-                libc::fsetxattr(
+                aim_storage::host::fsetxattr(
                     rw.as_raw_fd(),
                     cap_name.as_ptr(),
                     caps.as_ptr().cast(),
@@ -2822,7 +2827,7 @@ mod tests {
         assert_eq!(owner(&format!("{base}/file")).2, 0o6750);
         assert_eq!(
             unsafe {
-                libc::fgetxattr(
+                aim_storage::host::fgetxattr(
                     rw.as_raw_fd(),
                     cap_name.as_ptr(),
                     std::ptr::null_mut(),

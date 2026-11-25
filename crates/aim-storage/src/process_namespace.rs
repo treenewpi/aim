@@ -27,22 +27,22 @@ impl ProcessIdentity {
             start_microseconds: info.pbi_start_tvusec,
         })
     }
-    pub fn metadata_strict(pid: i32) -> io::Result<libc::proc_bsdinfo> {
+    pub fn metadata_strict(pid: i32) -> io::Result<crate::host::proc_bsdinfo> {
         if pid <= 0 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let mut info: crate::host::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as i32;
         loop {
             unsafe {
-                *libc::__error() = 0;
+                *crate::host::__error() = 0;
             }
             let returned = unsafe {
-                libc::proc_pidinfo(
+                crate::host::proc_pidinfo(
                     pid,
-                    libc::PROC_PIDTBSDINFO,
+                    crate::host::PROC_PIDTBSDINFO,
                     1,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    (&mut info as *mut crate::host::proc_bsdinfo).cast(),
                     size,
                 )
             };
@@ -62,7 +62,7 @@ impl ProcessIdentity {
     /// A zombie has exited: PROC_PIDTBSDINFO with arg 1 still reports it until it is reaped.
     pub fn is_live(self) -> bool {
         Self::metadata_strict(self.host_pid).is_ok_and(|info| {
-            info.pbi_status != libc::SZOMB
+            info.pbi_status != crate::host::SZOMB
                 && Self {
                     host_pid: self.host_pid,
                     start_seconds: info.pbi_start_tvsec,

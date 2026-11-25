@@ -392,7 +392,7 @@ fn open_on_key(key: &SessionKey, flags: i32, op: u32, payload: &[u8]) -> Result<
             return Err(36);
         }
         out.sun_family = libc::AF_UNIX as _;
-        out.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+        aim_storage::host::set_sun_len(&mut out, std::mem::size_of::<libc::sockaddr_un>() as u8);
         for (dst, src) in out.sun_path.iter_mut().zip(bytes) {
             *dst = *src as _;
         }
@@ -528,7 +528,7 @@ fn no_sigpipe(fd: RawFd) {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
+            aim_storage::host::SO_NOSIGPIPE,
             (&one as *const i32).cast(),
             4,
         );

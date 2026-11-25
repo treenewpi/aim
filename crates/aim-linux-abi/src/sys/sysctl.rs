@@ -206,13 +206,13 @@ mod tests {
         }
         let cred = Cred(crate::sys::cred::current());
         let path = "/proc/sys/kernel/kptr_restrict";
-        let read = super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
+        let read = super::super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
         assert!(read >= 0);
         assert_eq!(read_fd(read), "0\n");
         // The host file is O_RDWR. The guest open was read-only, so a
         // write is EBADF, not the handler's EACCES or EPERM.
         assert_eq!(write_fd(read, "2\n"), -(errno::EBADF as i64));
-        let write = super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
+        let write = super::super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
         assert!(write >= 0);
         assert_eq!(write_fd(write, "4\n"), -(errno::EINVAL as i64));
         assert_eq!(write_fd(write, "3\n"), -(errno::EINVAL as i64));
@@ -245,16 +245,16 @@ mod tests {
         );
         assert_eq!(read_fd(read), "2\n");
         let mut user = cred.0.clone();
-        user.uid[super::attrs::FS] = 1;
+        user.uid[super::super::attrs::FS] = 1;
         user.cap_eff &= !(1 << CAP_DAC_OVERRIDE);
         crate::sys::cred::init(user, None);
         assert_eq!(
-            super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap(),
+            super::super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap(),
             -(errno::EACCES as i64)
         );
         crate::sys::cred::init(cred.0.clone(), None);
         assert_eq!(
-            super::procfs::open("/proc/sys/kernel/not_a_sysctl", 0, libc::O_RDONLY).unwrap(),
+            super::super::procfs::open("/proc/sys/kernel/not_a_sysctl", 0, libc::O_RDONLY).unwrap(),
             -(errno::ENOENT as i64)
         );
         for fd in [read, write] {
@@ -266,8 +266,8 @@ mod tests {
     fn mmap_rnd_bits_keeps_the_arm64_range() {
         let _view = crate::vfs::test_view();
         let path = "/proc/sys/vm/mmap_rnd_bits";
-        let read = super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
-        let write = super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
+        let read = super::super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
+        let write = super::super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
         assert_eq!(read_fd(read), "24\n");
         assert_eq!(write_fd(write, "33\n"), -(errno::EINVAL as i64));
         assert_eq!(write_fd(write, "17\n"), -(errno::EINVAL as i64));
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(read_fd(read), "18\n");
         let compat = "/proc/sys/vm/mmap_rnd_compat_bits";
         let compat_write =
-            super::procfs::open(compat, libc::O_RDWR as u64, libc::O_RDWR).unwrap();
+            super::super::procfs::open(compat, libc::O_RDWR as u64, libc::O_RDWR).unwrap();
         assert_eq!(write_fd(compat_write, "17\n"), -(errno::EINVAL as i64));
         assert_eq!(write_fd(compat_write, "16\n"), 3);
         assert_eq!(
@@ -319,8 +319,8 @@ mod tests {
         );
         let host = super::store_path(super::spec(path).unwrap());
         let previous = std::fs::read(&host).ok();
-        let read = super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
-        let write = super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
+        let read = super::super::procfs::open(path, 0, libc::O_RDONLY).unwrap();
+        let write = super::super::procfs::open(path, libc::O_WRONLY as u64, libc::O_WRONLY).unwrap();
         assert!(read >= 0 && write >= 0, "{read} {write}");
         assert_eq!(write_fd(write, "4\n"), -(errno::EINVAL as i64));
         assert_eq!(write_fd(write, "2\n"), 2);

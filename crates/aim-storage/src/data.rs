@@ -418,6 +418,7 @@ impl Drop for DataImage {
 /// in rounds of what it has. Each file is unlinked while open: a
 /// preallocation released at close counts as nothing freed. Without the
 /// full sync the TRIM waits for the next mount.
+#[cfg(target_os = "macos")]
 fn release_to_trim(mount: &Path, total: u64) -> Result<(), String> {
     let path = mount.join(".aim-trim");
     let root = File::open(mount).map_err(|e| format!("{}: {e}", mount.display()))?;
@@ -460,6 +461,7 @@ fn release_to_trim(mount: &Path, total: u64) -> Result<(), String> {
 
 /// Writes everything of the volume at `mount` to its disk and waits for
 /// that (`sync_volume_np(3)`, a full sync).
+#[cfg(target_os = "macos")]
 fn sync_volume(mount: &Path) -> Result<(), String> {
     const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
     const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
@@ -473,6 +475,44 @@ fn sync_volume(mount: &Path) -> Result<(), String> {
     // It returns an errno value, not -1.
     if status != 0 {
         return Err(std::io::Error::from_raw_os_error(status).to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn release_to_trim(mount: &Path, total: u64) -> Result<(), String> {
+    let path = mount.join(".aim-trim");
+    let mut freed = 0u64;
+    while freed < total {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let length = (total - freed) as i64;
+        let status = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) };
+        let error = std::io::Error::last_os_error();
+        let removed = fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()));
+        drop(file);
+        removed?;
+        if status != 0 {
+            return Err(format!("fallocate: {error}"));
+        }
+        freed += length as u64;
+        let root = File::open(mount).map_err(|e| format!("{}: {e}", mount.display()))?;
+        if unsafe { libc::fsync(root.as_raw_fd()) } != 0 {
+            return Err(format!("fsync: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_volume(mount: &Path) -> Result<(), String> {
+    let file = File::open(mount).map_err(|e| format!("{}: {e}", mount.display()))?;
+    if unsafe { libc::syncfs(file.as_raw_fd()) } != 0 {
+        return Err(format!("syncfs: {}", std::io::Error::last_os_error()));
     }
     Ok(())
 }

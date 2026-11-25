@@ -328,23 +328,27 @@ struct SearchListLock {
 
 impl SearchListLock {
     fn take() -> Result<Self, i32> {
-        let mut dir = [0 as c_char; libc::PATH_MAX as usize];
-        // SAFETY: the buffer and its length.
-        let n =
-            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, dir.as_mut_ptr(), dir.len()) };
-        if n == 0 || n > dir.len() {
-            return Err(ERR_SEC_IO);
-        }
-        // SAFETY: confstr NUL-terminated what it wrote.
-        let dir = unsafe { CStr::from_ptr(dir.as_ptr()) };
+        #[cfg(target_os = "macos")]
+        let path = {
+            let mut dir = [0 as c_char; libc::PATH_MAX as usize];
+            // SAFETY: the buffer and its length.
+            let n = unsafe {
+                libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, dir.as_mut_ptr(), dir.len())
+            };
+            if n == 0 || n > dir.len() {
+                return Err(ERR_SEC_IO);
+            }
+            // SAFETY: confstr NUL-terminated what it wrote.
+            let dir = unsafe { CStr::from_ptr(dir.as_ptr()) };
+            Path::new(OsStr::from_bytes(dir.to_bytes())).join("dev.aim.keychain-search-list.lock")
+        };
+        #[cfg(not(target_os = "macos"))]
+        let path = Path::new("/tmp/dev.aim.keychain-search-list.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(
-                Path::new(OsStr::from_bytes(dir.to_bytes()))
-                    .join("dev.aim.keychain-search-list.lock"),
-            )
+            .open(path)
             .map_err(|_| ERR_SEC_IO)?;
         loop {
             // SAFETY: an open file of ours.

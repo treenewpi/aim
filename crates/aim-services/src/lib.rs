@@ -14,6 +14,7 @@
 //! services are native and how they conform.
 
 pub mod app_host;
+mod host_os;
 pub mod boot_trace;
 mod bundle;
 pub mod clip;

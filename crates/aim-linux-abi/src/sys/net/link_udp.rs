@@ -156,15 +156,17 @@ impl Registry {
 }
 
 fn loopback(port: u16) -> libc::sockaddr_in {
-    libc::sockaddr_in {
-        sin_len: 16,
-        sin_family: libc::AF_INET as u8,
-        sin_port: port.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        },
-        sin_zero: [0; 8],
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "macos")]
+    {
+        address.sin_len = 16;
     }
+    address.sin_family = libc::AF_INET as _;
+    address.sin_port = port.to_be();
+    address.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    address
 }
 
 pub(super) fn bind(fd: i32, addr: [u8; 4], reuseport: bool) -> Result<(), Errno> {

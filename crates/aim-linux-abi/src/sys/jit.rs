@@ -137,7 +137,7 @@ pub fn map_at(lo: u64, n: u64, src: Option<*const u8>) -> Result<(), i64> {
             lo as *mut _,
             n as usize,
             RWX,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+            libc::MAP_PRIVATE | libc::MAP_ANON | aim_storage::host::MAP_JIT,
             -1,
             0,
         )
@@ -152,9 +152,9 @@ pub fn map_at(lo: u64, n: u64, src: Option<*const u8>) -> Result<(), i64> {
     }
     if let Some(src) = src {
         unsafe {
-            libc::pthread_jit_write_protect_np(0);
+            aim_storage::host::pthread_jit_write_protect_np(0);
             std::ptr::copy_nonoverlapping(src, lo as *mut u8, n as usize);
-            libc::pthread_jit_write_protect_np(1);
+            aim_storage::host::pthread_jit_write_protect_np(1);
             sys_icache_invalidate(lo as *mut _, n as usize);
         }
     }
@@ -261,7 +261,7 @@ pub fn fault(ctx: *mut GuestContext, m: &mut DarwinMcontext) -> bool {
         }
         // The interrupted state was executable: a change here lasts.
         // SAFETY: switches this thread's view of JIT memory.
-        unsafe { libc::pthread_jit_write_protect_np(0) };
+        unsafe { aim_storage::host::pthread_jit_write_protect_np(0) };
         return true;
     }
     // Only guest code runs in JIT memory.
@@ -316,9 +316,9 @@ fn store_from_jit(m: &mut DarwinMcontext, region: (u64, u64)) -> bool {
     // SAFETY: [addr, addr+n) is JIT memory, writable while the thread's
     // view is; the returning handler restores the interrupted view.
     unsafe {
-        libc::pthread_jit_write_protect_np(0);
+        aim_storage::host::pthread_jit_write_protect_np(0);
         std::ptr::copy_nonoverlapping(st.bytes.as_ptr(), addr as *mut u8, st.len);
-        libc::pthread_jit_write_protect_np(1);
+        aim_storage::host::pthread_jit_write_protect_np(1);
         sys_icache_invalidate(addr as *mut _, st.len);
     }
     match st.writeback {
@@ -456,7 +456,7 @@ fn decode_store(insn: u32, x: &[u64; 31], sp: u64, v: &[u128; 32]) -> Option<Sto
 /// [`fault`] saved.
 extern "C" fn exec_and_resume() -> ! {
     // SAFETY: switches this thread's view of JIT memory.
-    unsafe { libc::pthread_jit_write_protect_np(1) };
+    unsafe { aim_storage::host::pthread_jit_write_protect_np(1) };
     context::resume_trap()
 }
 

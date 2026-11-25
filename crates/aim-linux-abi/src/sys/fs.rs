@@ -48,7 +48,7 @@ pub(super) fn open_flags_to_host(f: u64) -> i32 {
         _ => libc::O_RDWR,
     };
     if f & O_PATH != 0 {
-        return libc::O_EVTONLY
+        return aim_storage::host::O_EVTONLY
             | if f & O_CLOEXEC != 0 {
                 libc::O_CLOEXEC
             } else {
@@ -60,7 +60,7 @@ pub(super) fn open_flags_to_host(f: u64) -> i32 {
                 0
             }
             | if f & O_NOFOLLOW != 0 {
-                libc::O_SYMLINK
+                aim_storage::host::O_SYMLINK
             } else {
                 0
             };
@@ -90,7 +90,7 @@ pub(super) fn open_flags_to_host(f: u64) -> i32 {
 }
 
 fn open_flags_from_host(h: i32) -> u64 {
-    if h & libc::O_EVTONLY != 0 {
+    if h & aim_storage::host::O_EVTONLY != 0 {
         return O_PATH;
     }
     let mut f = (h & libc::O_ACCMODE) as u64 | O_LARGEFILE;
@@ -398,7 +398,7 @@ fn open_socket_path(r: &vfs::Resolved, flags: u64) -> i64 {
     let raw = unsafe {
         libc::open(
             parent.as_ptr(),
-            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            aim_storage::host::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if raw < 0 {
@@ -743,7 +743,7 @@ struct CloseEvidence {
 }
 impl CloseEvidence {
     fn capture(fd: i32) -> Self {
-        let saved = unsafe { *libc::__error() };
+        let saved = unsafe { *crate::hostlibc::__error() };
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let mode = if unsafe { libc::fstat(fd, &mut stat) } == 0 {
             stat.st_mode as u32
@@ -772,7 +772,7 @@ impl CloseEvidence {
             mode,
         };
         unsafe {
-            *libc::__error() = saved;
+            *crate::hostlibc::__error() = saved;
         }
         evidence
     }
@@ -823,7 +823,7 @@ fn close_inner(a: [u64; 6], capture: &mut Option<CloseEvidence>) -> i64 {
     fdtab::on_close(fd);
     let native_ret = unsafe { libc::close(fd) };
     let native_errno = if native_ret < 0 {
-        unsafe { *libc::__error() }
+        unsafe { *crate::hostlibc::__error() }
     } else {
         0
     };
@@ -1105,6 +1105,7 @@ fn special_read_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64> 
             None
         }
         Kind::TracePipe(_) | Kind::Content | Kind::Random | Kind::Ashmem => None,
+        Kind::Dev(_) => super::loopdev::rwv(fd, iov, false).or(Some(-(EINVAL as i64))),
         Kind::Memfd(_) => {
             let mut total = 0i64;
             for v in iov {
@@ -1177,6 +1178,7 @@ fn special_write_kernel(pin: &fdtab::Pinned, iov: &[libc::iovec]) -> Option<i64>
         Kind::Random => Some(super::random::write(iov)),
         // `ashmem_fops` has no write.
         Kind::Ashmem => Some(-(EINVAL as i64)),
+        Kind::Dev(_) => super::loopdev::rwv(fd, iov, true).or(Some(-(EINVAL as i64))),
         Kind::Memfd(_) => {
             if memfd::write_sealed(fd) {
                 return Some(-EPERM);
@@ -2153,7 +2155,7 @@ struct LinuxStat {
 const _: () = assert!(std::mem::size_of::<LinuxStat>() == 128);
 
 /// Darwin dev_t packs major in the top 8 bits; Linux's new encoding differs.
-fn linux_dev(d: i32) -> u64 {
+fn linux_dev(d: u64) -> u64 {
     let d = d as u32 as u64;
     let (major, minor) = (d >> 24, d & 0xff_ffff);
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
@@ -2170,7 +2172,7 @@ fn put_user_struct<T>(value: &T, out: u64) -> i64 {
 
 fn put_stat(st: &libc::stat, out: u64) -> i64 {
     let l = LinuxStat {
-        st_dev: linux_dev(st.st_dev),
+        st_dev: linux_dev(st.st_dev as u64),
         st_ino: st.st_ino,
         st_mode: st.st_mode as u32,
         st_nlink: st.st_nlink as u32,
@@ -2178,9 +2180,9 @@ fn put_stat(st: &libc::stat, out: u64) -> i64 {
         // guest's.
         st_uid: st.st_uid,
         st_gid: st.st_gid,
-        st_rdev: linux_dev(st.st_rdev),
+        st_rdev: linux_dev(st.st_rdev as u64),
         st_size: st.st_size,
-        st_blksize: st.st_blksize,
+        st_blksize: st.st_blksize as _,
         st_blocks: st.st_blocks,
         st_atime: st.st_atime,
         st_atime_nsec: st.st_atime_nsec as u64,
@@ -2483,7 +2485,7 @@ pub fn statx(a: [u64; 6]) -> i64 {
         nlink: st.st_nlink as u32,
         uid: st.st_uid,
         gid: st.st_gid,
-        mode: st.st_mode,
+        mode: st.st_mode as _,
         ino: st.st_ino,
         size: st.st_size as u64,
         blocks: st.st_blocks as u64,
@@ -2498,7 +2500,7 @@ pub fn statx(a: [u64; 6]) -> i64 {
             0
         } | encrypted.map_or(0, |_| super::fscrypt::ENCRYPTED as u64),
         atime: ts(st.st_atime, st.st_atime_nsec),
-        btime: ts(st.st_birthtime, st.st_birthtime_nsec),
+        btime: ts(aim_storage::host::birth(&st).0, aim_storage::host::birth(&st).1),
         ctime: ts(st.st_ctime, st.st_ctime_nsec),
         mtime: ts(st.st_mtime, st.st_mtime_nsec),
         rdev_major: rdev >> 24,
@@ -2579,10 +2581,10 @@ fn put_statfs(s: &libc::statfs, out: u64) -> i64 {
 
 fn put_statfs_as(s: &libc::statfs, f_type: u64, out: u64) -> i64 {
     let mut flags = 0;
-    if s.f_flags & libc::MNT_RDONLY as u32 != 0 {
+    if aim_storage::host::statfs_flags(s) & (aim_storage::host::MNT_RDONLY as u32) != 0 {
         flags |= ST_RDONLY;
     }
-    if s.f_flags & libc::MNT_NOSUID as u32 != 0 {
+    if aim_storage::host::statfs_flags(s) & (aim_storage::host::MNT_NOSUID as u32) != 0 {
         flags |= ST_NOSUID;
     }
     let l = LinuxStatfs {
@@ -2680,7 +2682,14 @@ pub fn statfs(a: [u64; 6]) -> i64 {
         return -(errno::last() as i64);
     }
     if r.read_only() {
-        s.f_flags |= libc::MNT_RDONLY as u32;
+        #[cfg(target_os = "macos")]
+        {
+            s.f_flags |= libc::MNT_RDONLY as u32;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &mut s;
+        }
     }
     space::adjust(&mut s);
     let magic = vfs::fstype(&r.guest).and_then(|t| kernel_fs_magic(&t));
@@ -3116,7 +3125,7 @@ fn lock(fd: i32, cmd: u64, arg: u64) -> i64 {
         l_start: l.l_start,
         l_len: l.l_len,
         l_pid: 0,
-        l_type: ty,
+        l_type: ty as _,
         l_whence: l.l_whence,
     };
     let hcmd = match cmd {
@@ -3999,7 +4008,7 @@ mod dac_tests {
         let backing = unsafe {
             OwnedFd::from_raw_fd(libc::open(
                 native.as_ptr(),
-                libc::O_EVTONLY | libc::O_CLOEXEC,
+                aim_storage::host::O_EVTONLY | libc::O_CLOEXEC,
             ))
         };
         assert!(backing.as_raw_fd() >= 0);

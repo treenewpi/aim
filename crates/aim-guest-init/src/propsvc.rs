@@ -81,26 +81,64 @@ fn bind(dir: &Path, name: &str, mode: u32) -> io::Result<UnixListener> {
 }
 
 fn peer_pid(stream: &UnixStream) -> i32 {
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: LOCAL_PEERPID writes a pid_t.
-    let r = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut len,
-        )
-    };
-    if r == 0 { pid } else { -1 }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: LOCAL_PEERPID writes a pid_t.
+        let r = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if r == 0 { pid } else { -1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED writes a ucred.
+        let r = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if r == 0 { cred.pid } else { -1 }
+    }
 }
 
 fn peer_uid(stream: &UnixStream) -> u32 {
-    let (mut uid, mut gid) = (0, 0);
-    // SAFETY: getpeereid on a connected Unix socket.
-    unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    uid
+    #[cfg(target_os = "macos")]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: getpeereid on a connected Unix socket.
+        unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        uid
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED writes a ucred.
+        let r = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if r == 0 { cred.uid } else { 0 }
+    }
 }
 
 /// Reads one request the way init does: until it decodes, the peer

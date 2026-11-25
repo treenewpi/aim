@@ -11,7 +11,31 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 mod info;
+#[cfg(target_os = "macos")]
 mod registry;
+#[cfg(not(target_os = "macos"))]
+mod registry {
+    use std::ffi::CStr;
+    use std::path::PathBuf;
+
+    pub struct Object(u32);
+    impl Object {
+        pub fn matching(_class: &CStr) -> Result<Vec<Object>, String> {
+            // Linux has no IORegistry, so no Apple disk image is attached.
+            Ok(Vec::new())
+        }
+        pub fn bsd_media(_name: &CStr) -> Option<Object> {
+            None
+        }
+        pub fn whole_disk_size(self) -> Option<u64> {
+            None
+        }
+        pub fn path(&self, _key: &CStr) -> Option<PathBuf> {
+            None
+        }
+        pub fn media(&self, _out: &mut Vec<(String, bool)>) {}
+    }
+}
 
 pub(crate) use info::leftover_devices;
 
@@ -159,6 +183,7 @@ pub fn attached() -> Result<Vec<Attached>, String> {
 }
 
 /// The kernel's mounts, as (device, mount point).
+#[cfg(target_os = "macos")]
 fn mounts() -> Result<Vec<(String, PathBuf)>, String> {
     // SAFETY: a null buffer asks for the count.
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
@@ -670,6 +695,7 @@ fn statfs(path: &Path) -> Option<libc::statfs> {
 }
 
 /// The mount point of the filesystem holding `path`, and its device.
+#[cfg(target_os = "macos")]
 pub fn mount_of(path: &Path) -> Option<(PathBuf, String)> {
     let fs = statfs(path)?;
     // SAFETY: statfs NUL-terminates both names.
@@ -711,6 +737,7 @@ pub fn allocated(path: &Path) -> std::io::Result<u64> {
 /// Bytes the files of the volume mounted at `mount` use. Not statfs's
 /// blocks less free ones: APFS on a sparse image counts the host volume's
 /// free space as its own, so that difference includes the host's use.
+#[cfg(target_os = "macos")]
 pub fn used(mount: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).ok()?;
     let mut list = libc::attrlist {
@@ -754,4 +781,58 @@ pub fn block_device_size(path: &Path) -> Option<u64> {
 pub fn capacity(path: &Path) -> Option<u64> {
     let fs = statfs(path)?;
     Some(fs.f_blocks * fs.f_bsize as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mounts() -> Result<Vec<(String, PathBuf)>, String> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(point) = before.split_whitespace().nth(4) else {
+            continue;
+        };
+        let Some(source) = after.split_whitespace().nth(1) else {
+            continue;
+        };
+        out.push((unescape(source), PathBuf::from(unescape(point))));
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(u8::is_ascii_digit)
+        {
+            let value = (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+            out.push(value);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mount_of(path: &Path) -> Option<(PathBuf, String)> {
+    let real = std::fs::canonicalize(path).ok()?;
+    mounts().ok()?.into_iter().filter(|(_, on)| real.starts_with(on)).max_by_key(|(_, on)| on.as_os_str().len()).map(|(from, on)| (on, from))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn used(mount: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_blocks.saturating_sub(stat.f_bfree).saturating_mul(stat.f_frsize))
 }

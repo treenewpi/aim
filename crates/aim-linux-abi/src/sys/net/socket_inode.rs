@@ -275,7 +275,7 @@ pub(crate) fn with<T>(
     stat.st_ino = receipt.identity.inode;
     stat.st_uid = attributes.uid.ok_or(EIO)?;
     stat.st_gid = attributes.gid.ok_or(EIO)?;
-    stat.st_mode = libc::S_IFSOCK | attributes.mode.ok_or(EIO)? as u16;
+    stat.st_mode = libc::S_IFSOCK | attributes.mode.ok_or(EIO)? as libc::mode_t;
     let result = action(&stat, &mut attributes)?;
     if attributes != old {
         write(&path, receipt, attributes)?;
@@ -407,7 +407,7 @@ mod tests {
         unsafe {
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(4);
+            (*header).cmsg_len = libc::CMSG_LEN(4) as _;
             (libc::CMSG_DATA(header) as *mut i32).write_unaligned(exported.backing_fd);
         }
         assert_eq!(unsafe { libc::sendmsg(sender.as_raw_fd(), &message, 0) }, 1);

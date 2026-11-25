@@ -97,7 +97,7 @@ impl Drop for MemoryIntArray {
 fn random_uuid() -> String {
     let mut b = [0u8; 16];
     // SAFETY: fills the local buffer.
-    unsafe { libc::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
+    unsafe { crate::host_os::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
     b[6] = b[6] & 0x0f | 0x40;
     b[8] = b[8] & 0x3f | 0x80;
     let hex: String = b.iter().map(|b| format!("{b:02x}")).collect();

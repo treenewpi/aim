@@ -7,32 +7,12 @@
 //! bytes, then uid, gid and mode as little-endian words; 20 bytes. A field
 //! nobody recorded is absent.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 const NAME: &[u8] = b"dev.aim.guest-inode\0";
-const XATTR_NOFOLLOW: c_int = 1;
-
-unsafe extern "C" {
-    fn getxattr(
-        path: *const c_char,
-        name: *const c_char,
-        value: *mut c_void,
-        size: usize,
-        position: u32,
-        options: c_int,
-    ) -> isize;
-    fn setxattr(
-        path: *const c_char,
-        name: *const c_char,
-        value: *const c_void,
-        size: usize,
-        position: u32,
-        options: c_int,
-    ) -> c_int;
-}
 
 /// Recorded owner and mode; None where nobody recorded one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,13 +61,13 @@ pub fn read(path: &Path) -> io::Result<Option<GuestInode>> {
     let mut b = [0u8; 20];
     // SAFETY: NUL-terminated path and name, local buffer.
     let n = unsafe {
-        getxattr(
+        crate::host::getxattr(
             p.as_ptr(),
             NAME.as_ptr().cast(),
             b.as_mut_ptr().cast(),
             b.len(),
             0,
-            XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         )
     };
     if n < 0 {
@@ -123,13 +103,13 @@ pub fn change(path: &Path, a: GuestInode) -> io::Result<()> {
     let p = c_path(path)?;
     // SAFETY: NUL-terminated path and name, exact readable span.
     let set = || unsafe {
-        if setxattr(
+        if crate::host::setxattr(
             p.as_ptr(),
             NAME.as_ptr().cast(),
             b.as_ptr().cast(),
             b.len(),
             0,
-            XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         ) == 0
         {
             Ok(())

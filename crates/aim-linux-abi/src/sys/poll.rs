@@ -307,7 +307,7 @@ impl Hangups {
             Some(hangups) => hangups,
             None => {
                 // SAFETY: a new kqueue, owned from here.
-                let kq = unsafe { libc::kqueue() };
+                let kq = unsafe { crate::hostlibc::kqueue() };
                 if kq < 0 {
                     return Err(errno::last());
                 }
@@ -320,18 +320,18 @@ impl Hangups {
             }
         };
         this.entries.push(index);
-        let change = libc::kevent {
+        let change = crate::hostlibc::kevent {
             ident: fd as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
-            fflags: libc::NOTE_LOWAT,
+            filter: crate::hostlibc::EVFILT_READ,
+            flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR | crate::hostlibc::EV_RECEIPT,
+            fflags: crate::hostlibc::NOTE_LOWAT,
             data: isize::MAX,
             udata: std::ptr::null_mut(),
         };
         // SAFETY: one change, its receipt into a local event.
-        let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut receipt: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
         let n = unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 this.kq.as_raw_fd(),
                 &change,
                 1,
@@ -359,9 +359,9 @@ impl Hangups {
         };
         loop {
             // SAFETY: an event array we own.
-            let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+            let mut events: [crate::hostlibc::kevent; 16] = unsafe { std::mem::zeroed() };
             let n = unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     self.kq.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -374,7 +374,7 @@ impl Hangups {
                 return Err(errno::last());
             }
             for event in &events[..n as usize] {
-                if event.flags & libc::EV_EOF == 0 {
+                if event.flags & crate::hostlibc::EV_EOF == 0 {
                     continue;
                 }
                 for &index in &self.entries {
@@ -471,7 +471,7 @@ fn host_poll(fds: &mut [libc::pollfd], ms: i32, mask: u64) -> i64 {
     let n = unsafe {
         libc::poll(
             fds.as_mut_ptr(),
-            fds.len() as u32,
+            fds.len() as _,
             if fuse_ready { 0 } else { ms },
         )
     };

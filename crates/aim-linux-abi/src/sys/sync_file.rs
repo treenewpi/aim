@@ -449,7 +449,7 @@ mod tests {
         fn native_fds() -> Vec<i32> {
             let mut bytes = [0u8; 8192];
             let size = unsafe {
-                libc::proc_pidinfo(
+                crate::hostlibc::proc_pidinfo(
                     libc::getpid(),
                     1,
                     0,

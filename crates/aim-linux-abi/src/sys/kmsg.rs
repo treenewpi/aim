@@ -356,22 +356,22 @@ impl Ring {
     /// Waits for the ring to change after `seen`, the end the caller found.
     fn wait(&self, seen: impl Fn(&Header) -> bool) -> Result<(), Errno> {
         // SAFETY: a new kqueue of our own.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { crate::hostlibc::kqueue() };
         if kq < 0 {
             return Err(crate::errno::last());
         }
         let kq = unsafe { OwnedFd::from_raw_fd(kq) };
-        let change = libc::kevent {
+        let change = crate::hostlibc::kevent {
             ident: self.file.as_raw_fd() as usize,
-            filter: libc::EVFILT_VNODE,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND,
+            filter: crate::hostlibc::EVFILT_VNODE,
+            flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR,
+            fflags: crate::hostlibc::NOTE_WRITE | crate::hostlibc::NOTE_EXTEND,
             data: 0,
             udata: std::ptr::null_mut(),
         };
         // SAFETY: one change, no events.
         if unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 kq.as_raw_fd(),
                 &change,
                 1,
@@ -387,10 +387,10 @@ impl Ring {
             if !seen(&self.lock()?.header) {
                 return Ok(());
             }
-            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let mut event: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
             // SAFETY: one event into a local.
             if unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     kq.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -440,14 +440,14 @@ impl Ring {
         let dead = h.first_off & !4095;
         if dead > h.punched.max(4096) {
             let start = h.punched.max(4096);
-            let hole = libc::fpunchhole_t {
-                fp_flags: 0,
-                reserved: 0,
-                fp_offset: start as i64,
-                fp_length: (dead - start) as i64,
-            };
-            // SAFETY: F_PUNCHHOLE with a local struct.
-            if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_PUNCHHOLE, &hole) } == 0 {
+            // SAFETY: punch the discarded prefix. Darwin uses F_PUNCHHOLE.
+            if unsafe {
+                aim_storage::host::punch_hole(
+                    self.file.as_raw_fd(),
+                    start as i64,
+                    (dead - start) as i64,
+                )
+            } == 0 {
                 h.punched = dead;
             }
         }

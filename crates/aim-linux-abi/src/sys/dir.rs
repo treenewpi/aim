@@ -95,7 +95,7 @@ fn read_host_entries(fd: i32) -> Result<Vec<Entry>, i64> {
         // SAFETY: getdirentries64 fills at most buf.len() bytes.
         let n = unsafe {
             libc::syscall(
-                SYS_GETDIRENTRIES64,
+                SYS_GETDIRENTRIES64 as _,
                 fd,
                 buf.as_mut_ptr(),
                 buf.len(),

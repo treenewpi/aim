@@ -421,7 +421,7 @@ impl BackgroundInstallControl {
             }
         };
         let timestamp =
-            super::usage_stats::now_millis() - (super::clock_ms(libc::CLOCK_UPTIME_RAW) - start);
+            super::usage_stats::now_millis() - (super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW) - start);
         let adb = host
             .property("debug.gts.transparency.bg-install-apps")
             .is_none_or(|s| s.is_empty())

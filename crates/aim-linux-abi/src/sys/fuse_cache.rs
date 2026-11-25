@@ -1012,7 +1012,8 @@ mod tests {
         let address = |path: &std::path::Path| {
             let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
             address.sun_family = libc::AF_UNIX as _;
-            address.sun_len = std::mem::size_of_val(&address) as u8;
+            let len = std::mem::size_of_val(&address) as u8;
+    aim_storage::host::set_sun_len(&mut address, len);
             assert!(path.as_os_str().as_bytes().len() < address.sun_path.len());
             for (dst, src) in address.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
                 *dst = *src as _;

@@ -2608,7 +2608,7 @@ fn generate_session_id(known: &HashSet<i64>) -> Result<i64> {
         let mut value = 0i64;
         // SAFETY: arc4random_buf fills the eight bytes of a local.
         unsafe {
-            libc::arc4random_buf((&mut value as *mut i64).cast(), std::mem::size_of::<i64>());
+            crate::host_os::arc4random_buf((&mut value as *mut i64).cast(), std::mem::size_of::<i64>());
         }
         let id = if value == i64::MIN { 0 } else { value.abs() };
         if id != 0 && !known.contains(&id) {

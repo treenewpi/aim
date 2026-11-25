@@ -21,7 +21,7 @@ struct Info([u8; 792]);
 impl Info {
     fn read(pid: i32, fd: i32) -> Result<Self, Errno> {
         let mut info = Self([0; 792]);
-        let size = unsafe { libc::proc_pidfdinfo(pid, fd, 3, info.0.as_mut_ptr().cast(), 792) };
+        let size = unsafe { crate::hostlibc::proc_pidfdinfo(pid, fd, 3, info.0.as_mut_ptr().cast(), 792) };
         if size != 792 {
             let error = errno::last();
             return Err(if error == 0 { EIO } else { error });
@@ -83,9 +83,9 @@ pub(super) fn live_socket_options() -> Result<BTreeMap<u64, (u32, u16)>, Errno> 
     let members = super::super::pidns::members().unwrap_or_else(|| vec![me]);
     let mut sockets = BTreeMap::new();
     for pid in members {
-        let size = size_of::<libc::proc_fdinfo>();
+        let size = size_of::<crate::hostlibc::proc_fdinfo>();
         let count =
-            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+            unsafe { crate::hostlibc::proc_pidinfo(pid, crate::hostlibc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
         if count <= 0 {
             let error = errno::last();
             if error == ESRCH {
@@ -95,11 +95,11 @@ pub(super) fn live_socket_options() -> Result<BTreeMap<u64, (u32, u16)>, Errno> 
         }
         let mut capacity = count as usize / size + 32;
         let descriptors = loop {
-            let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
+            let mut fds: Vec<crate::hostlibc::proc_fdinfo> = Vec::with_capacity(capacity);
             let n = unsafe {
-                libc::proc_pidinfo(
+                crate::hostlibc::proc_pidinfo(
                     pid,
-                    libc::PROC_PIDLISTFDS,
+                    crate::hostlibc::PROC_PIDLISTFDS,
                     0,
                     fds.as_mut_ptr().cast(),
                     (capacity * size) as i32,
@@ -122,7 +122,7 @@ pub(super) fn live_socket_options() -> Result<BTreeMap<u64, (u32, u16)>, Errno> 
             break fds;
         };
         for fd in descriptors {
-            if fd.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
+            if fd.proc_fdtype != crate::hostlibc::PROX_FDTYPE_SOCKET as u32 {
                 continue;
             }
             match Info::read(pid, fd.proc_fd) {
@@ -233,7 +233,7 @@ fn tcp_metrics(
     // TCP_CONNECTION_INFO lifetime totals, t_rxtshift is current backoff.
     let mut length = 0;
     if unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c"net.inet.tcp.pcblist64".as_ptr(),
             std::ptr::null_mut(),
             &mut length,
@@ -248,7 +248,7 @@ fn tcp_metrics(
     loop {
         bytes.resize(length, 0);
         let result = unsafe {
-            libc::sysctlbyname(
+            crate::hostlibc::sysctlbyname(
                 c"net.inet.tcp.pcblist64".as_ptr(),
                 bytes.as_mut_ptr().cast(),
                 &mut length,

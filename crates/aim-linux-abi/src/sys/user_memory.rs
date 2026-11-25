@@ -105,7 +105,9 @@ pub(super) fn scatter(vectors: &[libc::iovec], bytes: &[u8]) -> Result<usize, Er
     Ok(done)
 }
 
+#[cfg(target_os = "macos")]
 std::arch::global_asm!(include_str!("user_copy.S"));
+#[cfg(target_os = "macos")]
 std::arch::global_asm!(include_str!("user_atomic.S"));
 
 #[repr(C)]
@@ -119,6 +121,7 @@ struct ExceptionEntry {
     retry: u64,
     fixup: u64,
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn aim_user_copy(source: u64, destination: u64, length: usize) -> CopyResult;
     fn aim_user_atomic(
@@ -132,6 +135,69 @@ unsafe extern "C" {
     static aim_user_copy_ex_table: [ExceptionEntry; 4];
     static aim_user_atomic_ex_table: [ExceptionEntry; 4];
 }
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_user_copy(source: u64, destination: u64, length: usize) -> CopyResult {
+    unsafe {
+        std::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, length);
+    }
+    CopyResult {
+        remaining: 0,
+        error: 0,
+    }
+}
+/// A host word, where the Linux test process has no guest fault table.
+/// Darwin uses the exception-table atomic in `user_atomic.S`.
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_user_atomic(
+    address: u64,
+    operation: u32,
+    expected: u32,
+    value: u32,
+    output: *mut u32,
+) -> i32 {
+    let word = address as *mut u32;
+    unsafe {
+        match operation {
+            0 => {
+                *output = std::ptr::read_volatile(word);
+                0
+            }
+            1 => {
+                std::ptr::write_volatile(word, value);
+                0
+            }
+            2 => {
+                let old = std::ptr::read_volatile(word);
+                *output = old;
+                if old == expected {
+                    std::ptr::write_volatile(word, value);
+                    0
+                } else {
+                    1
+                }
+            }
+            _ => -1,
+        }
+    }
+}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_user_pager() {}
+#[cfg(not(target_os = "macos"))]
+static aim_user_copy_ex_table: [ExceptionEntry; 4] = [const {
+    ExceptionEntry {
+        pc: 0,
+        retry: 0,
+        fixup: 0,
+    }
+}; 4];
+#[cfg(not(target_os = "macos"))]
+static aim_user_atomic_ex_table: [ExceptionEntry; 4] = [const {
+    ExceptionEntry {
+        pc: 0,
+        retry: 0,
+        fixup: 0,
+    }
+}; 4];
 
 struct UserFaultSlot {
     busy: std::sync::atomic::AtomicBool,

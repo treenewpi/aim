@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn kqueue_install_reports_duplication_failure_and_preserves_source() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let raw = unsafe { libc::kqueue() };
+        let raw = unsafe { crate::hostlibc::kqueue() };
         assert!(raw >= 0);
         let source = unsafe { OwnedFd::from_raw_fd(raw) };
         assert_eq!(

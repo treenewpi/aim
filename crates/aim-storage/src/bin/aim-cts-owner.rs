@@ -57,7 +57,7 @@ fn children(parent: ProcessIdentity, deadline: Instant) -> io::Result<Vec<Proces
     }
     let mut pids = vec![0i32; 4096];
     unsafe {
-        *libc::__error() = 0;
+        *crate::host::__error() = 0;
     }
     let count = unsafe {
         libc::proc_listchildpids(
@@ -252,7 +252,7 @@ fn executable(process: ProcessIdentity) -> io::Result<PathBuf> {
     }
     let mut path = vec![0u8; 4096];
     unsafe {
-        *libc::__error() = 0;
+        *crate::host::__error() = 0;
     }
     let count = unsafe {
         libc::proc_pidpath(

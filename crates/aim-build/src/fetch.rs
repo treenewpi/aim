@@ -176,6 +176,8 @@ impl Source {
                 return self.check_file(&dest);
             }
             let partial = dest.with_extension("partial");
+            // macOS base64 takes -D -i -o. GNU base64 decodes with -d to stdout.
+            #[cfg(target_os = "macos")]
             log.run(
                 Command::new("base64")
                     .arg("-D")
@@ -184,6 +186,21 @@ impl Source {
                     .arg("-o")
                     .arg(&partial),
             )?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                let output = Command::new("base64")
+                    .arg("-d")
+                    .arg(&encoded)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "base64: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                fs::write(&partial, &output.stdout).map_err(|e| e.to_string())?;
+            }
             fs::remove_file(&encoded).map_err(|e| e.to_string())?;
             fs::rename(&partial, &dest).map_err(|e| e.to_string())?;
         }

@@ -58,7 +58,7 @@ struct Reactor {
 static REACTOR: Mutex<Option<Arc<Reactor>>> = Mutex::new(None);
 impl Reactor {
     fn start() -> io::Result<Arc<Self>> {
-        let fd = unsafe { libc::kqueue() };
+        let fd = unsafe { aim_storage::host::kqueue() };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -97,21 +97,21 @@ impl Reactor {
                 next.checked_add(1)
             })
             .map_err(|_| failure(libc::EOVERFLOW))?;
-        let change = libc::kevent {
+        let change = aim_storage::host::kevent {
             ident: fd as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
+            filter: aim_storage::host::EVFILT_READ,
+            flags: aim_storage::host::EV_ADD | aim_storage::host::EV_CLEAR | aim_storage::host::EV_RECEIPT,
             fflags: 0,
             data: 0,
             udata: tag as *mut _,
         };
-        let mut receipt: libc::kevent = unsafe { mem::zeroed() };
+        let mut receipt: aim_storage::host::kevent = unsafe { mem::zeroed() };
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         let count = unsafe {
-            libc::kevent(
+            aim_storage::host::kevent(
                 self.descriptor.as_raw_fd(),
                 &change,
                 1,
@@ -123,7 +123,7 @@ impl Reactor {
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        if count != 1 || receipt.flags & libc::EV_ERROR == 0 {
+        if count != 1 || receipt.flags & aim_storage::host::EV_ERROR == 0 {
             return Err(failure(libc::EPROTO));
         }
         if receipt.data != 0 {
@@ -133,9 +133,9 @@ impl Reactor {
     }
     fn run(&self) {
         loop {
-            let mut events: [libc::kevent; 32] = unsafe { mem::zeroed() };
+            let mut events: [aim_storage::host::kevent; 32] = unsafe { mem::zeroed() };
             let count = unsafe {
-                libc::kevent(
+                aim_storage::host::kevent(
                     self.descriptor.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -153,15 +153,15 @@ impl Reactor {
                 return;
             }
             for event in &events[..count as usize] {
-                let result = if event.flags & libc::EV_ERROR != 0 {
+                let result = if event.flags & aim_storage::host::EV_ERROR != 0 {
                     Err(failure(event.data as i32))
-                } else if event.filter != libc::EVFILT_READ {
+                } else if event.filter != aim_storage::host::EVFILT_READ {
                     Err(failure(libc::EPROTO))
                 } else {
                     super::token_event(
                         event.ident as i32,
                         event.udata as usize,
-                        event.flags & libc::EV_EOF != 0,
+                        event.flags & aim_storage::host::EV_EOF != 0,
                     )
                 };
                 if let Err(error) = result {

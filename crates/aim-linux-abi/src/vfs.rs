@@ -1895,7 +1895,7 @@ struct Vfs {
     /// Whether a path map is in use (the image is then read-only).
     mapped: bool,
     /// The device of the root when it is a read-only mount (the image's).
-    read_only_dev: Option<i32>,
+    read_only_dev: Option<libc::dev_t>,
     /// Longest guest prefix first; among equal prefixes the latest mount.
     mounts: MountTable,
     /// Directory holding the path map (the guest-init runtime directory).
@@ -2582,19 +2582,32 @@ pub fn init(root: &Path, map: Option<&Path>) -> Result<(), String> {
 }
 
 /// The device of the filesystem holding `root`, if it is mounted read-only.
-fn read_only_dev(root: &Path) -> Option<i32> {
+fn read_only_dev(root: &Path) -> Option<libc::dev_t> {
     let c = CString::new(root.as_os_str().as_bytes()).ok()?;
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, local buffers.
-    let ok =
-        unsafe { libc::statfs(c.as_ptr(), &mut fs) == 0 && libc::stat(c.as_ptr(), &mut st) == 0 };
-    (ok && fs.f_flags & libc::MNT_RDONLY as u32 != 0).then_some(st.st_dev)
+    if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        let read_only = unsafe { libc::statfs(c.as_ptr(), &mut fs) == 0 }
+            && fs.f_flags as u64 & libc::MNT_RDONLY as u64 != 0;
+        read_only.then_some(st.st_dev)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let read_only = unsafe { libc::statvfs(c.as_ptr(), &mut fs) == 0 }
+            && fs.f_flag & libc::ST_RDONLY as u64 != 0;
+        read_only.then_some(st.st_dev)
+    }
 }
 
 /// Whether host device `dev` is the read-only volume of the root: nothing
 /// on it can have been changed by a guest.
-pub fn on_read_only_root(dev: i32) -> bool {
+pub fn on_read_only_root(dev: libc::dev_t) -> bool {
     VFS.get().and_then(|v| v.read_only_dev) == Some(dev)
 }
 
@@ -3964,7 +3977,7 @@ fn guest_path_of_fd(fd: i32) -> Result<(String, bool), Errno> {
     }
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return Err(errno::last());
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -5144,7 +5157,7 @@ mod tests {
         let file = std::fs::File::open(&library).unwrap();
         let mut path = [0u8; libc::PATH_MAX as usize];
         assert_eq!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) },
+            unsafe { crate::sys::fgetpath(file.as_raw_fd(), path.as_mut_ptr()) },
             0
         );
         let host = PathBuf::from(std::ffi::OsStr::from_bytes(

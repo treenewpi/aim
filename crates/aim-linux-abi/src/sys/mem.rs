@@ -1141,7 +1141,7 @@ fn note_file_copy(base: u64, len: u64, fd: i32, off: u64, anonymous: bool) {
     // buffer.
     let st = unsafe {
         let mut st: libc::stat = std::mem::zeroed();
-        if libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) < 0 || libc::fstat(fd, &mut st) < 0 {
+        if crate::sys::fgetpath(fd, buf.as_mut_ptr()) < 0 || libc::fstat(fd, &mut st) < 0 {
             return;
         }
         st
@@ -1296,7 +1296,7 @@ fn file_backed(addr: u64) -> bool {
     let mut buf = [0u8; 16];
     // SAFETY: proc_regionfilename writes at most buf.len() bytes.
     unsafe {
-        libc::proc_regionfilename(
+        crate::hostlibc::proc_regionfilename(
             libc::getpid(),
             addr,
             buf.as_mut_ptr().cast(),
@@ -2174,10 +2174,10 @@ use patch::vm::{
 
 unsafe extern "C" {
     fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
-    fn mach_vm_allocate(task: libc::mach_port_t, address: *mut u64, size: u64, flags: i32) -> i32;
-    fn mach_vm_inherit(task: libc::mach_port_t, address: u64, size: u64, inheritance: u32) -> i32;
+    fn mach_vm_allocate(task: crate::mach_port_t, address: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_inherit(task: crate::mach_port_t, address: u64, size: u64, inheritance: u32) -> i32;
     fn mach_vm_read_overwrite(
-        task: libc::mach_port_t,
+        task: crate::mach_port_t,
         address: u64,
         size: u64,
         data: u64,
@@ -2223,7 +2223,7 @@ pub(super) fn remap_shared(dst: u64, src: u64, len: u64) -> Result<(), i64> {
 /// No unfilled executable memory is visible to another guest pthread.
 pub(super) fn publish_verified_jit_page(dst: u64, bytes: &[u8]) -> std::io::Result<()> {
     unsafe {
-        libc::pthread_jit_write_protect_np(1);
+        aim_storage::host::pthread_jit_write_protect_np(1);
     }
     let _placement = arena::placing_exclusive();
     let outcome = super::thread::with_guest_threads_quiescent(|| {
@@ -2236,7 +2236,7 @@ pub(super) fn publish_verified_jit_page(dst: u64, bytes: &[u8]) -> std::io::Resu
                 dst as *mut _,
                 bytes.len(),
                 protection,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                libc::MAP_PRIVATE | libc::MAP_ANON | aim_storage::host::MAP_JIT,
                 -1,
                 0,
             )
@@ -2268,9 +2268,9 @@ pub(super) fn publish_verified_jit_page(dst: u64, bytes: &[u8]) -> std::io::Resu
             return Err(failure);
         }
         unsafe {
-            libc::pthread_jit_write_protect_np(0);
+            aim_storage::host::pthread_jit_write_protect_np(0);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
-            libc::pthread_jit_write_protect_np(1);
+            aim_storage::host::pthread_jit_write_protect_np(1);
             sys_icache_invalidate(mapped, bytes.len());
         }
         Ok(())
@@ -2303,7 +2303,7 @@ pub(super) fn reprotect_verified_page(
     }
     let mut bytes = vec![0; length as usize];
     unsafe {
-        libc::pthread_jit_write_protect_np(1);
+        aim_storage::host::pthread_jit_write_protect_np(1);
     }
     let _placement = arena::placing_exclusive();
     let result = super::thread::with_guest_threads_quiescent(|| {
@@ -2316,7 +2316,7 @@ pub(super) fn reprotect_verified_page(
         let flags = libc::MAP_PRIVATE
             | libc::MAP_ANON
             | if protection == rwx {
-                libc::MAP_JIT
+                aim_storage::host::MAP_JIT
             } else {
                 libc::MAP_FIXED
             };
@@ -2336,11 +2336,11 @@ pub(super) fn reprotect_verified_page(
         } else {
             unsafe {
                 if protection == rwx {
-                    libc::pthread_jit_write_protect_np(0);
+                    aim_storage::host::pthread_jit_write_protect_np(0);
                 }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
                 if protection == rwx {
-                    libc::pthread_jit_write_protect_np(1);
+                    aim_storage::host::pthread_jit_write_protect_np(1);
                 }
                 sys_icache_invalidate(mapped, bytes.len());
             }
@@ -2358,7 +2358,7 @@ pub(super) fn reprotect_verified_page(
             let flags = libc::MAP_PRIVATE
                 | libc::MAP_ANON
                 | if current == rwx {
-                    libc::MAP_JIT
+                    aim_storage::host::MAP_JIT
                 } else {
                     libc::MAP_FIXED
                 };
@@ -2386,11 +2386,11 @@ pub(super) fn reprotect_verified_page(
             }
             unsafe {
                 if current == rwx {
-                    libc::pthread_jit_write_protect_np(0);
+                    aim_storage::host::pthread_jit_write_protect_np(0);
                 }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), restored.cast::<u8>(), bytes.len());
                 if current == rwx {
-                    libc::pthread_jit_write_protect_np(1);
+                    aim_storage::host::pthread_jit_write_protect_np(1);
                 }
                 sys_icache_invalidate(restored, bytes.len());
             }
@@ -2422,7 +2422,7 @@ pub(super) fn remap_verified_page(
                 std::ptr::null_mut(),
                 len as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                libc::MAP_PRIVATE | libc::MAP_ANON | aim_storage::host::MAP_JIT,
                 -1,
                 0,
             )
@@ -2431,9 +2431,9 @@ pub(super) fn remap_verified_page(
             return Err(std::io::Error::last_os_error());
         }
         unsafe {
-            libc::pthread_jit_write_protect_np(0);
+            aim_storage::host::pthread_jit_write_protect_np(0);
             std::ptr::copy_nonoverlapping(src as *const u8, staging.cast::<u8>(), len as usize);
-            libc::pthread_jit_write_protect_np(1);
+            aim_storage::host::pthread_jit_write_protect_np(1);
             sys_icache_invalidate(staging, len as usize);
         }
         Some(staging as u64)
@@ -3104,8 +3104,13 @@ pub fn mincore(a: [u64; 6]) -> i64 {
     {
         return -(ENOMEM as i64);
     }
-    // SAFETY: guest vector of len/PAGE bytes.
-    let r = unsafe { libc::mincore(addr as *const _, len as usize, vec as *mut libc::c_char) };
+    // SAFETY: guest vector of len/PAGE bytes. Darwin's mincore wants
+    // `*mut c_char`; Linux's wants `*mut u8`.
+    #[cfg(target_os = "macos")]
+    let resident = vec as *mut libc::c_char;
+    #[cfg(not(target_os = "macos"))]
+    let resident = vec as *mut u8;
+    let r = unsafe { libc::mincore(addr as *mut _, len as usize, resident) };
     if r < 0 {
         return -(errno::last() as i64);
     }

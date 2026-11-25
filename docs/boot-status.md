@@ -308,12 +308,34 @@ apexd-bootstrap started as `SVC_EXEC`, mapped
 `0x5a000`, found 38 APEXes and the bootstrap set (runtime, i18n, virt,
 tzdata), and logged `Need to pre-allocate 39 loop devices`. It then
 looped `newfstatat("/dev/loop-control") = ENOENT` 1270 times until the
-harness's 8 second limit. No reboot. Loop devices, a read-only ext4
-mount of a loop or dm device, and per-block dm-verity are in the tree
-after that archive and are not Mac-remeasured. The pinned layer has 35
-`apex_payload.img` files, all ext4 with a 4096-byte block; the trace's
-count of 38 is apexd's, and the three names that are not in the tarball
-are not invented here.
+harness's 8 second limit. No reboot.
+`63008084d55ca0d2065100aa7a29fa5913e1d755` (archive SHA256
+`3a54ba4da8ba39f1d430c3d3bb262542e5aa3f1d231ac6f7053eaf8cdf1aeb64`)
+remeasured that path. Every step exited 0 and `--init-timeout 90` was
+accepted. `/dev/loop-control` stat and open succeeded (fd 5). Every
+ioctl returned `ENOTTY`: `LOOP_CTL_ADD` `0x4c80` (first failure, call
+3662), `LOOP_CTL_GET_FREE` `0x4c82` (2232 times), `DM_DEV_CREATE`
+`0xc138fd03` (35 times), and init's `DM_DEV_STATUS` `0xc138fd07` (4
+times). The trace has no `DM_VERSION` (`0xc138fd00`) before
+`DM_DEV_CREATE`. apexd-bootstrap exited 1 and init rebooted with
+`reboot,bootloader,bootstrap-apexd-failed` after 4.7s. No mount ran, so
+ext4 and verity were not exercised. ioctl now follows the device number
+stored at open (`10:237` loop-control, `10:236` device-mapper, `7:N`
+loop). That dispatch is not Mac-remeasured. The pinned layer has 35
+`.apex` files and no `.capex`: 34 under `system/apex`, and
+`com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
+two partitions, and none of the zips is a compressed container (each has
+`apex_payload.img`). Every payload is ext4, magic `0xEF53`, 4096-byte
+blocks, compat `0x28` (`EXT_ATTR|DIR_INDEX`), incompat `0x42`
+(`FILETYPE|EXTENTS`), ro_compat `0x407b`
+(`SPARSE_SUPER|LARGE_FILE|HUGE_FILE|GDT_CSUM|DIR_NLINK|EXTRA_ISIZE|SHARED_BLOCKS`).
+`FLEX_BG`, `METADATA_CSUM` and `INLINE_DATA` are unset on all 35.
+`DIR_INDEX` is set, so a directory may be an htree. Apexd's
+`Need to pre-allocate 39 loop devices` is those 35 files plus one extra
+loop device for each bootstrap package it logged (`runtime`, `i18n`,
+`virt`, `tzdata`). There is no 36th apex file in the image, so the three
+names that would turn 35 into 38 are not a `.capex`, not the same package
+on another partition, and not present to name.
 The trace logs a bounded
 `/proc/sys` read or write payload, including a failed write, and a
 `readlinkat` result on failure. `write` of

@@ -164,7 +164,9 @@ const _: () = assert!(std::mem::offset_of!(DarwinMcontext, v) == 288);
 /// `uc` must be the ucontext a Darwin signal handler received.
 pub unsafe fn mcontext<'a>(uc: *mut libc::c_void) -> &'a mut DarwinMcontext {
     // SAFETY: caller contract; uc_mcontext points at the saved state.
-    unsafe { &mut *((*(uc as *mut libc::ucontext_t)).uc_mcontext as *mut DarwinMcontext) }
+    unsafe {
+        &mut *(aim_storage::host::mcontext_ptr(uc as *mut libc::ucontext_t) as *mut DarwinMcontext)
+    }
 }
 
 const NZCV: u64 = 0xf000_0000;

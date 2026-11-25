@@ -136,7 +136,7 @@ fn attributes(source: &Path, dest: &Path, mode: u32) -> Result<(), String> {
     // SAFETY: NUL-terminated paths and buffers of the lengths passed, in
     // the list/get/set pattern of listxattr(2) and getxattr(2).
     unsafe {
-        let len = libc::listxattr(from.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW);
+        let len = crate::host::listxattr(from.as_ptr(), std::ptr::null_mut(), 0, crate::host::XATTR_NOFOLLOW);
         if len < 0 {
             return Err(format!(
                 "{}: listxattr: {}",
@@ -145,11 +145,11 @@ fn attributes(source: &Path, dest: &Path, mode: u32) -> Result<(), String> {
             ));
         }
         let mut names = vec![0u8; len as usize];
-        let len = libc::listxattr(
+        let len = crate::host::listxattr(
             from.as_ptr(),
             names.as_mut_ptr().cast(),
             names.len(),
-            libc::XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         );
         if len < 0 {
             return Err(format!(
@@ -163,13 +163,13 @@ fn attributes(source: &Path, dest: &Path, mode: u32) -> Result<(), String> {
             .filter(|n| !n.is_empty() && *n != crate::fscrypt::CONTEXT.to_bytes())
         {
             let name = CString::new(name).map_err(|e| e.to_string())?;
-            let size = libc::getxattr(
+            let size = crate::host::getxattr(
                 from.as_ptr(),
                 name.as_ptr(),
                 std::ptr::null_mut(),
                 0,
                 0,
-                libc::XATTR_NOFOLLOW,
+                crate::host::XATTR_NOFOLLOW,
             );
             if size < 0 {
                 return Err(format!(
@@ -179,22 +179,22 @@ fn attributes(source: &Path, dest: &Path, mode: u32) -> Result<(), String> {
                 ));
             }
             let mut value = vec![0u8; size as usize];
-            let size = libc::getxattr(
+            let size = crate::host::getxattr(
                 from.as_ptr(),
                 name.as_ptr(),
                 value.as_mut_ptr().cast(),
                 value.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                crate::host::XATTR_NOFOLLOW,
             );
             if size < 0
-                || libc::setxattr(
+                || crate::host::setxattr(
                     to.as_ptr(),
                     name.as_ptr(),
                     value.as_ptr().cast(),
                     size as usize,
                     0,
-                    libc::XATTR_NOFOLLOW,
+                    crate::host::XATTR_NOFOLLOW,
                 ) != 0
             {
                 return Err(format!(
@@ -251,7 +251,7 @@ mod tests {
         let mut value = vec![0u8; 64];
         // SAFETY: NUL-terminated strings and a buffer of the length passed.
         let size = unsafe {
-            libc::getxattr(
+            crate::host::getxattr(
                 p.as_ptr(),
                 n.as_ptr(),
                 value.as_mut_ptr().cast(),
@@ -267,7 +267,7 @@ mod tests {
         let (p, n) = (c_path(path).unwrap(), CString::new(name).unwrap());
         // SAFETY: NUL-terminated strings and a buffer of the length passed.
         let status = unsafe {
-            libc::setxattr(
+            crate::host::setxattr(
                 p.as_ptr(),
                 n.as_ptr(),
                 value.as_ptr().cast(),

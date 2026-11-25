@@ -35,15 +35,15 @@ fn pipe() -> [OwnedFd; 2] {
 /// would: a fork without exec keeps even close-on-exec ones, and a
 /// concurrent test waiting for a last close must not wait for an actor.
 unsafe fn close_others(keep: [i32; 2]) {
-    let mut fds = [libc::proc_fdinfo {
+    let mut fds = [crate::host::proc_fdinfo {
         proc_fd: 0,
         proc_fdtype: 0,
     }; 256];
     loop {
         let size = unsafe {
-            libc::proc_pidinfo(
+            crate::host::proc_pidinfo(
                 libc::getpid(),
-                libc::PROC_PIDLISTFDS,
+                crate::host::PROC_PIDLISTFDS,
                 0,
                 fds.as_mut_ptr().cast(),
                 std::mem::size_of_val(&fds) as i32,
@@ -52,7 +52,7 @@ unsafe fn close_others(keep: [i32; 2]) {
         if size <= 0 {
             unsafe { libc::_exit(5) };
         }
-        let listed = &fds[..size as usize / std::mem::size_of::<libc::proc_fdinfo>()];
+        let listed = &fds[..size as usize / std::mem::size_of::<crate::host::proc_fdinfo>()];
         let mut closed = false;
         for fd in listed
             .iter()
@@ -103,7 +103,7 @@ unsafe fn serve(leader: bool, parent: libc::pid_t, commands: i32, answers: i32) 
                 if polled > 0 {
                     break;
                 }
-                if polled < 0 && *libc::__error() != libc::EINTR || libc::getppid() != parent {
+                if polled < 0 && *crate::host::__error() != libc::EINTR || libc::getppid() != parent {
                     libc::_exit(4);
                 }
             }
@@ -456,14 +456,14 @@ fn retained_binding_signals_after_credential_directory_teardown_without_adopting
 fn actor_keeps_no_descriptor_of_the_test_process() {
     let [_reader, _writer] = pipe();
     let mut actor = Actor::new(false);
-    let mut fds = [libc::proc_fdinfo {
+    let mut fds = [crate::host::proc_fdinfo {
         proc_fd: 0,
         proc_fdtype: 0,
     }; 16];
     let size = unsafe {
-        libc::proc_pidinfo(
+        crate::host::proc_pidinfo(
             actor.identity.host_pid,
-            libc::PROC_PIDLISTFDS,
+            crate::host::PROC_PIDLISTFDS,
             0,
             fds.as_mut_ptr().cast(),
             std::mem::size_of_val(&fds) as i32,
@@ -471,7 +471,7 @@ fn actor_keeps_no_descriptor_of_the_test_process() {
     };
     // Its command and answer pipes only.
     assert_eq!(
-        size as usize / std::mem::size_of::<libc::proc_fdinfo>(),
+        size as usize / std::mem::size_of::<crate::host::proc_fdinfo>(),
         2,
         "{:?}",
         io::Error::last_os_error()

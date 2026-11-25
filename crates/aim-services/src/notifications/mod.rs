@@ -698,17 +698,25 @@ fn connect(display: &Path) -> Result<Option<UnixStream>, String> {
     wire::send(link.as_fd(), wire::bytes(&hello), None).map_err(|e| e.to_string())?;
     let answer = wire::recv_record::<u32>(link.as_fd()).map_err(|e| e.to_string())?;
     // SO_NOSIGPIPE: a write after the server has gone fails instead.
-    let on: libc::c_int = 1;
-    // SAFETY: setsockopt on our socket with a local int.
+    // Linux has no such socket option; ignore SIGPIPE for this process.
+    #[cfg(target_os = "macos")]
+    {
+        let on: libc::c_int = 1;
+        // SAFETY: setsockopt on our socket with a local int.
+        unsafe {
+            libc::setsockopt(
+                link.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&on as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
     unsafe {
-        libc::setsockopt(
-            link.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            (&on as *const libc::c_int).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     Ok((answer == Some(mode::WINDOWS)).then_some(link))
 }
 

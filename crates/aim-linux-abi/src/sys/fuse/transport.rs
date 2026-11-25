@@ -105,7 +105,8 @@ fn socket_gone(path: &Path) -> bool {
         return false;
     }
     address.sun_family = libc::AF_UNIX as _;
-    address.sun_len = std::mem::size_of_val(&address) as _;
+    let len = std::mem::size_of_val(&address) as u8;
+    aim_storage::host::set_sun_len(&mut address, len);
     for (dst, src) in address.sun_path.iter_mut().zip(bytes) {
         *dst = *src as _;
     }

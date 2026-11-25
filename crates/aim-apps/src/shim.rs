@@ -266,9 +266,15 @@ fn clone(from: &Path, to: &Path) -> io::Result<()> {
         CString::new(from.as_os_str().as_bytes())?,
         CString::new(to.as_os_str().as_bytes())?,
     );
-    // SAFETY: two NUL-terminated paths.
+    // SAFETY: two NUL-terminated paths. Linux has no clonefile; the copy
+    // below is the fallback Darwin already uses when the volume refuses.
+    #[cfg(target_os = "macos")]
     if unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), 0) } == 0 {
         return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (f, t);
     }
     fs::copy(from, to).map(drop)
 }
@@ -394,12 +400,12 @@ mod tests {
     }
 }
 
-#[link(name = "CoreServices", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreServices", kind = "framework"))]
 unsafe extern "C" {
     fn LSRegisterURL(url: *const std::ffi::c_void, update: bool) -> i32;
 }
 
-#[link(name = "CoreFoundation", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreFoundation", kind = "framework"))]
 unsafe extern "C" {
     fn CFURLCreateFromFileSystemRepresentation(
         alloc: *const std::ffi::c_void,

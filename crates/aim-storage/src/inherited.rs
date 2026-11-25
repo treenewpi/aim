@@ -14,7 +14,7 @@
 //! descriptor exists, and a child forked in between keeps it past exec
 //! (#1617). [`stdio_only`] closes, in the child, what is not close-on-exec.
 
-const EMPTY: libc::proc_fdinfo = libc::proc_fdinfo {
+const EMPTY: crate::host::proc_fdinfo = crate::host::proc_fdinfo {
     proc_fd: -1,
     proc_fdtype: 0,
 };
@@ -55,15 +55,15 @@ fn above_stdio(mut f: impl FnMut(i32)) {
     let size = std::mem::size_of_val(&buffer) as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes into `buffer`.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::host::proc_pidinfo(
             libc::getpid(),
-            libc::PROC_PIDLISTFDS,
+            crate::host::PROC_PIDLISTFDS,
             0,
             buffer.as_mut_ptr().cast(),
             size,
         )
     };
-    let count = (n.max(0) as usize / std::mem::size_of::<libc::proc_fdinfo>()).min(buffer.len());
+    let count = (n.max(0) as usize / std::mem::size_of::<crate::host::proc_fdinfo>()).min(buffer.len());
     for info in &buffer[..count] {
         if info.proc_fd > 2 {
             f(info.proc_fd);

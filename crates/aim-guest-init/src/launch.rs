@@ -899,24 +899,32 @@ fn spawn(
         // (its `UnblockSignals` at fork), whatever mask this process has,
         // and with SIGPIPE's default action, which the Rust runtime ignores
         // in this process and init does not.
-        let mut unblocked: libc::sigset_t = 0;
+        let mut unblocked: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut unblocked);
         libc::posix_spawnattr_setsigmask(&mut attr, &unblocked);
-        let mut defaults: libc::sigset_t = 0;
+        let mut defaults: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut defaults);
         libc::sigaddset(&mut defaults, libc::SIGPIPE);
         libc::posix_spawnattr_setsigdefault(&mut attr, &defaults);
+        #[cfg(not(target_os = "macos"))]
+        if suspended {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err("posix_spawn cannot start a process suspended".into());
+        }
+        let mut flags = libc::POSIX_SPAWN_SETPGROUP
+            | libc::POSIX_SPAWN_SETSIGMASK
+            | libc::POSIX_SPAWN_SETSIGDEF;
+        #[cfg(target_os = "macos")]
+        {
+            flags |= libc::POSIX_SPAWN_CLOEXEC_DEFAULT;
+            if suspended {
+                flags |= libc::POSIX_SPAWN_START_SUSPENDED;
+            }
+        }
         libc::posix_spawnattr_setflags(
             &mut attr,
-            (libc::POSIX_SPAWN_SETPGROUP
-                | libc::POSIX_SPAWN_SETSIGMASK
-                | libc::POSIX_SPAWN_SETSIGDEF
-                | libc::POSIX_SPAWN_CLOEXEC_DEFAULT
-                | if suspended {
-                    libc::POSIX_SPAWN_START_SUSPENDED
-                } else {
-                    0
-                }) as libc::c_short,
+            flags as libc::c_short,
         );
         libc::posix_spawnattr_setpgroup(&mut attr, 0);
         libc::posix_spawn_file_actions_addopen(

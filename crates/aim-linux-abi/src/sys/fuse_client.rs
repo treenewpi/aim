@@ -686,12 +686,12 @@ pub fn stat(route: &FuseRoute, node: Option<u64>, fh: Option<u64>) -> Result<lib
     stat.st_atime_nsec = u32_at(&attr, 48)? as i64;
     stat.st_mtime_nsec = u32_at(&attr, 52)? as i64;
     stat.st_ctime_nsec = u32_at(&attr, 56)? as i64;
-    stat.st_mode = u32_at(&attr, 60)? as u16;
-    stat.st_nlink = u32_at(&attr, 64)? as u16;
+    stat.st_mode = u32_at(&attr, 60)? as _;
+    stat.st_nlink = u32_at(&attr, 64)? as _;
     stat.st_uid = u32_at(&attr, 68)?;
     stat.st_gid = u32_at(&attr, 72)?;
-    stat.st_rdev = u32_at(&attr, 76)? as i32;
-    stat.st_blksize = u32_at(&attr, 80)? as i32;
+    stat.st_rdev = u32_at(&attr, 76)? as _;
+    stat.st_blksize = u32_at(&attr, 80)? as _;
     Ok(stat)
 }
 pub fn getdents(fd: i32, buffer: u64, count: usize) -> Option<i64> {

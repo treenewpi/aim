@@ -104,16 +104,16 @@ pub(super) fn get(host: Host, name: &CStr, b: &mut [u8]) -> Option<usize> {
     // SAFETY: host path or fd, local buffer.
     let n = unsafe {
         match host {
-            Host::Image(p) | Host::Path(p) => libc::getxattr(
+            Host::Image(p) | Host::Path(p) => aim_storage::host::getxattr(
                 p.as_ptr(),
                 name.as_ptr(),
                 b.as_mut_ptr().cast(),
                 b.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                aim_storage::host::XATTR_NOFOLLOW,
             ),
             Host::Fd(fd) => {
-                libc::fgetxattr(fd, name.as_ptr(), b.as_mut_ptr().cast(), b.len(), 0, 0)
+                aim_storage::host::fgetxattr(fd, name.as_ptr(), b.as_mut_ptr().cast(), b.len(), 0, 0)
             }
         }
     };
@@ -162,15 +162,15 @@ fn set_guest(host: Host, a: Attr) -> Result<bool, crate::errno::Errno> {
 pub(super) fn set(host: Host, name: &CStr, b: &[u8]) -> Result<bool, crate::errno::Errno> {
     change(host, || unsafe {
         match host {
-            Host::Path(p) => libc::setxattr(
+            Host::Path(p) => aim_storage::host::setxattr(
                 p.as_ptr(),
                 name.as_ptr(),
                 b.as_ptr().cast(),
                 b.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                aim_storage::host::XATTR_NOFOLLOW,
             ),
-            Host::Fd(fd) => libc::fsetxattr(fd, name.as_ptr(), b.as_ptr().cast(), b.len(), 0, 0),
+            Host::Fd(fd) => aim_storage::host::fsetxattr(fd, name.as_ptr(), b.as_ptr().cast(), b.len(), 0, 0),
             Host::Image(_) => unreachable!(),
         }
     })
@@ -180,8 +180,8 @@ pub(super) fn set(host: Host, name: &CStr, b: &[u8]) -> Result<bool, crate::errn
 pub(super) fn remove(host: Host, name: &CStr) -> Result<bool, crate::errno::Errno> {
     let result = change(host, || unsafe {
         match host {
-            Host::Path(p) => libc::removexattr(p.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW),
-            Host::Fd(fd) => libc::fremovexattr(fd, name.as_ptr(), 0),
+            Host::Path(p) => aim_storage::host::removexattr(p.as_ptr(), name.as_ptr(), aim_storage::host::XATTR_NOFOLLOW),
+            Host::Fd(fd) => aim_storage::host::fremovexattr(fd, name.as_ptr(), 0),
             Host::Image(_) => unreachable!(),
         }
     });
@@ -343,7 +343,7 @@ fn table_lookup_key(key: &str) -> Attr {
 fn device_key(st: &libc::stat) -> String {
     format!(
         "/@devfs/{}/{}/{}/{}/{}",
-        st.st_dev, st.st_ino, st.st_gen, st.st_birthtime, st.st_birthtime_nsec
+        st.st_dev, st.st_ino, aim_storage::host::generation(st), aim_storage::host::birth(st).0, aim_storage::host::birth(st).1
     )
 }
 /// Only actual PTY allocation creates a devfs owner binding. Other character
@@ -407,7 +407,7 @@ struct Known {
 /// Reading an attribute costs about 15 µs on the development Mac, 10 to 30
 /// times a stat, so each process keeps what it read, by (dev, ino), and a
 /// fork child starts with its parent's (an app with what zygote read).
-static INODES: Mutex<Option<HashMap<(i32, u64), Known>>> = Mutex::new(None);
+static INODES: Mutex<Option<HashMap<(libc::dev_t, u64), Known>>> = Mutex::new(None);
 const INODES_MAX: usize = 1 << 16;
 
 /// Fork: the attributes read so far. They stay valid in the child as they
@@ -420,7 +420,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
     let inodes = INODES.lock().unwrap();
     let mut b = Vec::with_capacity(inodes.as_ref().map_or(0, |m| m.len()) * RECORD);
     for (&(dev, ino), k) in inodes.iter().flatten() {
-        b.extend_from_slice(&dev.to_le_bytes());
+        b.extend_from_slice(&(dev as u32).to_le_bytes());
         b.extend_from_slice(&ino.to_le_bytes());
         b.extend_from_slice(&k.ctime.0.to_le_bytes());
         b.extend_from_slice(&k.ctime.1.to_le_bytes());
@@ -442,7 +442,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 (present & bit != 0).then(|| decode(&b[at..at + 20]).unwrap_or_default())
             };
             let key = (
-                i32::from_le_bytes(b[..4].try_into().unwrap()),
+                i32::from_le_bytes(b[..4].try_into().unwrap()) as libc::dev_t,
                 word(&b[4..12]) as u64,
             );
             let k = Known {
@@ -544,7 +544,7 @@ pub fn apply(host: Host, guest: impl FnOnce() -> String, st: &mut libc::stat) {
     st.st_uid = a.uid.unwrap_or(0);
     st.st_gid = a.gid.unwrap_or(0);
     if let Some(m) = a.mode {
-        st.st_mode = (st.st_mode & libc::S_IFMT) | (m as u16 & 0o7777);
+        st.st_mode = (st.st_mode & libc::S_IFMT) | (m as libc::mode_t & 0o7777);
     }
 }
 
@@ -554,7 +554,7 @@ pub fn recording() -> bool {
 }
 
 thread_local! {
-    static HELD_INODE_LOCKS: std::cell::RefCell<Vec<(i32,u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static HELD_INODE_LOCKS: std::cell::RefCell<Vec<(libc::dev_t, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn host_stat(host: Host) -> Result<libc::stat, crate::errno::Errno> {
@@ -575,7 +575,7 @@ fn host_stat(host: Host) -> Result<libc::stat, crate::errno::Errno> {
 /// The inode locks this process holds, by (device, inode): a lock byte is
 /// held by the process's one open lock file, so its threads exclude each
 /// other here.
-static LOCKED: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+static LOCKED: Mutex<Vec<(libc::dev_t, u64)>> = Mutex::new(Vec::new());
 static UNLOCKED: std::sync::Condvar = std::sync::Condvar::new();
 
 /// `<runtime>/inode-locks/<device>`, made and opened once per process and
@@ -584,10 +584,10 @@ static UNLOCKED: std::sync::Condvar = std::sync::Condvar::new();
 /// and goes with that process. A failed open (no free descriptor, say) is
 /// tried again by the next lock.
 fn inode_lock_file(
-    device: i32,
+    device: libc::dev_t,
 ) -> Result<std::sync::Arc<aim_storage::private_fd::PrivateFile>, crate::errno::Errno> {
     use std::sync::Arc;
-    static FILES: Mutex<Vec<(i32, Arc<aim_storage::private_fd::PrivateFile>)>> =
+    static FILES: Mutex<Vec<(libc::dev_t, Arc<aim_storage::private_fd::PrivateFile>)>> =
         Mutex::new(Vec::new());
     let mut files = FILES.lock().unwrap();
     if let Some((_, file)) = files.iter().find(|(known, _)| *known == device) {
@@ -612,15 +612,21 @@ fn inode_lock_file(
 }
 
 /// Takes (F_WRLCK) or drops (F_UNLCK) the lock byte of inode `inode`.
-fn inode_lock_byte(fd: i32, inode: u64, kind: i16) -> Result<(), crate::errno::Errno> {
+fn inode_lock_byte(fd: i32, inode: u64, kind: impl Into<i32>) -> Result<(), crate::errno::Errno> {
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
-    range.l_type = kind;
+    range.l_type = kind.into() as _;
     range.l_whence = libc::SEEK_SET as i16;
     range.l_start = i64::try_from(inode).map_err(|_| crate::errno::from_darwin(libc::EOVERFLOW))?;
     range.l_len = 1;
     loop {
+        // The host's open-file-description lock. Darwin's command is 91;
+        // Linux's F_OFD_SETLKW is 38, and 91 is EINVAL there.
+        #[cfg(target_os = "macos")]
+        let cmd = super::fs::DARWIN_F_OFD_SETLKW;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = libc::F_OFD_SETLKW;
         // SAFETY: fcntl with a flock on our stack.
-        if unsafe { libc::fcntl(fd, super::fs::DARWIN_F_OFD_SETLKW, &range) } == 0 {
+        if unsafe { libc::fcntl(fd, cmd, &range) } == 0 {
             return Ok(());
         }
         let error = crate::errno::last();
@@ -658,7 +664,7 @@ pub fn with_inode_lock<T>(
         }
         locked.push(key);
     }
-    struct Held<'a>((i32, u64), &'a aim_storage::private_fd::PrivateFile, bool);
+    struct Held<'a>((libc::dev_t, u64), &'a aim_storage::private_fd::PrivateFile, bool);
     impl Drop for Held<'_> {
         fn drop(&mut self) {
             HELD_INODE_LOCKS.with(|held| held.borrow_mut().retain(|key| *key != self.0));
@@ -698,7 +704,7 @@ struct Creations {
 const CREATION_SLOTS: usize = 2048;
 
 fn creations(stat: &libc::stat) -> Result<&'static Creations, crate::errno::Errno> {
-    static MAPPED: Mutex<Vec<(i32, usize)>> = Mutex::new(Vec::new());
+    static MAPPED: Mutex<Vec<(libc::dev_t, usize)>> = Mutex::new(Vec::new());
     let mut mapped = MAPPED.lock().unwrap();
     let base = match mapped.iter().find(|(device, _)| *device == stat.st_dev) {
         Some(&(_, base)) => base,

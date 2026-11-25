@@ -132,7 +132,7 @@ fn check_apex_scan<'r>(
 pub(super) fn random_uuid() -> [u8; 16] {
     let mut b = [0u8; 16];
     // SAFETY: fills the buffer it is given.
-    unsafe { libc::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
+    unsafe { crate::host_os::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
     b[6] = b[6] & 0x0f | 0x40;
     b[8] = b[8] & 0x3f | 0x80;
     b

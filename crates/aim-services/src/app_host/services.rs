@@ -1066,7 +1066,7 @@ impl AppHost {
             next_restart_time: None,
             crash_count: 0,
             create_real_time: super::clock_ms(libc::CLOCK_MONOTONIC_RAW),
-            last_activity: super::clock_ms(libc::CLOCK_UPTIME_RAW),
+            last_activity: super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
             fg: Foreground::default(),
         });
         token
@@ -2342,7 +2342,7 @@ impl AppHost {
         let across_users =
             self.check_permission(Some("android.permission.INTERACT_ACROSS_USERS_FULL"), uid)? == 0;
         let allowed = self.get_tasks_allowed(uid)?;
-        let (now, uptime) = (Instant::now(), super::clock_ms(libc::CLOCK_UPTIME_RAW));
+        let (now, uptime) = (Instant::now(), super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW));
         let state = self.services.state.lock().unwrap();
         let apps = self.apps.lock().unwrap();
         let services: Vec<Running> = state
@@ -2473,7 +2473,7 @@ impl AppHost {
             0
         };
         let deadline = if limited != 0 {
-            let uptime = super::clock_ms(libc::CLOCK_UPTIME_RAW);
+            let uptime = super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
             let mut p = Parcel::new();
             fgs_policy::StartTimeLimitedForegroundService {
                 uid,
@@ -2505,7 +2505,7 @@ impl AppHost {
             self.stop_limited_timeout(
                 uid,
                 r.fg.limited_type,
-                super::clock_ms(libc::CLOCK_UPTIME_RAW),
+                super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
             )?;
             None
         };
@@ -2543,7 +2543,7 @@ impl AppHost {
         if let Err(error) = self.stop_limited_timeout(
             r.info.info.application_info.uid,
             r.fg.limited_type,
-            super::clock_ms(libc::CLOCK_UPTIME_RAW),
+            super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
         ) {
             eprintln!(
                 "app host: stopping FGS accounting for {}/{}: {}",
@@ -2707,7 +2707,7 @@ impl AppHost {
                 }
                 let service_type = r.fg.limited_type;
                 let policy = r.fg.timeout_policy.as_ref().unwrap().clone();
-                let uptime = super::clock_ms(libc::CLOCK_UPTIME_RAW);
+                let uptime = super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
                 if event == Event::Limited {
                     let mut p = Parcel::new();
                     fgs_policy::TimeoutTimeLimitedForegroundService {

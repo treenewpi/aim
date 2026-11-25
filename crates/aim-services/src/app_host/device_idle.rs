@@ -786,7 +786,7 @@ impl AppHost {
     pub(super) fn temp_allowlist_now(&self) -> Result<i64, Exception> {
         let cpu = self.flag("com.android.server.deviceidle.use_cpu_time_for_temp_allowlist")?;
         Ok(super::clock_ms(if cpu {
-            libc::CLOCK_UPTIME_RAW
+            crate::host_os::CLOCK_UPTIME_RAW
         } else {
             libc::CLOCK_MONOTONIC_RAW
         }))

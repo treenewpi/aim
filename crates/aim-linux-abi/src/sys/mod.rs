@@ -554,6 +554,34 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
     }
 }
 
+/// `fcntl(F_GETPATH)`: a NUL-terminated host path in a `PATH_MAX` buffer.
+/// Linux reads the same path from `/proc/self/fd`.
+pub unsafe fn fgetpath(fd: i32, buf: *mut u8) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::fcntl(fd, libc::F_GETPATH, buf)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let linked = std::fs::read_link(format!("/proc/self/fd/{fd}"));
+        let Ok(path) = linked else {
+            unsafe { *aim_storage::host::__error() = libc::ENOENT };
+            return -1;
+        };
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+        let cap = libc::PATH_MAX as usize;
+        if bytes.len() + 1 > cap {
+            unsafe { *aim_storage::host::__error() = libc::ENAMETOOLONG };
+            return -1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            *buf.add(bytes.len()) = 0;
+        }
+        0
+    }
+}
+
 pub mod fuse_mount;
 
 pub mod fuse_client;

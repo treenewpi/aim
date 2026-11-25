@@ -59,12 +59,12 @@ pub(super) const MAX_QUEUED_EVENTS: usize = 16384;
 const O_NONBLOCK: u64 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
 
-const VNODE_NOTES: u32 = libc::NOTE_WRITE
-    | libc::NOTE_EXTEND
-    | libc::NOTE_ATTRIB
-    | libc::NOTE_DELETE
-    | libc::NOTE_RENAME
-    | libc::NOTE_REVOKE;
+const VNODE_NOTES: u32 = crate::hostlibc::NOTE_WRITE
+    | crate::hostlibc::NOTE_EXTEND
+    | crate::hostlibc::NOTE_ATTRIB
+    | crate::hostlibc::NOTE_DELETE
+    | crate::hostlibc::NOTE_RENAME
+    | crate::hostlibc::NOTE_REVOKE;
 
 /// (inode, size, mtime ns, is a directory) of a directory entry.
 type Snapshot = HashMap<Vec<u8>, (u64, i64, i64, bool)>;
@@ -229,16 +229,16 @@ fn register_note(kq: i32, fd: i32, udata: usize, mirror: Option<i32>) -> bool {
 }
 
 fn vnode_note(kq: i32, fd: i32, udata: usize) -> bool {
-    let k = libc::kevent {
+    let k = crate::hostlibc::kevent {
         ident: fd as usize,
-        filter: libc::EVFILT_VNODE,
-        flags: libc::EV_ADD | libc::EV_CLEAR,
+        filter: crate::hostlibc::EVFILT_VNODE,
+        flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR,
         fflags: VNODE_NOTES,
         data: 0,
         udata: udata as *mut _,
     };
     // SAFETY: one change, no events.
-    unsafe { libc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 }
+    unsafe { crate::hostlibc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 }
 }
 
 fn entry_udata(wd: i32, fd: i32) -> usize {
@@ -284,7 +284,7 @@ fn sync_entries(kq: i32, wd: i32, w: &mut Watch, mirror: Option<i32>) {
         let efd = unsafe {
             libc::open(
                 path.as_ptr(),
-                libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                aim_storage::host::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
         if efd < 0 {
@@ -301,20 +301,20 @@ fn sync_entries(kq: i32, wd: i32, w: &mut Watch, mirror: Option<i32>) {
 
 /// Keep the kqueue readable while decoded events wait in the queue.
 fn signal_pending(kq: i32, on: bool) -> bool {
-    let k = libc::kevent {
+    let k = crate::hostlibc::kevent {
         ident: 0,
-        filter: libc::EVFILT_USER,
+        filter: crate::hostlibc::EVFILT_USER,
         flags: if on {
-            libc::EV_ADD | libc::EV_ENABLE
+            crate::hostlibc::EV_ADD | crate::hostlibc::EV_ENABLE
         } else {
-            libc::EV_DELETE
+            crate::hostlibc::EV_DELETE
         },
-        fflags: if on { libc::NOTE_TRIGGER } else { 0 },
+        fflags: if on { crate::hostlibc::NOTE_TRIGGER } else { 0 },
         data: 0,
         udata: std::ptr::null_mut(),
     };
     // SAFETY: one change, no events.
-    unsafe { libc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 }
+    unsafe { crate::hostlibc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 }
 }
 
 pub fn inotify_init1(a: [u64; 6]) -> i64 {
@@ -323,7 +323,7 @@ pub fn inotify_init1(a: [u64; 6]) -> i64 {
         return -(EINVAL as i64);
     }
     // SAFETY: plain kqueue.
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return -(errno::last() as i64);
     }
@@ -397,7 +397,7 @@ pub fn inotify_add_watch(a: [u64; 6]) -> i64 {
         return *wd as i64;
     }
     // SAFETY: an event-only open of the watched path.
-    let wfd = unsafe { libc::open(r.host.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+    let wfd = unsafe { libc::open(r.host.as_ptr(), aim_storage::host::O_EVTONLY | libc::O_CLOEXEC) };
     if wfd < 0 {
         return -(errno::last() as i64);
     }
@@ -453,7 +453,7 @@ fn decode(fd: i32, s: &mut State, wd: i32, notes: u32) {
     let mut out = Vec::new();
     let dir_flag = if w.dir.is_some() { IN_ISDIR } else { 0 };
     if let Some(old) = &mut w.dir {
-        if notes & (libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB) != 0 {
+        if notes & (crate::hostlibc::NOTE_WRITE | crate::hostlibc::NOTE_EXTEND | crate::hostlibc::NOTE_ATTRIB) != 0 {
             let new = snapshot(&w.host);
             for (name, e) in &new {
                 let isdir = if e.3 { IN_ISDIR } else { 0 };
@@ -484,20 +484,20 @@ fn decode(fd: i32, s: &mut State, wd: i32, notes: u32) {
             }
             *old = new;
         }
-    } else if notes & (libc::NOTE_WRITE | libc::NOTE_EXTEND) != 0 {
+    } else if notes & (crate::hostlibc::NOTE_WRITE | crate::hostlibc::NOTE_EXTEND) != 0 {
         out.push((IN_MODIFY, Vec::new()));
         out.push((IN_CLOSE_WRITE, Vec::new()));
     }
     if w.dir.is_some() {
         sync_entries(fd, wd, w, mirror);
     }
-    if notes & libc::NOTE_ATTRIB != 0 {
+    if notes & crate::hostlibc::NOTE_ATTRIB != 0 {
         out.push((IN_ATTRIB | dir_flag, Vec::new()));
     }
-    if notes & libc::NOTE_RENAME != 0 {
+    if notes & crate::hostlibc::NOTE_RENAME != 0 {
         out.push((IN_MOVE_SELF | dir_flag, Vec::new()));
     }
-    let gone = notes & (libc::NOTE_DELETE | libc::NOTE_REVOKE) != 0;
+    let gone = notes & (crate::hostlibc::NOTE_DELETE | crate::hostlibc::NOTE_REVOKE) != 0;
     if gone {
         out.push((IN_DELETE_SELF | dir_flag, Vec::new()));
     }
@@ -519,7 +519,7 @@ fn decode(fd: i32, s: &mut State, wd: i32, notes: u32) {
 /// rescan does not report it again. Its removal and renames come from the
 /// directory's own knote.
 fn decode_entry(fd: i32, s: &mut State, wd: i32, efd: i32, notes: u32) {
-    if notes & (libc::NOTE_WRITE | libc::NOTE_EXTEND) == 0 {
+    if notes & (crate::hostlibc::NOTE_WRITE | crate::hostlibc::NOTE_EXTEND) == 0 {
         return;
     }
     let Some(w) = s.watches.get_mut(&wd) else {
@@ -568,7 +568,7 @@ fn collect(fd: i32, s: &mut State, mut block: bool) -> i64 {
 
 /// Up to 32 knote events into the queue: their count, or a negative errno.
 fn collect_some(fd: i32, s: &mut State, block: bool) -> i64 {
-    let mut evs = [libc::kevent {
+    let mut evs = [crate::hostlibc::kevent {
         ident: 0,
         filter: 0,
         flags: 0,
@@ -582,7 +582,7 @@ fn collect_some(fd: i32, s: &mut State, block: bool) -> i64 {
     };
     // SAFETY: output array we own.
     let n = unsafe {
-        libc::kevent(
+        crate::hostlibc::kevent(
             fd,
             std::ptr::null(),
             0,
@@ -596,7 +596,7 @@ fn collect_some(fd: i32, s: &mut State, block: bool) -> i64 {
     }
     for e in &evs[..n as usize] {
         let udata = e.udata as usize;
-        if e.filter == libc::EVFILT_VNODE && udata & ENTRY != 0 {
+        if e.filter == crate::hostlibc::EVFILT_VNODE && udata & ENTRY != 0 {
             decode_entry(
                 fd,
                 s,
@@ -604,7 +604,7 @@ fn collect_some(fd: i32, s: &mut State, block: bool) -> i64 {
                 udata as u32 as i32,
                 e.fflags,
             );
-        } else if e.filter == libc::EVFILT_VNODE {
+        } else if e.filter == crate::hostlibc::EVFILT_VNODE {
             decode(fd, s, udata as i32, e.fflags);
         }
     }
@@ -905,7 +905,7 @@ pub fn after_fork_child() -> Result<(), errno::Errno> {
         }
         // SAFETY: the parent's fd number, freed by Darwin in the child.
         unsafe {
-            let kq = libc::kqueue();
+            let kq = crate::hostlibc::kqueue();
             if kq < 0 {
                 return Err(errno::last());
             }

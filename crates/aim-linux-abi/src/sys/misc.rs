@@ -148,7 +148,7 @@ pub fn prctl(a: [u64; 6]) -> i64 {
             super::thread::set_name(b);
             if let Ok(c) = std::ffi::CString::new(&s[..len]) {
                 // SAFETY: naming the current thread.
-                unsafe { libc::pthread_setname_np(c.as_ptr()) };
+                unsafe { aim_storage::host::set_thread_name(c.as_ptr()) };
             }
             0
         }

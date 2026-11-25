@@ -893,7 +893,7 @@ mod tests {
         description
     }
 
-    fn identity(fd: BorrowedFd<'_>) -> (i32, u64) {
+    fn identity(fd: BorrowedFd<'_>) -> (libc::dev_t, u64) {
         use std::os::fd::AsRawFd;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) }, 0);

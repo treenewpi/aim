@@ -43,9 +43,9 @@ impl Identity {
         Ok(Self {
             dev: stat.st_dev as u32 as u64,
             ino: stat.st_ino,
-            generation: stat.st_gen,
-            birth_seconds: stat.st_birthtime,
-            birth_nanoseconds: stat.st_birthtime_nsec,
+            generation: crate::host::generation(&stat),
+            birth_seconds: crate::host::birth(&stat).0,
+            birth_nanoseconds: crate::host::birth(&stat).1,
         })
     }
     /// The lock byte of this identity in its device's lock files: the
@@ -201,9 +201,17 @@ fn lease_directory(given: &Path) -> io::Result<Arc<LeaseDirectory>> {
     directories.push(directory.clone());
     Ok(directory)
 }
-/// Darwin's open-file-description locks (sys/fcntl.h, private).
+/// Open-file-description locks. Darwin's commands are private (90 and 91,
+/// sys/fcntl.h). Linux's are F_OFD_SETLK and F_OFD_SETLKW (37 and 38);
+/// Darwin's numbers are EINVAL there.
+#[cfg(target_os = "macos")]
 const F_OFD_SETLK: i32 = 90;
+#[cfg(target_os = "macos")]
 const F_OFD_SETLKW: i32 = 91;
+#[cfg(not(target_os = "macos"))]
+const F_OFD_SETLK: i32 = libc::F_OFD_SETLK;
+#[cfg(not(target_os = "macos"))]
+const F_OFD_SETLKW: i32 = libc::F_OFD_SETLKW;
 
 /// `flock(fd, operation)` of the byte at `slot`: LOCK_SH, LOCK_EX or
 /// LOCK_UN, with LOCK_NB answering EBUSY where another open file holds it.
@@ -213,7 +221,7 @@ fn locked(fd: BorrowedFd<'_>, slot: i64, operation: i32) -> io::Result<()> {
         libc::LOCK_SH => libc::F_RDLCK,
         libc::LOCK_EX => libc::F_WRLCK,
         _ => libc::F_UNLCK,
-    };
+    } as _;
     range.l_whence = libc::SEEK_SET as i16;
     range.l_start = slot;
     range.l_len = 1;
@@ -310,13 +318,28 @@ impl Inode {
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        if unsafe { libc::lseek(fd.as_raw_fd(), self.slot(), libc::SEEK_SET) } < 0 {
+        if unsafe { libc::lseek(fd.as_raw_fd(), self.file_position(), libc::SEEK_SET) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(fd)
     }
     fn slot(&self) -> i64 {
         self.identity().slot()
+    }
+    /// The lock file's position for this inode. Darwin seeks to the 62-bit
+    /// slot. ext4 without huge_file rejects that lseek (EINVAL past
+    /// `(2^32-1) << 12`); the open-file-description lock still uses the
+    /// full slot, and the position keeps the slot's bits that fit.
+    fn file_position(&self) -> i64 {
+        let slot = self.slot();
+        #[cfg(target_os = "macos")]
+        {
+            slot
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            slot & 0x0000_00ff_ffff_f000
+        }
     }
     pub fn admission(&self) -> io::Result<Admission> {
         if Identity::from_fd(self.source())? != self.identity() {
@@ -375,7 +398,7 @@ impl Inode {
         let admission = self.admission()?;
         let expected = self.lock_file("writers")?;
         if Identity::from_fd(carrier.as_fd())? != Identity::from_fd(expected.as_fd())?
-            || unsafe { libc::lseek(carrier.as_raw_fd(), 0, libc::SEEK_CUR) } != self.slot()
+            || unsafe { libc::lseek(carrier.as_raw_fd(), 0, libc::SEEK_CUR) } != self.file_position()
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }

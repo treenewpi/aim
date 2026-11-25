@@ -46,7 +46,7 @@ pub struct Transform {
     pub ty: f64,
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreGraphics", kind = "framework"))]
 unsafe extern "C" {
     static kCGColorSpaceSRGB: Ref;
     fn CGColorSpaceCreateWithName(name: Ref) -> Ref;
@@ -126,7 +126,7 @@ unsafe extern "C" {
     );
 }
 
-#[link(name = "ImageIO", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "ImageIO", kind = "framework"))]
 unsafe extern "C" {
     fn CGImageSourceCreateWithData(data: Ref, options: Ref) -> Ref;
     fn CGImageSourceCreateImageAtIndex(s: Ref, i: usize, options: Ref) -> Ref;
@@ -135,7 +135,7 @@ unsafe extern "C" {
     fn CGImageDestinationFinalize(d: Ref) -> bool;
 }
 
-#[link(name = "CoreFoundation", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "CoreFoundation", kind = "framework"))]
 unsafe extern "C" {
     fn CFDataCreate(alloc: Ref, bytes: *const u8, len: isize) -> Ref;
     fn CFDataCreateMutable(alloc: Ref, capacity: isize) -> Ref;

@@ -161,14 +161,14 @@ fn account(u: &Usage, kind: Kind, private_map: bool, host_file: bool, referenced
 fn referenced(start: u64, end: u64) -> u64 {
     let mut vec = vec![0 as libc::c_char; ((end - start) / PAGE) as usize];
     // SAFETY: one byte per page of the range into `vec`.
-    let r = unsafe { libc::mincore(start as *const _, (end - start) as usize, vec.as_mut_ptr()) };
+    let r = unsafe { libc::mincore(start as *mut _, (end - start) as usize, vec.as_mut_ptr().cast()) };
     // A range unmapped since the walk has no pages.
     if r != 0 {
         return 0;
     }
-    let referenced = libc::MINCORE_REFERENCED | libc::MINCORE_REFERENCED_OTHER;
+    let referenced = aim_storage::host::MINCORE_REFERENCED | aim_storage::host::MINCORE_REFERENCED_OTHER;
     vec.iter()
-        .filter(|&&b| b as i32 & libc::MINCORE_INCORE != 0 && b as i32 & referenced != 0)
+        .filter(|&&b| b as i32 & aim_storage::host::MINCORE_INCORE != 0 && b as i32 & referenced != 0)
         .count() as u64
 }
 

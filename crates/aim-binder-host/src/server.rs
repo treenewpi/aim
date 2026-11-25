@@ -533,7 +533,7 @@ impl Server {
             threads: RwLock::new(HashMap::new()),
         });
         // SAFETY: plain kqueue.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { aim_storage::host::kqueue() };
         if kq < 0 {
             return Err("kqueue failed".into());
         }
@@ -729,16 +729,16 @@ impl Server {
         );
         self.files.lock().unwrap().insert(port, file);
         let _ = mach::move_member(port, self.set);
-        let ev = libc::kevent {
+        let ev = aim_storage::host::kevent {
             ident: socket as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD,
+            filter: aim_storage::host::EVFILT_READ,
+            flags: aim_storage::host::EV_ADD,
             fflags: 0,
             data: 0,
             udata: port as usize as *mut _,
         };
         // SAFETY: registering our socket with our kqueue.
-        unsafe { libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        unsafe { aim_storage::host::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         Ok((vec![(port, mach::MAKE_SEND)], Vec::new()))
     }
 
@@ -802,9 +802,9 @@ impl Server {
     fn release_loop(self: Arc<Self>) {
         loop {
             // SAFETY: an event buffer on our stack.
-            let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+            let mut ev: aim_storage::host::kevent = unsafe { std::mem::zeroed() };
             let n =
-                unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, std::ptr::null()) };
+                unsafe { aim_storage::host::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, std::ptr::null()) };
             if n != 1 {
                 continue;
             }
@@ -813,7 +813,7 @@ impl Server {
             // SAFETY: draining our end of the socket (the guest never
             // writes to it; this only notices EOF).
             let got = unsafe { libc::read(fd, sink.as_mut_ptr().cast(), sink.len()) };
-            if ev.flags & libc::EV_EOF == 0 && got != 0 {
+            if ev.flags & aim_storage::host::EV_EOF == 0 && got != 0 {
                 continue;
             }
             let port = ev.udata as usize as Port;
@@ -1877,7 +1877,7 @@ mod path_carrier_tests {
             11
         );
         let name = CString::new(std::env::temp_dir().as_os_str().as_encoded_bytes()).unwrap();
-        let fd = unsafe { libc::open(name.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+        let fd = unsafe { libc::open(name.as_ptr(), aim_storage::host::O_EVTONLY | libc::O_CLOEXEC) };
         assert!(fd >= 0);
         let backing = unsafe { OwnedFd::from_raw_fd(fd) };
         let port = mach::fd_to_port(backing.as_raw_fd()).unwrap();
@@ -2024,7 +2024,7 @@ mod close_flush_tests {
             service,
             set,
             files: Mutex::new(HashMap::new()),
-            kq: unsafe { libc::kqueue() },
+            kq: unsafe { aim_storage::host::kqueue() },
             shared: Mutex::new(Vec::new()),
             pool,
         });

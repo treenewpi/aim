@@ -136,7 +136,7 @@ fn target(
 
 fn options(t: &Target) -> libc::c_int {
     match t {
-        Target::Path(_, false) => libc::XATTR_NOFOLLOW,
+        Target::Path(_, false) => aim_storage::host::XATTR_NOFOLLOW,
         _ => 0,
     }
 }
@@ -150,7 +150,7 @@ fn host_get(t: &Target, name: &CStr, buf: *mut u8, size: usize) -> i64 {
     // SAFETY: host path or fd, guest buffer of `size` bytes.
     let n = unsafe {
         match t {
-            Target::Path(r, _) => libc::getxattr(
+            Target::Path(r, _) => aim_storage::host::getxattr(
                 r.host.as_ptr(),
                 name.as_ptr(),
                 buf.cast(),
@@ -158,7 +158,7 @@ fn host_get(t: &Target, name: &CStr, buf: *mut u8, size: usize) -> i64 {
                 0,
                 options(t),
             ),
-            Target::Fd(fd) => libc::fgetxattr(*fd, name.as_ptr(), buf.cast(), size, 0, 0),
+            Target::Fd(fd) => aim_storage::host::fgetxattr(*fd, name.as_ptr(), buf.cast(), size, 0, 0),
         }
     };
     if n < 0 {
@@ -269,7 +269,7 @@ fn set(t: Target, name: u64, value: u64, size: u64, flags: u64) -> i64 {
     // SAFETY: host path or fd, guest value of `size` bytes.
     let r = unsafe {
         match &t {
-            Target::Path(r, _) => libc::setxattr(
+            Target::Path(r, _) => aim_storage::host::setxattr(
                 r.host.as_ptr(),
                 hname.as_ptr(),
                 value as *const _,
@@ -277,7 +277,7 @@ fn set(t: Target, name: u64, value: u64, size: u64, flags: u64) -> i64 {
                 0,
                 opts,
             ),
-            Target::Fd(fd) => libc::fsetxattr(
+            Target::Fd(fd) => aim_storage::host::fsetxattr(
                 *fd,
                 hname.as_ptr(),
                 value as *const _,
@@ -306,8 +306,8 @@ fn list(t: Target, buf: u64, size: u64) -> i64 {
     // SAFETY: host path or fd; a size query, then a read into a local buffer.
     let query = |b: *mut libc::c_char, n: usize| unsafe {
         match &t {
-            Target::Path(r, _) => libc::listxattr(r.host.as_ptr(), b, n, options(&t)),
-            Target::Fd(fd) => libc::flistxattr(*fd, b, n, 0),
+            Target::Path(r, _) => aim_storage::host::listxattr(r.host.as_ptr(), b, n, options(&t)),
+            Target::Fd(fd) => aim_storage::host::flistxattr(*fd, b, n, 0),
         }
     };
     let mut host = Vec::new();
@@ -366,8 +366,8 @@ fn remove(t: Target, name: u64) -> i64 {
     // SAFETY: host path or fd.
     let r = unsafe {
         match &t {
-            Target::Path(r, _) => libc::removexattr(r.host.as_ptr(), hname.as_ptr(), options(&t)),
-            Target::Fd(fd) => libc::fremovexattr(*fd, hname.as_ptr(), 0),
+            Target::Path(r, _) => aim_storage::host::removexattr(r.host.as_ptr(), hname.as_ptr(), options(&t)),
+            Target::Fd(fd) => aim_storage::host::fremovexattr(*fd, hname.as_ptr(), 0),
         }
     };
     errno::check(r as i64)

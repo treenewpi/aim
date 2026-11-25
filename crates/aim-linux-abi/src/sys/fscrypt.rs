@@ -102,7 +102,7 @@ fn context(host: Host) -> Option<Vec<u8>> {
     attrs::get(host, CONTEXT, &mut b).map(|n| b[..n].to_vec())
 }
 
-fn host_type(host: Host) -> Result<u16, Errno> {
+fn host_type(host: Host) -> Result<libc::mode_t, Errno> {
     Ok(host_stat(host)?.st_mode & libc::S_IFMT)
 }
 
@@ -121,7 +121,7 @@ fn host_stat(host: Host) -> Result<libc::stat, Errno> {
 }
 
 /// Only regular files, directories and symlinks are encrypted.
-fn encryptable(kind: u16) -> bool {
+fn encryptable(kind: libc::mode_t) -> bool {
     matches!(kind, libc::S_IFREG | libc::S_IFDIR | libc::S_IFLNK)
 }
 
@@ -137,7 +137,7 @@ fn store(host: Host, context: &[u8]) -> Result<(), Errno> {
 fn renewed(context: &[u8]) -> Vec<u8> {
     let mut context = context.to_vec();
     let at = context.len() - NONCE;
-    unsafe { libc::arc4random_buf(context[at..].as_mut_ptr().cast(), NONCE) };
+    unsafe { aim_storage::host::arc4random_buf(context[at..].as_mut_ptr().cast(), NONCE) };
     context
 }
 
@@ -149,7 +149,7 @@ pub(super) fn encrypted(host: Host) -> Result<bool, Errno> {
 /// `fscrypt_prepare_new_inode`: `child`, just created in `parent` (on
 /// host device `device`), takes the parent's policy with a nonce of its
 /// own.
-pub(super) fn inherit(parent: Host, device: i32, child: Host) -> Result<(), Errno> {
+pub(super) fn inherit(parent: Host, device: libc::dev_t, child: Host) -> Result<(), Errno> {
     if !active()? || owner()?.is_none_or(|owner| owner.device() != device as u64) {
         return Ok(());
     }
@@ -287,7 +287,7 @@ fn entries(fd: i32, path: &CStr, all: bool) -> Result<Vec<CString>, Errno> {
 fn withdraw(fd: i32, names: &[CString]) -> Result<(), Errno> {
     attrs::remove(Host::Fd(fd), CONTEXT)?;
     let mut path = [0u8; libc::PATH_MAX as usize];
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, path.as_mut_ptr()) } < 0 {
         return Err(errno::last());
     }
     let dir = CStr::from_bytes_until_nul(&path).map_err(|_| errno::EINVAL)?;
@@ -546,7 +546,7 @@ fn plaintext(
 /// while the directory's ctime is (setting a policy changes it, in any
 /// process): a walk passes the same directories again and again while a key
 /// is absent, and reading an attribute costs 10 to 30 times a stat.
-static CONTEXTS: std::sync::Mutex<Option<HashMap<(i32, u64), ((i64, i64), Option<Vec<u8>>)>>> =
+static CONTEXTS: std::sync::Mutex<Option<HashMap<(libc::dev_t, u64), ((i64, i64), Option<Vec<u8>>)>>> =
     std::sync::Mutex::new(None);
 const CONTEXTS_MAX: usize = 1 << 14;
 

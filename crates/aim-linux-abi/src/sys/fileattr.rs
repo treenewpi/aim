@@ -22,14 +22,14 @@ const APPEND: u32 = 0x20;
 pub(super) const VERITY: u32 = 0x100000;
 const CAP_FOWNER: u64 = 1 << 3;
 const CAP_LINUX_IMMUTABLE: u64 = 1 << 9;
-const HOST_IMMUTABLE: u32 = libc::UF_IMMUTABLE | libc::SF_IMMUTABLE;
-const HOST_APPEND: u32 = libc::UF_APPEND | libc::SF_APPEND;
+const HOST_IMMUTABLE: u32 = aim_storage::host::UF_IMMUTABLE | aim_storage::host::SF_IMMUTABLE;
+const HOST_APPEND: u32 = aim_storage::host::UF_APPEND | aim_storage::host::SF_APPEND;
 
 /// Whether an inode is immutable or append-only, so that its mode, owner
 /// and extended attributes stay as they are (`may_setattr`,
 /// `xattr_permission`); Darwin refuses only some of those changes.
 pub(super) fn fixed(stat: &libc::stat) -> bool {
-    stat.st_flags & (HOST_IMMUTABLE | HOST_APPEND) != 0
+    aim_storage::host::file_flags(&stat) & (HOST_IMMUTABLE | HOST_APPEND) != 0
 }
 
 /// A filesystem's `fileattr_set` rules.
@@ -122,10 +122,10 @@ fn flags(fd: i32, stat: &libc::stat) -> Result<u32, Errno> {
     if super::fscrypt::encrypted(Host::Fd(fd))? {
         flags |= super::fscrypt::ENCRYPTED;
     }
-    if stat.st_flags & HOST_IMMUTABLE != 0 {
+    if aim_storage::host::file_flags(&stat) & HOST_IMMUTABLE != 0 {
         flags |= IMMUTABLE;
     }
-    if stat.st_flags & HOST_APPEND != 0 {
+    if aim_storage::host::file_flags(&stat) & HOST_APPEND != 0 {
         flags |= APPEND;
     }
     if super::regular_file::verity_stat(stat)? == Some(true) {
@@ -192,11 +192,11 @@ fn set(fd: i32, arg: u64, id: &Identity, rules: &Rules) -> i64 {
             return 0;
         }
         let host = if new & IMMUTABLE == 0 {
-            stat.st_flags & !HOST_IMMUTABLE
+            aim_storage::host::file_flags(&stat) & !HOST_IMMUTABLE
         } else {
-            stat.st_flags | libc::UF_IMMUTABLE
+            aim_storage::host::file_flags(&stat) | aim_storage::host::UF_IMMUTABLE
         };
-        if unsafe { libc::fchflags(fd, host) } < 0 {
+        if unsafe { aim_storage::host::fchflags(fd, host) } < 0 {
             return -(errno::last() as i64);
         }
         0
@@ -338,10 +338,10 @@ mod tests {
         assert_eq!(set_flags(fd, 0, &root), Some(0));
         assert_eq!(get_flags(fd), Ok(0));
         // A host append-only flag shows, and keeps mode, owner and xattrs.
-        assert_eq!(unsafe { libc::fchflags(fd, libc::UF_APPEND) }, 0);
+        assert_eq!(unsafe { aim_storage::host::fchflags(fd, aim_storage::host::UF_APPEND) }, 0);
         assert_eq!(get_flags(fd), Ok(APPEND));
         assert_unchangeable(&path, fd);
-        assert_eq!(unsafe { libc::fchflags(fd, 0) }, 0);
+        assert_eq!(unsafe { aim_storage::host::fchflags(fd, 0) }, 0);
         std::fs::write(&path, b"writable again").unwrap();
 
         std::fs::remove_dir_all(dir).unwrap();

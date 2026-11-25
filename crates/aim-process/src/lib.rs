@@ -64,6 +64,7 @@ fn checked(rc: libc::c_int) -> io::Result<()> {
 /// Re-execute with the full argv (including argv[0]) unchanged, disclaiming
 /// responsibility and retaining the PID, environment, descriptors and process group.
 /// Call only before initialization or threads, while the environment is unchanged.
+#[cfg(target_os = "macos")]
 pub fn exec(program: &OsStr, args: impl Iterator<Item = OsString>) -> io::Error {
     struct Attr(libc::posix_spawnattr_t);
     impl Drop for Attr {
@@ -117,12 +118,44 @@ pub fn exec(program: &OsStr, args: impl Iterator<Item = OsString>) -> io::Error 
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn exec(program: &OsStr, args: impl Iterator<Item = OsString>) -> io::Error {
+    let program = match CString::new(program.as_bytes()) {
+        Ok(program) => program,
+        Err(error) => return error.into(),
+    };
+    let args = match args
+        .map(|s| CString::new(s.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(error) => return error.into(),
+    };
+    let argv = args
+        .iter()
+        .map(|s| s.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+    unsafe extern "C" {
+        static environ: *mut *mut libc::c_char;
+    }
+    unsafe {
+        libc::execve(
+            program.as_ptr(),
+            argv.as_ptr().cast(),
+            environ.cast(),
+        )
+    };
+    io::Error::last_os_error()
+}
+
 /// Spawn `program` with `argv` (argv[0] included) and the environment
 /// `envp` ("NAME=value"), responsible for its own privacy requests, as
 /// `std::process::Command` would spawn it otherwise: the descriptors not
 /// closed on exec are inherited, `stdio` is dup'ed onto 0, 1 and 2 (None:
 /// inherited), the signal mask is empty and SIGPIPE is default. A child
 /// that disclaims needs no re-exec of its own to take responsibility.
+#[cfg(target_os = "macos")]
 pub fn spawn(
     program: &CStr,
     argv: &[CString],
@@ -187,6 +220,62 @@ pub fn spawn(
             envp.as_ptr(),
         ))?;
         Ok(pid)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn spawn(
+    program: &CStr,
+    argv: &[CString],
+    envp: &[CString],
+    stdio: [Option<RawFd>; 3],
+) -> io::Result<libc::pid_t> {
+    let pointers = |strings: &[CString]| {
+        strings
+            .iter()
+            .map(|s| s.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+    };
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        checked(libc::posix_spawnattr_init(&mut attr))?;
+        checked(libc::posix_spawn_file_actions_init(&mut actions))?;
+        let result = (|| {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            checked(libc::posix_spawnattr_setsigmask(&mut attr, &mask))?;
+            libc::sigaddset(&mut mask, libc::SIGPIPE);
+            checked(libc::posix_spawnattr_setsigdefault(&mut attr, &mask))?;
+            checked(libc::posix_spawnattr_setflags(
+                &mut attr,
+                (libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF) as _,
+            ))?;
+            for (target, fd) in stdio.iter().enumerate() {
+                if let Some(fd) = fd {
+                    checked(libc::posix_spawn_file_actions_adddup2(
+                        &mut actions,
+                        *fd,
+                        target as RawFd,
+                    ))?;
+                }
+            }
+            let (argv, envp) = (pointers(argv), pointers(envp));
+            let mut pid = 0;
+            checked(libc::posix_spawn(
+                &mut pid,
+                program.as_ptr(),
+                &actions,
+                &attr,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            ))?;
+            Ok(pid)
+        })();
+        libc::posix_spawnattr_destroy(&mut attr);
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        result
     }
 }
 

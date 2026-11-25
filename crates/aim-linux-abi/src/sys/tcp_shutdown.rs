@@ -89,22 +89,22 @@ pub(super) fn polled_hangup(fd: RawFd) -> Option<Shutdown> {
 pub(super) fn writable(fd: RawFd) -> bool {
     // SAFETY: a kqueue of our own, closed here; one change, one event.
     unsafe {
-        let kq = libc::kqueue();
+        let kq = crate::hostlibc::kqueue();
         if kq < 0 {
             return false;
         }
-        let mut change: libc::kevent = std::mem::zeroed();
+        let mut change: crate::hostlibc::kevent = std::mem::zeroed();
         change.ident = fd as usize;
-        change.filter = libc::EVFILT_WRITE;
-        change.flags = libc::EV_ADD;
-        let mut event: libc::kevent = std::mem::zeroed();
+        change.filter = crate::hostlibc::EVFILT_WRITE;
+        change.flags = crate::hostlibc::EV_ADD;
+        let mut event: crate::hostlibc::kevent = std::mem::zeroed();
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let n = libc::kevent(kq, &change, 1, &mut event, 1, &zero);
+        let n = crate::hostlibc::kevent(kq, &change, 1, &mut event, 1, &zero);
         libc::close(kq);
-        n == 1 && event.flags & libc::EV_ERROR == 0 && event.flags & libc::EV_EOF == 0
+        n == 1 && event.flags & crate::hostlibc::EV_ERROR == 0 && event.flags & crate::hostlibc::EV_EOF == 0
     }
 }
 

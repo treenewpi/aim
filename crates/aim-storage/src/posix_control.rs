@@ -167,6 +167,7 @@ impl Frame {
         })
     }
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     static mach_task_self_: u32;
     static bootstrap_port: u32;
@@ -194,6 +195,64 @@ unsafe extern "C" {
         buffer: *mut libc::c_void,
         size: i32,
     ) -> i32;
+}
+#[cfg(not(target_os = "macos"))]
+static mach_task_self_: u32 = 0;
+#[cfg(not(target_os = "macos"))]
+static bootstrap_port: u32 = 0;
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_allocate(_task: u32, _right: u32, _name: *mut u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_insert_right(_task: u32, _name: u32, _right: u32, _kind: u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_mod_refs(_task: u32, _name: u32, _right: u32, _delta: i32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_port_deallocate(_task: u32, _name: u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_msg(
+    _msg: *mut u8,
+    _options: i32,
+    _send: u32,
+    _receive: u32,
+    _name: u32,
+    _timeout: u32,
+    _notify: u32,
+) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn bootstrap_register(_bp: u32, _name: *const i8, _port: u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn bootstrap_look_up(_bp: u32, _name: *const i8, _port: *mut u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn fileport_makeport(_fd: i32, _port: *mut u32) -> i32 {
+    libc::ENOTSUP
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn fileport_makefd(_port: u32) -> i32 {
+    -1
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn proc_pidfileportinfo(
+    _pid: i32,
+    _port: u32,
+    _flavor: i32,
+    _buffer: *mut libc::c_void,
+    _size: i32,
+) -> i32 {
+    -1
 }
 pub(crate) fn task() -> u32 {
     unsafe { mach_task_self_ }
@@ -358,7 +417,7 @@ fn send(
 // proc_uniqidentifierinfo(56), p_uniqueid at16 and p_idversion at32.
 fn process_generation(pid: i32) -> io::Result<(u64, u32)> {
     let mut bytes = [0u8; 56];
-    let size = unsafe { libc::proc_pidinfo(pid, 17, 0, bytes.as_mut_ptr().cast(), 56) };
+    let size = unsafe { crate::host::proc_pidinfo(pid, 17, 0, bytes.as_mut_ptr().cast(), 56) };
     if size <= 0 {
         return Err(io::Error::last_os_error());
     }

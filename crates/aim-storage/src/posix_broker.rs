@@ -567,7 +567,7 @@ struct Exits {
 impl Exits {
     fn new() -> io::Result<Self> {
         let queue = crate::private_fd::PrivateFd::allocate(|| {
-            let fd = unsafe { libc::kqueue() };
+            let fd = unsafe { crate::host::kqueue() };
             if fd < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -582,16 +582,16 @@ impl Exits {
     /// An owner that exited, or was replaced, before its watch began is left to
     /// the next scan.
     fn watch(&self, process: ProcessIdentity) {
-        let event = libc::kevent {
+        let event = crate::host::kevent {
             ident: process.host_pid as usize,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
+            filter: crate::host::EVFILT_PROC,
+            flags: crate::host::EV_ADD | crate::host::EV_ONESHOT,
+            fflags: crate::host::NOTE_EXIT,
             data: 0,
             udata: std::ptr::null_mut(),
         };
         if unsafe {
-            libc::kevent(
+            crate::host::kevent(
                 self.queue.as_raw_fd(),
                 &event,
                 1,
@@ -608,14 +608,14 @@ impl Exits {
     /// Whether an owner may have exited since the last call.
     fn any(&self) -> bool {
         let mut exited = self.unwatched.swap(false, Ordering::AcqRel);
-        let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+        let mut events: [crate::host::kevent; 64] = unsafe { std::mem::zeroed() };
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         loop {
             let count = unsafe {
-                libc::kevent(
+                crate::host::kevent(
                     self.queue.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -709,14 +709,14 @@ impl State {
             self.exits.watch(actor);
             return Ok(holder);
         }
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let mut info: crate::host::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as i32;
         if unsafe {
-            libc::proc_pidinfo(
+            crate::host::proc_pidinfo(
                 actor.host_pid,
-                libc::PROC_PIDTBSDINFO,
+                crate::host::PROC_PIDTBSDINFO,
                 1,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                (&mut info as *mut crate::host::proc_bsdinfo).cast(),
                 size,
             )
         } != size

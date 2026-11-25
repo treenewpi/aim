@@ -1,10 +1,16 @@
 //! Read-only ext4 for an APEX payload image.
 //!
-//! The pinned Android 16 layer's payload images are ext4, 4096-byte blocks,
-//! incompat `FILETYPE|EXTENTS`, with extent trees of depth 0 or 1. A mount
-//! copies each inode's bytes out through [`ReadAt`] (the loop device, or a
-//! dm-verity wrapper over it). Shared blocks are read as stored. A feature
-//! that changes the block map fails the mount.
+//! The pinned Android 16 layer's 35 payload images are ext4, 4096-byte
+//! blocks. Every one has the same feature words: compat `0x28`
+//! (`EXT_ATTR|DIR_INDEX`, so a directory may be an htree), incompat `0x42`
+//! (`FILETYPE|EXTENTS`), ro_compat `0x407b`
+//! (`SPARSE_SUPER|LARGE_FILE|HUGE_FILE|GDT_CSUM|DIR_NLINK|EXTRA_ISIZE|SHARED_BLOCKS`).
+//! `FLEX_BG`, `METADATA_CSUM` and `INLINE_DATA` are unset. Extent trees are
+//! depth 0 or 1. A mount copies each inode's bytes out through [`ReadAt`]
+//! (the loop device, or a dm-verity wrapper over it). Shared blocks are
+//! read as stored. An incompat bit outside `FILETYPE|EXTENTS` fails the
+//! mount with `EINVAL`, as Linux does for a feature the filesystem does
+//! not implement. `BIGALLOC` fails with `EOPNOTSUPP`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -571,6 +577,22 @@ mod tests {
         match Image::open(img) {
             Err(err) => assert_eq!(err, EINVAL),
             Ok(_) => panic!("a superblock without the ext4 magic opened"),
+        }
+    }
+
+    #[test]
+    fn rejects_an_incompat_bit_outside_the_supported_set() {
+        // Linux returns EINVAL from ext4_fill_super when an incompat bit
+        // is outside the features this filesystem implements. FLEX_BG is
+        // that kind of bit here, and it is unset on every pinned payload.
+        let mut img = image(MANIFEST, false);
+        let at = 1024 + 0x60;
+        let incompat = u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
+        assert_eq!(incompat, INCOMPAT_OK);
+        img[at..at + 4].copy_from_slice(&(incompat | 0x200).to_le_bytes());
+        match Image::open(img) {
+            Err(err) => assert_eq!(err, EINVAL),
+            Ok(_) => panic!("flex_bg opened"),
         }
     }
 }

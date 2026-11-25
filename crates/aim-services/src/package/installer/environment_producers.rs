@@ -13,7 +13,7 @@ use std::{
 fn uuid() -> [u8; 16] {
     let mut value = [0u8; 16];
     unsafe {
-        libc::arc4random_buf(value.as_mut_ptr().cast(), value.len());
+        crate::host_os::arc4random_buf(value.as_mut_ptr().cast(), value.len());
     }
     value[6] = (value[6] & 15) | 0x40;
     value[8] = (value[8] & 63) | 0x80;

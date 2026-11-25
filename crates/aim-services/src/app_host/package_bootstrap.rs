@@ -483,15 +483,24 @@ fn allocate_installer_bytes(
             0
         };
         host.allocate_bytes(None, need, flags, SYSTEM_UID)?;
-        let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATEALL,
-            fst_posmode: libc::F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: need,
-            fst_bytesalloc: 0,
-        };
-        // SAFETY: F_PREALLOCATE with a local fstore.
-        if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) } < 0 {
+        // Darwin reserves with F_PREALLOCATE. Linux fallocate reserves the
+        // same range from the file's physical end.
+        #[cfg(target_os = "macos")]
+        {
+            let mut store = libc::fstore_t {
+                fst_flags: libc::F_ALLOCATEALL,
+                fst_posmode: libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: need,
+                fst_bytesalloc: 0,
+            };
+            // SAFETY: F_PREALLOCATE with a local fstore.
+            if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) } < 0 {
+                return Err(failed());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if unsafe { libc::fallocate(fd, 0, st.st_blocks * 512, need) } < 0 {
             return Err(failed());
         }
     }

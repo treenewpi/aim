@@ -28,7 +28,7 @@ pub struct Open {
 static EPOCH: LazyLock<RwLock<[u8; 16]>> = LazyLock::new(|| RwLock::new(new_epoch()));
 fn new_epoch() -> [u8; 16] {
     let mut bytes = [0; 16];
-    unsafe { libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
+    unsafe { aim_storage::host::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
     bytes
 }
 pub(super) fn epoch() -> [u8; 16] {
@@ -43,14 +43,14 @@ pub(super) fn exec_reset() -> std::sync::RwLockWriteGuard<'static, [u8; 16]> {
 }
 
 fn set(fd: i32, name: &std::ffi::CStr, bytes: &[u8]) -> Result<(), Errno> {
-    if unsafe { libc::fsetxattr(fd, name.as_ptr(), bytes.as_ptr().cast(), bytes.len(), 0, 0) } < 0 {
+    if unsafe { aim_storage::host::fsetxattr(fd, name.as_ptr(), bytes.as_ptr().cast(), bytes.len(), 0, 0) } < 0 {
         return Err(errno::last());
     }
     Ok(())
 }
 fn get<const N: usize>(fd: i32, name: &std::ffi::CStr) -> Result<[u8; N], Errno> {
     let mut bytes = [0; N];
-    let n = unsafe { libc::fgetxattr(fd, name.as_ptr(), bytes.as_mut_ptr().cast(), N, 0, 0) };
+    let n = unsafe { aim_storage::host::fgetxattr(fd, name.as_ptr(), bytes.as_mut_ptr().cast(), N, 0, 0) };
     if n < 0 {
         Err(errno::last())
     } else if n as usize != N {
@@ -166,7 +166,7 @@ impl PositionLock {
     fn new(fd: i32) -> Result<Self, Errno> {
         let guard = fdtab::lifecycle();
         let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = libc::F_WRLCK;
+        lock.l_type = libc::F_WRLCK as _;
         lock.l_whence = libc::SEEK_SET as i16;
         loop {
             if unsafe { libc::fcntl(fd, libc::F_SETLKW, &lock) } == 0 {
@@ -185,7 +185,7 @@ impl PositionLock {
 impl Drop for PositionLock {
     fn drop(&mut self) {
         let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = libc::F_UNLCK;
+        lock.l_type = libc::F_UNLCK as _;
         lock.l_whence = libc::SEEK_SET as i16;
         // The descriptor is pinned and its lifecycle is locked.
         unsafe { libc::fcntl(self.fd, libc::F_SETLK, &lock) };

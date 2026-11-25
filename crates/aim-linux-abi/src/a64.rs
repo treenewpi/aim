@@ -62,7 +62,7 @@ pub fn host_ctr_el0() -> u32 {
     let mut size = std::mem::size_of::<u64>();
     // SAFETY: sysctl reading a u64 into a local.
     let ok = unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c"hw.cachelinesize".as_ptr(),
             (&mut line as *mut u64).cast(),
             &mut size,
@@ -267,6 +267,7 @@ pub fn stub_for(kind: Kind, rt: u32, ctr_el0: u32, stub: u64, site: u64) -> Opti
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     std::arch::global_asm!(
         ".globl _a64_reference",
         ".p2align 2",
@@ -293,9 +294,12 @@ mod tests {
         "movk x4, #0x8444, lsl #16",
         "ldr x16, [x16, #6128]",
     );
+    #[cfg(target_os = "macos")]
     unsafe extern "C" {
         static a64_reference: [u32; 21];
     }
+    #[cfg(not(target_os = "macos"))]
+    static a64_reference: [u32; 21] = [0; 21];
 
     #[test]
     fn encoders_match_assembler() {

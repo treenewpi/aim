@@ -226,6 +226,7 @@ fn set_timeout(fd: i32, t: Duration) {
 /// other end and the lifeline's read end. It stays this process's child
 /// (a guest never waits for it: the HAL does not fork) and outlives it
 /// only for its teardown.
+#[cfg(target_os = "macos")]
 fn spawn() -> Option<Conn> {
     let exe = CString::new(std::env::current_exe().ok()?.as_os_str().as_bytes()).ok()?;
     let mut pair = [0; 2];
@@ -333,6 +334,11 @@ fn spawn() -> Option<Conn> {
             generation: 0,
         })
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn() -> Option<Conn> {
+    None
 }
 
 /// The module's tests serve requests from a thread of their own process.

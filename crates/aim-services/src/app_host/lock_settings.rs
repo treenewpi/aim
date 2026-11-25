@@ -330,7 +330,7 @@ fn init_recovery_service(
     }
     // `getRandomEndpointCert`.
     // SAFETY: arc4random_uniform has no preconditions.
-    let index = unsafe { libc::arc4random_uniform(cert_xml.endpoints.len() as u32) } as usize;
+    let index = unsafe { crate::host_os::arc4random_uniform(cert_xml.endpoints.len() as u32) } as usize;
     let cert_path = cert_xml
         .endpoint_path(index, root, date)
         .map_err(certificate_error)?;
@@ -342,7 +342,7 @@ fn init_recovery_service(
     }
     let mut counter_id = 0i64;
     // SAFETY: the buffer is the value's own bytes (`SecureRandom.nextLong`).
-    unsafe { libc::arc4random_buf((&raw mut counter_id).cast(), size_of::<i64>()) };
+    unsafe { crate::host_os::arc4random_buf((&raw mut counter_id).cast(), size_of::<i64>()) };
     set_agent_value(
         db,
         ROOT_OF_TRUST,
@@ -817,14 +817,14 @@ impl LockSettings {
         let protector = loop {
             let mut id = 0i64;
             // SAFETY: arc4random_buf fills the eight bytes of a local.
-            unsafe { libc::arc4random_buf((&raw mut id).cast(), size_of::<i64>()) };
+            unsafe { crate::host_os::arc4random_buf((&raw mut id).cast(), size_of::<i64>()) };
             if id != NULL_PROTECTOR_ID {
                 break id;
             }
         };
         let mut secret = Zeroizing::new(vec![0; CE_SECRET_LEN]);
         // SAFETY: arc4random_buf fills the vector's bytes.
-        unsafe { libc::arc4random_buf(secret.as_mut_ptr().cast(), secret.len()) };
+        unsafe { crate::host_os::arc4random_buf(secret.as_mut_ptr().cast(), secret.len()) };
         self.host
             .ce_secrets()
             .create(&ce_secret_account(user, protector), &secret)?;

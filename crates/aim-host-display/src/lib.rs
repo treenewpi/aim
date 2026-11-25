@@ -141,7 +141,9 @@ fn open<T: Copy + Default>(hello: &Request) -> Result<(NativeStream, T), i64> {
     };
     // A write after the server has gone must fail, not raise SIGPIPE.
     let on: libc::c_int = 1;
-    // SAFETY: setsockopt on our socket with a local int.
+    // SAFETY: setsockopt on our socket with a local int. Linux has no
+    // SO_NOSIGPIPE; ignoring SIGPIPE is that option for this process.
+    #[cfg(target_os = "macos")]
     unsafe {
         libc::setsockopt(
             stream.fd.as_raw_fd(),
@@ -151,6 +153,11 @@ fn open<T: Copy + Default>(hello: &Request) -> Result<(NativeStream, T), i64> {
             size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = on;
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    }
     // The server answers at once; a hung one must not hang the guest.
     let timeout = libc::timeval {
         tv_sec: 5,

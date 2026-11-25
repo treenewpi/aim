@@ -75,7 +75,7 @@ pub(super) fn pair(flags: u64) -> Result<(i32, i32), i64> {
         libc::setsockopt(
             peer,
             libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
+            aim_storage::host::SO_NOSIGPIPE,
             (&one as *const i32).cast(),
             4,
         )
@@ -138,10 +138,10 @@ impl Drop for Locked<'_> {
 }
 
 /// Takes (F_WRLCK) or drops (F_UNLCK) this process's lock on all of `fd`.
-fn record_lock(fd: i32, kind: i16) -> Result<(), crate::errno::Errno> {
+fn record_lock(fd: i32, kind: impl Into<i32>) -> Result<(), crate::errno::Errno> {
     // SAFETY: a zeroed flock is a valid whole-file range.
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
-    range.l_type = kind;
+    range.l_type = kind.into() as _;
     range.l_whence = libc::SEEK_SET as i16;
     loop {
         // SAFETY: fcntl with a flock on our stack.
@@ -203,7 +203,7 @@ impl EventFd {
             self.shared.store(file, Ordering::Relaxed);
         }
         // SAFETY: plain kqueue creation.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { crate::hostlibc::kqueue() };
         if kq < 0 {
             return Err(errno::last());
         }
@@ -211,13 +211,13 @@ impl EventFd {
         let kq = ReadWatch(fdtab::hide(kq));
         fdtab::set_flags(kq.0, false, true);
         // SAFETY: a zeroed kevent is valid; one change, no events out.
-        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut change: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
         change.ident = file as usize;
-        change.filter = libc::EVFILT_VNODE;
-        change.flags = libc::EV_ADD | libc::EV_CLEAR;
-        change.fflags = libc::NOTE_WRITE;
+        change.filter = crate::hostlibc::EVFILT_VNODE;
+        change.flags = crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR;
+        change.fflags = crate::hostlibc::NOTE_WRITE;
         let r =
-            unsafe { libc::kevent(kq.0, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            unsafe { crate::hostlibc::kevent(kq.0, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if r < 0 {
             return Err(errno::last());
         }
@@ -307,9 +307,9 @@ impl EventFd {
                 }
             };
             // SAFETY: a zeroed kevent receives the one event.
-            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let mut event: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
             let r = unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     reads.0,
                     std::ptr::null(),
                     0,

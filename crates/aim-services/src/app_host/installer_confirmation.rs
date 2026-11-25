@@ -124,7 +124,7 @@ impl Service for InstallerConfirmation {
             }
             bridge::GET_UPTIME_MILLIS => {
                 bridge::GetUptimeMillis::read(&mut call.data).map_err(|_| BAD_VALUE)?;
-                bridge::write_get_uptime_millis_reply(&mut p, clock_ms(libc::CLOCK_UPTIME_RAW));
+                bridge::write_get_uptime_millis_reply(&mut p, clock_ms(crate::host_os::CLOCK_UPTIME_RAW));
                 Ok(())
             }
             _ => return Err(UNKNOWN_TRANSACTION),

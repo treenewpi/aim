@@ -68,9 +68,20 @@ pub const DIRECT_KEY: u8 = 0x04;
 pub const IV_INO_LBLK_64: u8 = 0x08;
 pub const IV_INO_LBLK_32: u8 = 0x10;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     /// `fsgetpath(2)`: the path of an inode of a mounted volume.
     fn fsgetpath(buf: *mut libc::c_char, size: usize, fsid: *mut libc::fsid_t, id: u64) -> isize;
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn fsgetpath(
+    _buf: *mut libc::c_char,
+    _size: usize,
+    _fsid: *mut libc::fsid_t,
+    _id: u64,
+) -> isize {
+    unsafe { *libc::__errno_location() = libc::ENOENT };
+    -1
 }
 
 /// `struct fscrypt_key_specifier`: a v1 key by its descriptor, a v2 key by
@@ -232,13 +243,13 @@ pub fn context(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut context = [0u8; 40];
     let n = unsafe {
-        libc::getxattr(
+        crate::host::getxattr(
             path.as_ptr(),
             CONTEXT.as_ptr(),
             context.as_mut_ptr().cast(),
             context.len(),
             0,
-            libc::XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         )
     };
     if n < 0 {
@@ -257,17 +268,17 @@ pub fn context(path: &Path) -> io::Result<Option<Vec<u8>>> {
 fn store(path: &Path, context: &[u8]) -> io::Result<()> {
     let mut context = context.to_vec();
     let at = context.len() - NONCE;
-    unsafe { libc::arc4random_buf(context[at..].as_mut_ptr().cast(), NONCE) };
+    unsafe { crate::host::arc4random_buf(context[at..].as_mut_ptr().cast(), NONCE) };
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let set = || {
         let set = unsafe {
-            libc::setxattr(
+            crate::host::setxattr(
                 name.as_ptr(),
                 CONTEXT.as_ptr(),
                 context.as_ptr().cast(),
                 context.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                crate::host::XATTR_NOFOLLOW,
             )
         };
         if set < 0 {
@@ -294,7 +305,7 @@ fn store(path: &Path, context: &[u8]) -> io::Result<()> {
 
 fn withdraw(path: &Path) -> io::Result<()> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    if unsafe { libc::removexattr(path.as_ptr(), CONTEXT.as_ptr(), libc::XATTR_NOFOLLOW) } < 0 {
+    if unsafe { crate::host::removexattr(path.as_ptr(), CONTEXT.as_ptr(), crate::host::XATTR_NOFOLLOW) } < 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ENOATTR) {
             return Err(error);
@@ -441,7 +452,7 @@ impl Owner {
             // either no secret or all of it.
             let next = dir.join(SECRET_NEXT);
             let mut bytes = [0u8; 32];
-            unsafe { libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
+            unsafe { crate::host::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
             let mut file = open(&next, true)?;
             if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } < 0 {
                 return Err(io::Error::last_os_error());
@@ -915,13 +926,13 @@ fn live(root: &Root, mut fsid: libc::fsid_t) -> io::Result<bool> {
     }
     let mut context = [0u8; 40];
     let n = unsafe {
-        libc::getxattr(
+        crate::host::getxattr(
             path.as_ptr(),
             CONTEXT.as_ptr(),
             context.as_mut_ptr().cast(),
             context.len(),
             0,
-            libc::XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         )
     };
     if n < 0 {
@@ -1066,7 +1077,7 @@ mod tests {
         let context = [&[1u8, 1, 4, 0][..], &[1; 8], &[0; 16]].concat();
         let path = std::ffi::CString::new(root.as_os_str().as_bytes()).unwrap();
         let set = unsafe {
-            libc::setxattr(
+            crate::host::setxattr(
                 path.as_ptr(),
                 CONTEXT.as_ptr(),
                 context.as_ptr().cast(),

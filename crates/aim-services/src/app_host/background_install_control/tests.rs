@@ -370,7 +370,7 @@ fn handler_classifies_privileged_installer_windows_adb_and_missing_history_then_
         assert!(owner.is_installer(host, "q", 0).unwrap());
         assert!(!owner.is_installer(host, "p", 0).unwrap());
         let boot_wall = super::super::usage_stats::now_millis()
-            - super::super::clock_ms(libc::CLOCK_UPTIME_RAW);
+            - super::super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
         let mut resumed = event(ACTIVITY_RESUMED, 1, boot_wall - 1000);
         resumed.package = "q".into();
         owner.usage(0, resumed.clone()).unwrap();

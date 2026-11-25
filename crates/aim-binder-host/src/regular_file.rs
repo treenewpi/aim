@@ -24,9 +24,10 @@ pub fn identity(fd: BorrowedFd<'_>) -> io::Result<[u8; 36]> {
     let mut bytes = [0; 36];
     bytes[..8].copy_from_slice(&(stat.st_dev as u32 as u64).to_le_bytes());
     bytes[8..16].copy_from_slice(&stat.st_ino.to_le_bytes());
-    bytes[16..20].copy_from_slice(&stat.st_gen.to_le_bytes());
-    bytes[20..28].copy_from_slice(&stat.st_birthtime.to_le_bytes());
-    bytes[28..36].copy_from_slice(&stat.st_birthtime_nsec.to_le_bytes());
+    bytes[16..20].copy_from_slice(&aim_storage::host::generation(&stat).to_le_bytes());
+    let (birth, birth_nsec) = aim_storage::host::birth(&stat);
+    bytes[20..28].copy_from_slice(&birth.to_le_bytes());
+    bytes[28..36].copy_from_slice(&birth_nsec.to_le_bytes());
     Ok(bytes)
 }
 
@@ -47,7 +48,7 @@ pub fn validate(
     }
     let mode = metadata.flags & 3;
     let physical = if mode == 3 { libc::O_RDWR } else { mode as i32 };
-    if flags & libc::O_EVTONLY != 0
+    if flags & aim_storage::host::O_EVTONLY != 0
         || metadata.flags & crate::path_file::O_PATH as u64 != 0
         || flags & libc::O_ACCMODE != physical
         || matches!(mode, 1 | 2) != metadata.writer

@@ -403,7 +403,7 @@ mod install_user_tests {
 fn token() -> String {
     let mut bytes = [0u8; 16];
     unsafe {
-        libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len());
+        crate::host_os::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len());
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

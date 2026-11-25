@@ -36,6 +36,7 @@ const PAGE: u64 = crate::loader::PAGE;
 /// Where the code starts in the image; the metadata comes before it.
 const TEXT_OFF: usize = 0x1000;
 
+#[cfg(target_os = "macos")]
 std::arch::global_asm!(
     // x9 = the commpage.
     ".macro COMMPAGE",
@@ -235,6 +236,7 @@ std::arch::global_asm!(
     tick_hi = const crate::sys::clock::TICK_NS >> 16,
 );
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn aim_vdso_start();
     fn aim_vdso_clock_gettime();
@@ -243,6 +245,18 @@ unsafe extern "C" {
     fn aim_vdso_rt_sigreturn();
     fn aim_vdso_end();
 }
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_start() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_clock_gettime() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_gettimeofday() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_clock_getres() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_rt_sigreturn() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn aim_vdso_end() {}
 
 /// `[vvar]`: the host tick's length (`aim_hostcall::clock::timebase`).
 #[repr(C)]

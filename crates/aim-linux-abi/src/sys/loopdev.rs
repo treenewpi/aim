@@ -8,15 +8,25 @@
 //! ([`super::dmverity`]); a mismatch is `EIO`.
 //!
 //! Eight loop devices start unbound, as `CONFIG_BLK_DEV_LOOP_MIN_COUNT`
-//! does, so `LOOP_CTL_ADD` of those ids is `EEXIST`.
+//! does, so `LOOP_CTL_ADD` of those ids is `EEXIST`. apexd counts a
+//! success only when the call returns greater than zero
+//! (`PreAllocateLoopDevices`), so id 0 must already exist: a new id 0
+//! would return 0 and abort bootstrap. `EEXIST` with no
+//! `/sys/block/loopN/loop` directory is the idle device it keeps.
+//!
+//! An open records the device's major and minor. ioctl, read and fstat
+//! follow that pair. `/dev/loop-control` is 10:237, `/dev/device-mapper`
+//! is 10:236, `/dev/loopN` is 7:N and `/dev/block/dm-N` is 253:N. A pin
+//! duplicates the host fd; the duplicate carries the same device
+//! numbers, and device-mapper commands are not accepted on loop-control.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::errno::{self, EBADF, EBUSY, EEXIST, EIO, EINVAL, ENODEV, ENOTTY, ENXIO, EROFS, Errno};
 use crate::vfs::{self, Area};
@@ -52,6 +62,7 @@ const LO_FLAGS_PARTSCAN: u32 = 8;
 const LO_FLAGS_DIRECT_IO: u32 = 16;
 const LO_FLAGS_OK: u32 = LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR | LO_FLAGS_PARTSCAN | LO_FLAGS_DIRECT_IO;
 
+const DM_VERSION: u8 = 0;
 const DM_DEV_CREATE: u8 = 3;
 const DM_DEV_REMOVE: u8 = 4;
 const DM_DEV_SUSPEND: u8 = 6;
@@ -112,7 +123,13 @@ enum Kind {
 #[derive(Clone, Copy)]
 struct Open {
     kind: Kind,
-    pos: u64,
+}
+
+/// The device numbers resolved when this fd was opened, and its offset.
+pub struct OpenDev {
+    pub major: u32,
+    pub minor: u32,
+    pub pos: Mutex<u64>,
 }
 
 struct State {
@@ -194,9 +211,58 @@ pub fn open(guest: &str, flags: u64) -> Option<i64> {
         return Some(-(errno::last() as i64));
     }
     super::fdtab::set_flags(fd, flags & 0o4000 != 0, flags & O_CLOEXEC != 0);
+    let (major, minor) = numbers(resolved);
     hold(&mut state, resolved);
-    state.opens.insert(fd, Open { kind: resolved, pos: 0 });
+    state.opens.insert(fd, Open { kind: resolved });
+    drop(state);
+    super::fdtab::insert(
+        fd,
+        super::fdtab::Kind::Dev(Arc::new(OpenDev {
+            major,
+            minor,
+            pos: Mutex::new(0),
+        })),
+    );
     Some(fd as i64)
+}
+
+fn numbers(kind: Kind) -> (u32, u32) {
+    match kind {
+        Kind::Control => (MISC_MAJOR, LOOP_CONTROL_MINOR),
+        Kind::Mapper => (MISC_MAJOR, DM_CONTROL_MINOR),
+        Kind::Loop(minor) => (LOOP_MAJOR, minor),
+        Kind::Dm(minor) => (DM_MAJOR, minor),
+    }
+}
+
+fn kind_of(major: u32, minor: u32) -> Option<Kind> {
+    match (major, minor) {
+        (MISC_MAJOR, LOOP_CONTROL_MINOR) => Some(Kind::Control),
+        (MISC_MAJOR, DM_CONTROL_MINOR) => Some(Kind::Mapper),
+        (LOOP_MAJOR, minor) => Some(Kind::Loop(minor)),
+        (DM_MAJOR, minor) => Some(Kind::Dm(minor)),
+        _ => None,
+    }
+}
+
+fn recorded(fd: i32) -> Option<Arc<OpenDev>> {
+    match super::fdtab::get(fd) {
+        Some(super::fdtab::Kind::Dev(dev)) => Some(dev),
+        _ => None,
+    }
+}
+
+/// A fork child keeps the device numbers and offset of an inherited open.
+pub fn restore_open(fd: i32, major: u32, minor: u32, pos: u64) -> Arc<OpenDev> {
+    if let Some(kind) = kind_of(major, minor) {
+        let mut state = lock();
+        state.opens.entry(fd).or_insert(Open { kind });
+    }
+    Arc::new(OpenDev {
+        major,
+        minor,
+        pos: Mutex::new(pos),
+    })
 }
 
 fn hold(state: &mut State, kind: Kind) {
@@ -266,19 +332,20 @@ pub fn stat(guest: &str) -> Option<libc::stat> {
 }
 
 pub fn fstat(fd: i32, st: &mut libc::stat) -> bool {
-    let state = lock();
-    let Some(open) = state.opens.get(&fd) else {
+    let Some(dev) = recorded(fd) else {
         return false;
     };
-    *st = stat_of(&state, open.kind);
+    let Some(kind) = kind_of(dev.major, dev.minor) else {
+        return false;
+    };
+    *st = stat_of(&lock(), kind);
     true
 }
 
 pub fn ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
-    if !lock().opens.contains_key(&fd) {
-        return None;
-    }
-    Some(match command(fd, req, arg) {
+    let dev = recorded(fd)?;
+    let kind = kind_of(dev.major, dev.minor)?;
+    Some(match command(kind, req & 0xffff_ffff, arg) {
         Ok(value) => value,
         Err(error) => -(error as i64),
     })
@@ -286,7 +353,7 @@ pub fn ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
 
 /// Read, write, or positioned read/write. None: not one of these fds.
 pub fn pio(fd: i32, buf: u64, len: usize, pos: Option<i64>, write: bool) -> Option<i64> {
-    if !lock().opens.contains_key(&fd) {
+    if recorded(fd).is_none() {
         return None;
     }
     if write {
@@ -299,7 +366,7 @@ pub fn pio(fd: i32, buf: u64, len: usize, pos: Option<i64>, write: bool) -> Opti
 }
 
 pub fn rwv(fd: i32, iov: &[libc::iovec], write: bool) -> Option<i64> {
-    if !lock().opens.contains_key(&fd) {
+    if recorded(fd).is_none() {
         return None;
     }
     if write {
@@ -324,12 +391,13 @@ pub fn rwv(fd: i32, iov: &[libc::iovec], write: bool) -> Option<i64> {
 }
 
 pub fn lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
-    let mut state = lock();
-    let open = state.opens.get(&fd)?.clone();
-    let len = device_len(&state, open.kind).unwrap_or(0);
+    let dev = recorded(fd)?;
+    let kind = kind_of(dev.major, dev.minor)?;
+    let len = device_len(&lock(), kind).unwrap_or(0);
+    let mut pos = dev.pos.lock().unwrap_or_else(|error| error.into_inner());
     let next = match whence {
         0 => off,
-        1 => open.pos as i64 + off,
+        1 => *pos as i64 + off,
         2 => len as i64 + off,
         3 => {
             if off < 0 || off as u64 > len {
@@ -348,12 +416,18 @@ pub fn lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
     if next < 0 {
         return Some(-(EINVAL as i64));
     }
-    state.opens.get_mut(&fd).unwrap().pos = next as u64;
+    *pos = next as u64;
     Some(next)
 }
 
-/// `mount` of an ext4 loop or dm-verity device. The tree is the bytes the
-/// block source returns. A verity failure fails the mount.
+/// `mount` of an ext4 loop or dm-verity device.
+///
+/// The tree is a directory filled from the block reader at this call.
+/// It is mounted read-only as an image, and a guest lookup of a file
+/// under it resolves to that directory. The host backing file is not
+/// opened again, so changing it after the mount cannot change a guest
+/// read. A dm-verity source is checked while the directory is filled;
+/// a bad block fails the mount.
 pub fn mount_ext4(source: &str, guest: &str, readonly: bool) -> Result<(), Errno> {
     if !readonly {
         return Err(EROFS);
@@ -463,12 +537,11 @@ impl ReadAt for FdAt {
     }
 }
 
-fn command(fd: i32, req: u64, arg: u64) -> Result<i64, Errno> {
-    let kind = lock().opens.get(&fd).ok_or(EBADF)?.kind;
+fn command(kind: Kind, req: u64, arg: u64) -> Result<i64, Errno> {
     if let Some(nr) = blk_nr(req) {
         return blk(kind, nr, arg);
     }
-    if let Some(nr) = dm_nr(req) {
+    if let Some(nr) = dm_cmd(req) {
         return if matches!(kind, Kind::Mapper) {
             dm(nr, arg)
         } else {
@@ -728,7 +801,7 @@ fn fd_path(fd: i32) -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; 4096];
-        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0 {
+        if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } == 0 {
             Some(
                 unsafe { std::ffi::CStr::from_ptr(buf.as_ptr().cast()) }
                     .to_bytes()
@@ -789,16 +862,24 @@ fn dm(nr: u8, arg: u64) -> Result<i64, Errno> {
         return Err(EINVAL);
     }
     let mut buf = super::user_memory::read_exact(arg, data_size as usize)?;
-    match nr {
-        DM_DEV_CREATE => dm_create(&mut buf)?,
-        DM_DEV_REMOVE => dm_remove(&mut buf)?,
-        DM_DEV_SUSPEND => dm_suspend(&mut buf)?,
-        DM_DEV_STATUS => dm_status(&mut buf)?,
-        DM_TABLE_LOAD => dm_load(&mut buf)?,
+    let status = match nr {
+        DM_VERSION => dm_version(&mut buf),
+        DM_DEV_CREATE => dm_create(&mut buf),
+        DM_DEV_REMOVE => dm_remove(&mut buf),
+        DM_DEV_SUSPEND => dm_suspend(&mut buf),
+        DM_DEV_STATUS => dm_status(&mut buf),
+        DM_TABLE_LOAD => dm_load(&mut buf),
         _ => return Err(ENOTTY),
-    }
+    };
     super::user_memory::write_exact(arg, &buf)?;
+    status?;
     Ok(0)
+}
+
+fn dm_version(buf: &mut [u8]) -> Result<(), Errno> {
+    let major = u32_at(buf, 0);
+    put_version(buf);
+    if major == 4 { Ok(()) } else { Err(EINVAL) }
 }
 
 fn dm_create(buf: &mut [u8]) -> Result<(), Errno> {
@@ -998,8 +1079,13 @@ fn encode_dev(major: u32, minor: u32) -> u64 {
 fn blk_nr(req: u64) -> Option<u8> {
     ((req >> 8) & 0xff == 0x12).then_some((req & 0xff) as u8)
 }
-fn dm_nr(req: u64) -> Option<u8> {
-    ((req >> 8) & 0xff == 0xfd).then_some((req & 0xff) as u8)
+/// `_IOWR(0xfd, nr, struct dm_ioctl)` with `sizeof(struct dm_ioctl) == 312`.
+/// The observed Mac requests are `0xc138fd03` and `0xc138fd07`.
+fn dm_cmd(req: u64) -> Option<u8> {
+    let dir = req >> 30;
+    let size = (req >> 16) & 0x3fff;
+    let typ = (req >> 8) & 0xff;
+    (dir == 3 && size == 0x138 && typ == 0xfd).then_some((req & 0xff) as u8)
 }
 
 fn loop_minor(path: &str) -> Option<u32> {
@@ -1112,19 +1198,19 @@ fn read_fd(fd: i32, buf: u64, len: usize, pos: Option<i64>) -> Result<i64, Errno
     if len == 0 {
         return Ok(0);
     }
-    let state = lock();
-    let open = state.opens.get(&fd).ok_or(EBADF)?.clone();
+    let dev = recorded(fd).ok_or(EBADF)?;
+    let kind = kind_of(dev.major, dev.minor).ok_or(EBADF)?;
     let at = match pos {
         Some(p) if p < 0 => return Err(EINVAL),
         Some(p) => p as u64,
-        None => open.pos,
+        None => *dev.pos.lock().unwrap_or_else(|error| error.into_inner()),
     };
-    let len_dev = device_len(&state, open.kind).ok_or(ENXIO)?;
+    let state = lock();
+    let len_dev = device_len(&state, kind).ok_or(ENXIO)?;
     if at >= len_dev {
         return Ok(0);
     }
     let take = ((len_dev - at) as usize).min(len);
-    let kind = open.kind;
     let io = match kind {
         Kind::Loop(minor) => loop_io(&state, minor).map(Io::Loop)?,
         Kind::Dm(minor) => {
@@ -1147,7 +1233,7 @@ fn read_fd(fd: i32, buf: u64, len: usize, pos: Option<i64>) -> Result<i64, Errno
     }
     super::user_memory::write_exact(buf, &tmp)?;
     if pos.is_none() {
-        lock().opens.get_mut(&fd).ok_or(EBADF)?.pos = at + take as u64;
+        *dev.pos.lock().unwrap_or_else(|error| error.into_inner()) = at + take as u64;
     }
     Ok(take as i64)
 }
@@ -1512,10 +1598,204 @@ mod tests {
         let added = ctl_add(40).unwrap();
         assert_eq!(added, 40);
         assert_eq!(ctl_add(40).unwrap_err(), EEXIST);
+        // Id 0 is one of the eight preallocated devices. Linux returns
+        // EEXIST, and apexd treats a zero return as failure.
+        assert_eq!(ctl_add(0).unwrap_err(), EEXIST);
         assert_eq!(ioctl(fd as i32, 0x4cff, 0).unwrap(), -(ENOTTY as i64));
         ctl_remove(40).unwrap();
-        on_close(fd as i32);
+        super::super::fdtab::on_close(fd as i32);
         unsafe { libc::close(fd as i32) };
+    }
+
+    /// apexd's order, through `fs::openat` and `fs::ioctl` (syscall 29).
+    #[test]
+    fn apexd_ioctls_go_through_the_syscall_dispatcher() {
+        let _gate = gate();
+        let dm = guest_open("/dev/device-mapper");
+        assert!(dm >= 0, "{dm}");
+        assert_eq!(guest_rdev(dm as i32), linux_rdev(10, 236));
+        assert_eq!(path_rdev("/dev/device-mapper"), linux_rdev(10, 236));
+        let mut version = dm_header("");
+        let rc = guest_ioctl(dm as i32, 0xc138_fd00, version.as_mut_ptr() as u64);
+        assert_eq!(rc, 0, "{rc}");
+        assert_eq!(u32::from_le_bytes(version[0..4].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(version[4..8].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(version[8..12].try_into().unwrap()), 0);
+        // A sign-extended request is the same command.
+        let mut again = dm_header("");
+        assert_eq!(
+            guest_ioctl(dm as i32, 0xffff_ffff_c138_fd00, again.as_mut_ptr() as u64),
+            0
+        );
+        // The size field is part of the command. 0x139 is not struct dm_ioctl.
+        assert_eq!(guest_ioctl(dm as i32, 0xc139_fd00, version.as_mut_ptr() as u64), -(ENOTTY as i64));
+
+        let ctl = guest_open("/dev/loop-control");
+        assert!(ctl >= 0, "{ctl}");
+        assert_eq!(guest_rdev(ctl as i32), linux_rdev(10, 237));
+        assert_eq!(path_rdev("/dev/loop-control"), linux_rdev(10, 237));
+        // Device-mapper commands stay on 10:236.
+        assert_eq!(
+            guest_ioctl(ctl as i32, 0xc138_fd00, version.as_mut_ptr() as u64),
+            -(ENOTTY as i64)
+        );
+        let free = guest_ioctl(ctl as i32, 0x4c82, 0);
+        assert!(free >= 0, "{free}");
+        assert_eq!(guest_ioctl(ctl as i32, 0x4c80, 0), -(EEXIST as i64));
+        // Loop-control commands stay on 10:237.
+        assert_eq!(guest_ioctl(dm as i32, 0x4c82, 0), -(ENOTTY as i64));
+
+        let node = format!("/dev/loop{free}");
+        let loop_fd = guest_open(&node);
+        assert!(loop_fd >= 0, "{loop_fd}");
+        assert_eq!(guest_rdev(loop_fd as i32), linux_rdev(7, free as u32));
+        assert_eq!(path_rdev(&node), linux_rdev(7, free as u32));
+        let dir = std::env::temp_dir().join(format!("aim-dispatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload");
+        fs::write(&path, vec![0x11u8; 4096]).unwrap();
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let backing = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(backing >= 0);
+        let mut cfg = [0u8; 240];
+        cfg[0..4].copy_from_slice(&(backing as u32).to_le_bytes());
+        cfg[4..8].copy_from_slice(&4096u32.to_le_bytes());
+        cfg[8 + 32..8 + 40].copy_from_slice(&4096u64.to_le_bytes());
+        assert_eq!(guest_ioctl(loop_fd as i32, 0x4c0a, cfg.as_ptr() as u64), 0);
+        unsafe { libc::close(backing) };
+
+        let name = "aim-dispatch";
+        let mut create = dm_header(name);
+        assert_eq!(guest_ioctl(dm as i32, 0xc138_fd03, create.as_mut_ptr() as u64), 0);
+        assert_eq!(u32::from_le_bytes(create[0..4].try_into().unwrap()), 4);
+        let mut load = vec![0u8; 312 + 48];
+        load[..312].copy_from_slice(&dm_header(name));
+        let load_len = load.len() as u32;
+        put_u32(&mut load, 12, load_len);
+        put_u32(&mut load, 16, 312);
+        put_u32(&mut load, 20, 1);
+        put_u32(&mut load, 312 + 20, 48);
+        load[312 + 24..312 + 29].copy_from_slice(b"error");
+        assert_eq!(guest_ioctl(dm as i32, 0xc138_fd09, load.as_mut_ptr() as u64), 0);
+        let mut resume = dm_header(name);
+        assert_eq!(guest_ioctl(dm as i32, 0xc138_fd06, resume.as_mut_ptr() as u64), 0);
+        let mut status = dm_header(name);
+        assert_eq!(guest_ioctl(dm as i32, 0xc138_fd07, status.as_mut_ptr() as u64), 0);
+        assert_eq!(u32::from_le_bytes(status[20..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(status[28..32].try_into().unwrap()) & 2, 0);
+
+        let mut rm = dm_header(name);
+        assert_eq!(guest_ioctl(dm as i32, 0xc138_fd04, rm.as_mut_ptr() as u64), 0);
+        clr_fd(free as u32).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        for fd in [loop_fd, ctl, dm] {
+            assert_eq!(super::super::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+    }
+
+    #[test]
+    fn a_mounted_tree_ignores_a_later_change_to_the_host_file() {
+        let _gate = gate();
+        let (_view, _) = crate::vfs::test_view();
+        let (image, manifest) = super::super::ext4ro::manifest_fixture();
+        let dir = std::env::temp_dir().join(format!("aim-tamper-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.img");
+        fs::write(&path, &image).unwrap();
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        let minor = ctl_free().unwrap() as u32;
+        configure(minor, fd, 4096, &[0; 232]).unwrap();
+        unsafe { libc::close(fd) };
+        let guest = "/aim-tamper-mount";
+        mount_ext4(&format!("/dev/block/loop{minor}"), guest, true).unwrap();
+        let got = guest_read(&format!("{guest}/apex_manifest.pb"));
+        assert_eq!(got, manifest);
+        fs::write(&path, vec![0u8; image.len()]).unwrap();
+        let again = guest_read(&format!("{guest}/apex_manifest.pb"));
+        assert_eq!(again, manifest);
+        crate::vfs::remove_mount(guest).unwrap();
+        clr_fd(minor).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn guest_open(path: &str) -> i64 {
+        let c = CString::new(path).unwrap();
+        super::super::fs::openat([
+            crate::vfs::LINUX_AT_FDCWD as u64,
+            c.as_ptr() as u64,
+            2 | O_CLOEXEC,
+            0,
+            0,
+            0,
+        ])
+    }
+
+    fn guest_ioctl(fd: i32, req: u64, arg: u64) -> i64 {
+        super::super::fs::ioctl([fd as u64, req, arg, 0, 0, 0])
+    }
+
+    fn guest_rdev(fd: i32) -> u64 {
+        let mut buf = vec![0u8; 128];
+        let rc = super::super::fs::fstat([fd as u64, buf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        assert_eq!(rc, 0, "{rc}");
+        u64::from_le_bytes(buf[32..40].try_into().unwrap())
+    }
+
+    fn path_rdev(path: &str) -> u64 {
+        let c = CString::new(path).unwrap();
+        let mut buf = vec![0u8; 128];
+        let rc = super::super::fs::newfstatat([
+            crate::vfs::LINUX_AT_FDCWD as u64,
+            c.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!(rc, 0, "{rc}");
+        u64::from_le_bytes(buf[32..40].try_into().unwrap())
+    }
+
+    fn linux_rdev(major: u32, minor: u32) -> u64 {
+        let (major, minor) = (u64::from(major), u64::from(minor));
+        (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)
+    }
+
+    fn dm_header(name: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 312];
+        put_u32(&mut buf, 0, 4);
+        put_u32(&mut buf, 12, 312);
+        write_name(&mut buf, 48, 128, name);
+        buf
+    }
+
+    fn guest_read(path: &str) -> Vec<u8> {
+        let c = CString::new(path).unwrap();
+        let fd = super::super::fs::openat([
+            crate::vfs::LINUX_AT_FDCWD as u64,
+            c.as_ptr() as u64,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        assert!(fd >= 0, "{fd}");
+        let mut buf = vec![0u8; 4096];
+        let n = super::super::fs::read([
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(n >= 0, "{n}");
+        assert_eq!(super::super::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        buf.truncate(n as usize);
+        buf
     }
 
     #[test]
@@ -1547,7 +1827,8 @@ mod tests {
         );
         let mut load = vec![0u8; 312 + 40 + params.len() + 8];
         write_name(&mut load, 48, 128, "apex-verity");
-        put_u32(&mut load, 12, load.len() as u32);
+        let load_len = load.len() as u32;
+        put_u32(&mut load, 12, load_len);
         put_u32(&mut load, 16, 312);
         put_u32(&mut load, 20, 1);
         put_u32(&mut load, 28, DM_READONLY);

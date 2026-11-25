@@ -1635,7 +1635,7 @@ impl AppHost {
                 pid: 0,
                 started,
                 start_elapsed: clock_ms(libc::CLOCK_MONOTONIC_RAW),
-                start_uptime: clock_ms(libc::CLOCK_UPTIME_RAW),
+                start_uptime: clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
                 thread: None,
                 activities: Vec::new(),
                 config: None,
@@ -1766,7 +1766,7 @@ impl AppHost {
                 pid: 0,
                 started,
                 start_elapsed: clock_ms(libc::CLOCK_MONOTONIC_RAW),
-                start_uptime: clock_ms(libc::CLOCK_UPTIME_RAW),
+                start_uptime: clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
                 thread: None,
                 activities: Vec::new(),
                 config: None,
@@ -2040,7 +2040,7 @@ impl AppHost {
                 pid: 0,
                 started,
                 start_elapsed: clock_ms(libc::CLOCK_MONOTONIC_RAW),
-                start_uptime: clock_ms(libc::CLOCK_UPTIME_RAW),
+                start_uptime: clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
                 thread: None,
                 activities: request.into_iter().collect(),
                 config: None,
@@ -2397,7 +2397,7 @@ impl AppHost {
                 pid,
                 started: Instant::now(),
                 start_elapsed: clock_ms(libc::CLOCK_MONOTONIC_RAW),
-                start_uptime: clock_ms(libc::CLOCK_UPTIME_RAW),
+                start_uptime: clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
                 thread: Some(strong),
                 activities: Vec::new(),
                 reported_config: Some(config.clone()),
@@ -3039,7 +3039,7 @@ impl AppHost {
     /// An activity of the process of `start_seq` was resumed.
     fn activity_changed(&self, start_seq: i64) {
         if let Some(app) = self.apps.lock().unwrap().get_mut(&start_seq) {
-            app.last_activity = clock_ms(libc::CLOCK_UPTIME_RAW);
+            app.last_activity = clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
         }
     }
 

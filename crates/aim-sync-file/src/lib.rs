@@ -25,12 +25,62 @@
 //!
 //! [`metal`] connects fences to Metal's shared events, in both directions.
 
+#[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(not(target_os = "macos"))]
+pub mod metal {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::fd::{BorrowedFd, OwnedFd};
+
+    pub type Id = *mut c_void;
+    pub unsafe fn fence(_event: Id, _value: u64) -> io::Result<OwnedFd> {
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+    pub unsafe fn signal_when(_fd: BorrowedFd<'_>, _event: Id, _value: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+}
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(target_os = "macos")]
+use libc::{EVFILT_READ, EV_ADD, EV_ONESHOT, kevent, kqueue};
+#[cfg(not(target_os = "macos"))]
+use queue::{EVFILT_READ, EV_ADD, EV_ONESHOT, kevent, kqueue};
+
+#[cfg(not(target_os = "macos"))]
+mod queue {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct kevent {
+        pub ident: usize,
+        pub filter: i16,
+        pub flags: u16,
+        pub fflags: u32,
+        pub data: isize,
+        pub udata: *mut libc::c_void,
+    }
+    pub const EVFILT_READ: i16 = -1;
+    pub const EV_ADD: u16 = 1;
+    pub const EV_ONESHOT: u16 = 0x10;
+    pub unsafe fn kqueue() -> i32 {
+        -1
+    }
+    pub unsafe fn kevent(
+        _kq: i32,
+        _changes: *const kevent,
+        _nchanges: i32,
+        _events: *mut kevent,
+        _nevents: i32,
+        _timeout: *const libc::timespec,
+    ) -> i32 {
+        -1
+    }
+}
 
 /// The `SO_LINGER` time that marks a sync_file's socket ("SF").
 pub const MARK: i32 = 0x5346;
@@ -204,6 +254,9 @@ pub fn pair() -> io::Result<(OwnedFd, Writer)> {
         }
         // A writer's send, at the latest when it is dropped, must not
         // raise SIGPIPE in the producer once every sync_file is closed.
+        // Darwin has SO_NOSIGPIPE. Linux does not; the process ignores
+        // SIGPIPE, which is what that option does for this socket.
+        #[cfg(target_os = "macos")]
         cvt(libc::setsockopt(
             writer.as_raw_fd(),
             libc::SOL_SOCKET,
@@ -211,6 +264,11 @@ pub fn pair() -> io::Result<(OwnedFd, Writer)> {
             (&on as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         ))?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = on;
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        }
         cvt(libc::setsockopt(
             file.as_raw_fd(),
             libc::SOL_SOCKET,
@@ -421,10 +479,10 @@ impl Waiter {
         for (p, s) in inputs.iter().zip(states) {
             if *s == State::Active {
                 // SAFETY: an all-zero kevent is valid.
-                let mut k: libc::kevent = unsafe { std::mem::zeroed() };
+                let mut k: kevent = unsafe { std::mem::zeroed() };
                 k.ident = p.0 as usize;
-                k.filter = libc::EVFILT_READ;
-                k.flags = libc::EV_ADD | libc::EV_ONESHOT;
+                k.filter = EVFILT_READ;
+                k.flags = EV_ADD | EV_ONESHOT;
                 k.udata = id as *mut libc::c_void;
                 changes.push(k);
             }
@@ -439,7 +497,7 @@ impl Waiter {
         );
         // SAFETY: registering local changes on our kqueue.
         let r = unsafe {
-            libc::kevent(
+            kevent(
                 self.kq,
                 changes.as_ptr(),
                 changes.len() as i32,
@@ -458,11 +516,11 @@ impl Waiter {
 
     fn run(&self) {
         // SAFETY: an all-zero kevent is valid.
-        let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+        let mut events: [kevent; 16] = unsafe { std::mem::zeroed() };
         loop {
             // SAFETY: waiting on our kqueue into a local array.
             let n = unsafe {
-                libc::kevent(
+                kevent(
                     self.kq,
                     std::ptr::null(),
                     0,
@@ -505,7 +563,7 @@ fn waiter() -> io::Result<Arc<Waiter>> {
         return Ok(waiter.clone());
     }
     // SAFETY: a new kqueue of our own.
-    let kq = cvt(unsafe { libc::kqueue() })?;
+    let kq = cvt(unsafe { kqueue() })?;
     // A kqueue is not inherited by a fork child, so it is hidden but not
     // listed with the descriptors a child closes.
     let kq = match HOOKS.get() {
@@ -626,6 +684,7 @@ mod tests {
     }
 
     /// Signaling a fence nobody holds any more fails quietly.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_writer_outliving_its_fence_raises_no_sigpipe() {
         let (file, writer) = pair().unwrap();

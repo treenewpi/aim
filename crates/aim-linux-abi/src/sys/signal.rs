@@ -56,7 +56,7 @@ const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
 
 /// The host signal that pokes a guest thread.
-const CARRIER: i32 = libc::SIGEMT;
+const CARRIER: i32 = aim_storage::host::SIGEMT;
 /// Host signals the kernel raises on the thread whose syscall caused them.
 const THREAD_DIRECTED: u64 = bit(13) | bit(25); // SIGPIPE, SIGXFSZ
 /// Queued signals per queue; beyond it sigqueue fails with EAGAIN.
@@ -149,7 +149,7 @@ pub fn die(sig: i32) -> ! {
     unsafe {
         if h != 0 {
             libc::signal(h, libc::SIG_DFL);
-            let mut set: libc::sigset_t = 0;
+            let mut set = crate::hostlibc::empty_sigset();
             libc::sigaddset(&mut set, h);
             libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             libc::pthread_kill(libc::pthread_self(), h);
@@ -622,10 +622,10 @@ fn record_external(sig: i32, si: &libc::siginfo_t) {
         _ => sigframe::SI_USER,
     };
     let e = &EXTERNAL_INFO[sig as usize - 1];
-    let from = if code == SI_KERNEL { 0 } else { si.si_pid };
+    let from = if code == SI_KERNEL { 0 } else { aim_storage::host::si_pid(&si) };
     e.from.store(from as u32 as u64, Relaxed);
     e.code.store(
-        code as u32 as u64 | (si.si_status as u32 as u64) << 32,
+        code as u32 as u64 | (aim_storage::host::si_status(&si) as u32 as u64) << 32,
         Relaxed,
     );
     EXTERNAL.fetch_or(bit(sig), SeqCst);
@@ -1193,13 +1193,13 @@ extern "C" fn finish_verity_fault() -> ! {
 struct HostErrno(i32);
 impl HostErrno {
     fn save() -> Self {
-        Self(unsafe { *libc::__error() })
+        Self(unsafe { *crate::hostlibc::__error() })
     }
 }
 impl Drop for HostErrno {
     fn drop(&mut self) {
         unsafe {
-            *libc::__error() = self.0;
+            *crate::hostlibc::__error() = self.0;
         }
     }
 }
@@ -1251,12 +1251,12 @@ unsafe fn host_signal(hsig: i32, si: &libc::siginfo_t, uc: *mut libc::c_void) ->
         // A copy can also fault while this handler builds a guest frame;
         // its pager continuation must preserve the interrupted host stack.
         if matches!(hsig, libc::SIGSEGV | libc::SIGBUS)
-            && super::user_memory::recover_fault(m, si.si_addr as u64)
+            && super::user_memory::recover_fault(m, aim_storage::host::si_addr(&si))
         {
             return None;
         }
         if matches!(hsig, libc::SIGSEGV | libc::SIGBUS)
-            && defer_verity_fault(ctx, si.si_addr as u64, m)
+            && defer_verity_fault(ctx, aim_storage::host::si_addr(&si), m)
         {
             return None;
         }
@@ -1273,7 +1273,7 @@ unsafe fn host_signal(hsig: i32, si: &libc::siginfo_t, uc: *mut libc::c_void) ->
         if context::region(m.pc) != context::Region::Other || ctx.in_host != 0 {
             return host_fault;
         }
-        return guest_fault(ctx, hsig, si.si_code, si.si_addr as u64, m);
+        return guest_fault(ctx, hsig, si.si_code, aim_storage::host::si_addr(&si), m);
     }
     let sig = from_host(hsig);
     if sig == 0 {
@@ -2236,19 +2236,19 @@ mod host_errno_tests {
                     libc::_exit(2);
                 }
                 let result = libc::open(c"/dev/null/not-a-directory".as_ptr(), libc::O_RDONLY);
-                let error = *libc::__error();
+                let error = *crate::hostlibc::__error();
                 if result != -1 || error != libc::ENOTDIR {
                     libc::_exit(3);
                 }
-                if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 || *libc::__error() != error {
+                if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 || *crate::hostlibc::__error() != error {
                     libc::_exit(4);
                 }
                 let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
                 if fd < 0 {
                     libc::_exit(5);
                 }
-                *libc::__error() = libc::EINTR;
-                if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 || *libc::__error() != libc::EINTR
+                *crate::hostlibc::__error() = libc::EINTR;
+                if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 || *crate::hostlibc::__error() != libc::EINTR
                 {
                     libc::_exit(6);
                 }

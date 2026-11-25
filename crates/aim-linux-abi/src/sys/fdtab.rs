@@ -72,6 +72,9 @@ pub enum Kind {
     /// A bpf map, program or type information (`bpf`): an anon inode,
     /// which its object file stands for, with no read, write or seek.
     Bpf,
+    /// A loop or device-mapper open. The major and minor were resolved
+    /// from the path at open; ioctl and stat use those numbers.
+    Dev(Arc<super::loopdev::OpenDev>),
 }
 
 pub(super) struct PathProof(std::os::fd::OwnedFd);
@@ -131,7 +134,7 @@ impl PathDescription {
         let raw = unsafe {
             libc::open(
                 parent.as_ptr(),
-                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                aim_storage::host::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         if raw < 0 {
@@ -1418,15 +1421,15 @@ pub fn open_fds() -> Vec<i32> {
     // SAFETY: sizing call, then a buffer of that size.
     unsafe {
         let pid = libc::getpid();
-        let n = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+        let n = crate::hostlibc::proc_pidinfo(pid, crate::hostlibc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
         if n <= 0 {
             return Vec::new();
         }
-        let sz = std::mem::size_of::<libc::proc_fdinfo>();
-        let mut v: Vec<libc::proc_fdinfo> = Vec::with_capacity(n as usize / sz + 16);
-        let n = libc::proc_pidinfo(
+        let sz = std::mem::size_of::<crate::hostlibc::proc_fdinfo>();
+        let mut v: Vec<crate::hostlibc::proc_fdinfo> = Vec::with_capacity(n as usize / sz + 16);
+        let n = crate::hostlibc::proc_pidinfo(
             pid,
-            libc::PROC_PIDLISTFDS,
+            crate::hostlibc::PROC_PIDLISTFDS,
             0,
             v.as_mut_ptr().cast(),
             (v.capacity() * sz) as i32,
@@ -1466,7 +1469,8 @@ pub fn anon_name(fd: i32) -> Option<String> {
             | Kind::ProxyFile
             | Kind::Kmsg(_)
             | Kind::Cgroup(_)
-            | Kind::Binder(_) => {
+            | Kind::Binder(_)
+            | Kind::Dev(_) => {
                 return None;
             }
         }
@@ -1944,7 +1948,7 @@ fn hold_table_top() {
     }
     // SAFETY: a new descriptor of our own, moved to the top.
     let held = unsafe {
-        let fd = libc::kqueue();
+        let fd = crate::hostlibc::kqueue();
         if fd < 0 {
             crate::diag!(
                 "descriptor table top: kqueue errno {}",
@@ -2114,6 +2118,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             Kind::PidFd(a) => Arc::as_ptr(a) as *const (),
             Kind::Knob(a) => Arc::as_ptr(a) as *const (),
             Kind::TracePipe(a) => Arc::as_ptr(a) as *const (),
+            Kind::Dev(a) => Arc::as_ptr(a) as *const (),
             Kind::Memfd(_)
             | Kind::SyncFile
             | Kind::Random
@@ -2263,6 +2268,12 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 } else {
                     w.u32(25);
                 }
+            }
+            Kind::Dev(dev) => {
+                w.u32(26);
+                w.u32(dev.major);
+                w.u32(dev.minor);
+                w.u64(*dev.pos.lock().unwrap_or_else(|e| e.into_inner()));
             }
             Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
         }
@@ -2427,6 +2438,12 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 Kind::Content
             }
             25 => Kind::Content,
+            26 => {
+                let major = r.u32();
+                let minor = r.u32();
+                let pos = r.u64();
+                Kind::Dev(super::loopdev::restore_open(fd, major, minor, pos))
+            }
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
@@ -2598,6 +2615,7 @@ mod tests {
     /// A hidden fd goes high even when the soft RLIMIT_NOFILE is above
     /// what the descriptor table can hold, and stays where `posix_spawn`
     /// can pass it to a fork child.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_hidden_fd_goes_high_and_stays_inheritable() {
         // SAFETY: raising this test process's soft limit to its hard one.
@@ -2608,7 +2626,7 @@ mod tests {
             libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
         }
         // SAFETY: a new kqueue of our own.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { crate::hostlibc::kqueue() };
         let fd = hide(kq);
         assert!(fd >= hidden_base() && fd < 10240, "{fd}");
         // SAFETY: a file action list of our own, destroyed here.

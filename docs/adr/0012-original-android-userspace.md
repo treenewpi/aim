@@ -657,13 +657,24 @@ peripheral mode and no `/sys/class/android_usb`.
 
 binder, FUSE, `/proc` and `/sys` per the device contract, the netlink subset
 the remaining original daemons use, evdev, and memfd/ashmem. Loop
-(`/dev/loop-control`, `/dev/loopN`) and device-mapper (`/dev/device-mapper`,
-`/dev/block/dm-N`) answer the ioctl set android-16.0.0_r1 apexd and libdm
-issue on the bootstrap path. Any other command on those fds is `ENOTTY`.
+(`/dev/loop-control` is 10:237, `/dev/loopN` is 7:N) and device-mapper
+(`/dev/device-mapper` is 10:236, `/dev/block/dm-N` is 253:N) record that
+device number at open; `stat` and `fstat` report it, and ioctl follows
+it, so a device-mapper command is not accepted on loop-control.
+`LOOP_CTL_ADD`, `LOOP_CTL_REMOVE` and `LOOP_CTL_GET_FREE` are `0x4c80`
+through `0x4c82`. Device-mapper commands are
+`_IOWR(0xfd, nr, struct dm_ioctl)` with size 312, including `DM_VERSION`.
+The Mac trace of `63008084d55ca0d2065100aa7a29fa5913e1d755` did not issue
+`DM_VERSION` before `DM_DEV_CREATE`. Any other command on those fds is
+`ENOTTY`.
 A read-only `ext4` mount of one of those devices is the bytes that block
-source returns. A dm-verity table is checked per data block on read against
-the hashtree and the root digest; a mismatch is `EIO`. Preinstalled
-bootstrap apexes do not load that table.
+source returns. The pinned layer's 35 payloads share one feature set:
+compat `0x28` (`EXT_ATTR|DIR_INDEX`), incompat `0x42`
+(`FILETYPE|EXTENTS`), ro_compat `0x407b` (including `SHARED_BLOCKS`, not
+`METADATA_CSUM`). `FLEX_BG` and `INLINE_DATA` are unset. An incompat bit
+outside `FILETYPE|EXTENTS` is `EINVAL`. A dm-verity table is checked per
+data block on read against the hashtree and the root digest; a mismatch
+is `EIO`. Preinstalled bootstrap apexes do not load that table.
 
 - **uevents:** NETLINK_KOBJECT_UEVENT sockets receive the kernel's
   uevents (`ACTION@DEVPATH`, the variables, `SEQNUM`) with the kernel's

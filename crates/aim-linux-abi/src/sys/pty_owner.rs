@@ -157,7 +157,7 @@ impl Description {
         use std::os::fd::{FromRawFd, OwnedFd};
         let observation = self.watch()?.observation;
         let queue = PrivateFd::allocate(|| {
-            let fd = unsafe { libc::kqueue() };
+            let fd = unsafe { crate::hostlibc::kqueue() };
             if fd < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -165,24 +165,24 @@ impl Description {
             }
         })
         .map_err(failure)?;
-        let mut changes: [libc::kevent; 3] = unsafe { std::mem::zeroed() };
+        let mut changes: [crate::hostlibc::kevent; 3] = unsafe { std::mem::zeroed() };
         changes[0].ident = observation.data().as_raw_fd() as usize;
         changes[0].filter = if write {
-            libc::EVFILT_WRITE
+            crate::hostlibc::EVFILT_WRITE
         } else {
-            libc::EVFILT_READ
+            crate::hostlibc::EVFILT_READ
         };
-        changes[0].flags = libc::EV_ADD;
-        changes[0].fflags = libc::NOTE_LOWAT;
+        changes[0].flags = crate::hostlibc::EV_ADD;
+        changes[0].fflags = crate::hostlibc::NOTE_LOWAT;
         changes[0].data = 1;
         changes[1].ident = observation.notification().ok_or(errno::EIO)?.as_raw_fd() as usize;
-        changes[1].filter = libc::EVFILT_READ;
-        changes[1].flags = libc::EV_ADD;
+        changes[1].filter = crate::hostlibc::EVFILT_READ;
+        changes[1].flags = crate::hostlibc::EV_ADD;
         changes[2].ident = 0;
-        changes[2].filter = libc::EVFILT_USER;
-        changes[2].flags = libc::EV_ADD | libc::EV_CLEAR;
+        changes[2].filter = crate::hostlibc::EVFILT_USER;
+        changes[2].flags = crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR;
         if unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 queue.as_raw_fd(),
                 changes.as_ptr(),
                 3,
@@ -203,13 +203,13 @@ impl Description {
             tv_sec: duration.as_secs() as _,
             tv_nsec: duration.subsec_nanos() as _,
         });
-        let mut events: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+        let mut events: [crate::hostlibc::kevent; 2] = unsafe { std::mem::zeroed() };
         let wake = || unsafe {
-            let saved = *libc::__error();
-            let mut event: libc::kevent = std::mem::zeroed();
-            event.filter = libc::EVFILT_USER;
-            event.fflags = libc::NOTE_TRIGGER;
-            libc::kevent(
+            let saved = *crate::hostlibc::__error();
+            let mut event: crate::hostlibc::kevent = std::mem::zeroed();
+            event.filter = crate::hostlibc::EVFILT_USER;
+            event.fflags = crate::hostlibc::NOTE_TRIGGER;
+            crate::hostlibc::kevent(
                 queue.as_raw_fd(),
                 &event,
                 1,
@@ -217,11 +217,11 @@ impl Description {
                 0,
                 std::ptr::null(),
             );
-            *libc::__error() = saved;
+            *crate::hostlibc::__error() = saved;
         };
         let result = super::signal::interruptible(&wake, || {
             let count = unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     queue.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -234,10 +234,10 @@ impl Description {
                 return Err(errno::last());
             }
             for event in &events[..count as usize] {
-                if event.flags & libc::EV_ERROR != 0 {
+                if event.flags & crate::hostlibc::EV_ERROR != 0 {
                     return Err(errno::from_darwin(event.data as i32));
                 }
-                if event.filter == libc::EVFILT_USER {
+                if event.filter == crate::hostlibc::EVFILT_USER {
                     return Err(errno::EINTR);
                 }
             }

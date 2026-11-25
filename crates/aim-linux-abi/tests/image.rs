@@ -125,7 +125,7 @@ struct ProcRegionInfo {
 #[repr(C)]
 struct ProcRegionWithPathInfo {
     prinfo: ProcRegionInfo,
-    vip: libc::vnode_info_path,
+    vip: aim_storage::host::vnode_info_path,
 }
 
 const PROC_PIDREGIONPATHINFO: i32 = 8;

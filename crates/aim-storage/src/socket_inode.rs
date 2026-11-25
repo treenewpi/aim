@@ -14,6 +14,7 @@ pub struct Identity {
     pub inode: u64,
     pub cookie: u64,
 }
+#[cfg(target_os = "macos")]
 pub fn identity(fd: RawFd) -> io::Result<Identity> {
     let mut bytes = [0u8; 792];
     let size =
@@ -33,6 +34,20 @@ pub fn identity(fd: RawFd) -> io::Result<Identity> {
         cookie,
     })
 }
+#[cfg(not(target_os = "macos"))]
+pub fn identity(fd: RawFd) -> io::Result<Identity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.st_ino == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(Identity {
+        inode: stat.st_ino,
+        cookie: stat.st_ino,
+    })
+}
 /// A trusted allocation receipt travels with the actual socket capability.
 /// The opaque Darwin address cookie alone is never an adoption credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +61,7 @@ impl Receipt {
         let mut generation = [0u8; 16];
         loop {
             unsafe {
-                libc::arc4random_buf(generation.as_mut_ptr().cast(), generation.len());
+                crate::host::arc4random_buf(generation.as_mut_ptr().cast(), generation.len());
             }
             if generation != [0; 16] {
                 break;

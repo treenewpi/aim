@@ -94,9 +94,9 @@ const RUSAGE_CHILDREN: i32 = -1;
 const RUSAGE_THREAD: i32 = 1;
 
 unsafe extern "C" {
-    fn mach_thread_self() -> libc::mach_port_t;
-    static mach_task_self_: libc::mach_port_t;
-    fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> i32;
+    fn mach_thread_self() -> crate::mach_port_t;
+    static mach_task_self_: crate::mach_port_t;
+    fn mach_port_deallocate(task: crate::mach_port_t, name: crate::mach_port_t) -> i32;
 }
 
 /// User and system time of the calling thread.
@@ -104,19 +104,19 @@ fn thread_times() -> Option<(libc::timeval, libc::timeval)> {
     // SAFETY: THREAD_BASIC_INFO into a local of the right size.
     unsafe {
         let port = mach_thread_self();
-        let mut info: libc::thread_basic_info = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::thread_basic_info>() / 4) as u32;
-        let kr = libc::thread_info(
+        let mut info: crate::hostlibc::thread_basic_info = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<crate::hostlibc::thread_basic_info>() / 4) as u32;
+        let kr = crate::hostlibc::thread_info(
             port,
-            libc::THREAD_BASIC_INFO as u32,
-            (&mut info as *mut libc::thread_basic_info).cast(),
+            crate::hostlibc::THREAD_BASIC_INFO as u32,
+            (&mut info as *mut crate::hostlibc::thread_basic_info).cast(),
             &mut count,
         );
         mach_port_deallocate(mach_task_self_, port);
         if kr != 0 {
             return None;
         }
-        let tv = |t: libc::time_value_t| libc::timeval {
+        let tv = |t: crate::hostlibc::time_value_t| libc::timeval {
             tv_sec: t.seconds as i64,
             tv_usec: t.microseconds,
         };
@@ -268,7 +268,7 @@ pub fn sysinfo(a: [u64; 6]) -> i64 {
     let procs = match super::pidns::members() {
         Some(m) => m.len() as i32,
         // SAFETY: counting pids.
-        None => unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0),
+        None => unsafe { crate::hostlibc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0),
     };
     let mut w = [0u64; 14];
     w[0] = uptime() / 1_000_000_000;
@@ -288,11 +288,7 @@ pub fn sysinfo(a: [u64; 6]) -> i64 {
 
 /// getcpu (168): Darwin keeps the CPU number in the low bits of TPIDR_EL0.
 pub fn getcpu(a: [u64; 6]) -> i64 {
-    let tp: u64;
-    // SAFETY: reading TPIDR_EL0 is always permitted at EL0.
-    unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tp) };
-    let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
-    let cpu = ((tp & 0xfff) % ncpu) as u32;
+    let cpu = host_cpu();
     // SAFETY: guest unsigned ints.
     {
         if a[0] != 0 {
@@ -303,6 +299,23 @@ pub fn getcpu(a: [u64; 6]) -> i64 {
         }
     }
     0
+}
+
+fn host_cpu() -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tp: u64;
+        // SAFETY: reading TPIDR_EL0 is always permitted at EL0.
+        unsafe { std::arch::asm!("mrs {}, tpidr_el0", out(reg) tp) };
+        let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+        ((tp & 0xfff) % ncpu) as u32
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // TPIDR_EL0 is the arm64 Darwin path. A non-arm64 test host has
+        // no such register; the guest cpu number is not invented from it.
+        0
+    }
 }
 
 static PERSONALITY: AtomicU32 = AtomicU32::new(0);

@@ -52,7 +52,7 @@ fn isolated(test: &str) -> bool {
 #[test]
 fn renice_retains_linux_state_and_observes_native_qos() {
     use super::super::cred;
-    use libc::qos_class_t::*;
+    use crate::qos_class_t::*;
     if !isolated("sys::process::sched_tests::renice_retains_linux_state_and_observes_native_qos") {
         return;
     }
@@ -79,7 +79,7 @@ fn renice_retains_linux_state_and_observes_native_qos() {
         let mut relative = 1;
         assert_eq!(
             unsafe {
-                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut relative)
+                crate::hostlibc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut relative)
             },
             0
         );
@@ -101,7 +101,7 @@ fn renice_retains_linux_state_and_observes_native_qos() {
     // Linux nice/class alone would incorrectly skip the necessary update.
     for (qos, relative) in [(QOS_CLASS_UTILITY, 0), (QOS_CLASS_DEFAULT, -3)] {
         assert_eq!(
-            unsafe { libc::pthread_set_qos_class_self_np(qos, relative) },
+            unsafe { crate::hostlibc::pthread_set_qos_class_self_np(qos, relative) },
             0
         );
         assert_eq!(cred::setpriority([0; 6]), 0);
@@ -109,7 +109,7 @@ fn renice_retains_linux_state_and_observes_native_qos() {
         let mut relative = 1;
         assert_eq!(
             unsafe {
-                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut relative)
+                crate::hostlibc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut relative)
             },
             0
         );
@@ -125,7 +125,7 @@ fn renice_retains_linux_state_and_observes_native_qos() {
     let mut qos = QOS_CLASS_UNSPECIFIED;
     assert_eq!(
         unsafe {
-            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, std::ptr::null_mut())
+            crate::hostlibc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, std::ptr::null_mut())
         },
         0
     );
@@ -138,7 +138,7 @@ fn renice_retains_linux_state_and_observes_native_qos() {
     apply_stale_sched(th).unwrap();
     assert_eq!(
         unsafe {
-            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, std::ptr::null_mut())
+            crate::hostlibc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, std::ptr::null_mut())
         },
         0
     );

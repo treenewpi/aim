@@ -77,7 +77,7 @@ impl ReadParcelable for Noted {
 /// A uniform random integer below `bound` (`ThreadLocalRandom.nextInt`).
 fn random_below(bound: u32) -> u32 {
     // SAFETY: arc4random_uniform takes and returns plain integers.
-    unsafe { libc::arc4random_uniform(bound) }
+    unsafe { crate::host_os::arc4random_uniform(bound) }
 }
 
 /// A uniform random float in [0, 1) (`ThreadLocalRandom.nextFloat`).

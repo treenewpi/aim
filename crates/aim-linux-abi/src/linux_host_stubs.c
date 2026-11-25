@@ -1,0 +1,49 @@
+/* Darwin symbols declared by the guest ABI. Each call fails.
+   Linked only on Linux; macOS uses the system definitions. */
+unsigned int mach_task_self_ = 0;
+void *_dispatch_source_type_signal = 0;
+long _NSGetEnviron(void) { return 5; }
+long __ulock_wait2(void) { return 5; }
+long __ulock_wake(void) { return 5; }
+long clock_gettime_nsec_np(void) { return 5; }
+long dispatch_get_global_queue(void) { return 5; }
+long dispatch_resume(void) { return 5; }
+long dispatch_source_create(void) { return 5; }
+long dispatch_source_set_event_handler_f(void) { return 5; }
+long host_processor_info(void) { return 5; }
+long host_statistics64(void) { return 5; }
+long mach_absolute_time(void) { return 5; }
+long mach_host_self(void) { return 5; }
+long mach_make_memory_entry_64(void) { return 5; }
+long mach_msg(void) { return 5; }
+long mach_port_allocate(void) { return 5; }
+long mach_port_deallocate(void) { return 5; }
+long mach_port_insert_right(void) { return 5; }
+long mach_port_mod_refs(void) { return 5; }
+long mach_port_request_notification(void) { return 5; }
+long mach_ports_lookup(void) { return 5; }
+long mach_ports_register(void) { return 5; }
+long mach_thread_self(void) { return 5; }
+long mach_vm_allocate(void) { return 5; }
+long mach_vm_deallocate(void) { return 5; }
+long mach_vm_inherit(void) { return 5; }
+long mach_vm_map(void) { return 5; }
+long mach_vm_page_info(void) { return 5; }
+long mach_vm_protect(void) { return 5; }
+long mach_vm_read_overwrite(void) { return 5; }
+long mach_vm_region(void) { return 5; }
+long mach_vm_remap(void) { return 5; }
+long mach_vm_write(void) { return 5; }
+long notify_register_file_descriptor(void) { return 5; }
+long os_sync_wait_on_address(void) { return 5; }
+long os_sync_wake_by_address_any(void) { return 5; }
+long posix_spawn_file_actions_addinherit_np(void) { return 5; }
+long posix_spawnattr_set_registered_ports_np(void) { return 5; }
+long pthread_fchdir_np(void) { return 5; }
+long setiopolicy_np(void) { return 5; }
+long sys_icache_invalidate(void) { return 5; }
+long task_policy_set(void) { return 5; }
+long thread_get_register_pointer_values(void) { return 5; }
+long thread_get_state(void) { return 5; }
+long thread_resume(void) { return 5; }
+long thread_suspend(void) { return 5; }
