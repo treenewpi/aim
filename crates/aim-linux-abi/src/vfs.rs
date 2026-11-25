@@ -3023,6 +3023,80 @@ pub fn is_mountpoint(guest: &str) -> bool {
     })
 }
 
+/// Fail when a host directory the guest can create files in is on a
+/// case-folding volume. That is the path map's writable and kernfs
+/// directories (`/data`, `/cache`, and the other writable layers), the
+/// tmpfs backing directory `<runtime>/tmpfs`, socket directories, scratch,
+/// and `$TMPDIR`. A path that does not exist yet is judged by the
+/// directory that will hold it. Call after [`init`].
+pub fn require_case_sensitive_backing() -> Result<(), String> {
+    let v = vfs();
+    let mut entries = Vec::new();
+    if !v.mapped {
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "root".to_string(),
+            path: v.root.clone(),
+        });
+    }
+    let mounts: Vec<(String, PathBuf, bool)> = {
+        let mounts = v.mounts.read().unwrap();
+        mounts
+            .iter()
+            .filter(|m| !m.own && matches!(m.area, Area::Writable | Area::Kernfs))
+            .map(|m| {
+                let role = if m.area == Area::Kernfs {
+                    format!("kernfs {}", m.guest)
+                } else {
+                    format!("writable {}", m.guest)
+                };
+                (role, m.host.clone(), m.guest == "/dev")
+            })
+            .collect()
+    };
+    for (role, host, dev_socket) in mounts {
+        if dev_socket {
+            entries.push(crate::case_volume::VolumeCheck {
+                role: "socket directory".to_string(),
+                path: host.join("socket"),
+            });
+        }
+        entries.push(crate::case_volume::VolumeCheck {
+            role,
+            path: host_backing(&host),
+        });
+    }
+    if let Some(runtime) = v.runtime.as_deref() {
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "tmpfs backing".to_string(),
+            path: runtime.join("tmpfs"),
+        });
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "socket directory".to_string(),
+            path: runtime.join("dev").join("socket"),
+        });
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "scratch".to_string(),
+            path: runtime.join("scratch"),
+        });
+    }
+    entries.push(crate::case_volume::VolumeCheck {
+        role: "TMPDIR".to_string(),
+        path: std::env::temp_dir(),
+    });
+    crate::case_volume::require(&entries)
+}
+
+fn host_backing(host: &Path) -> PathBuf {
+    match std::fs::metadata(host) {
+        Ok(meta) if meta.is_dir() => host.to_path_buf(),
+        Ok(_) => host
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| host.to_path_buf()),
+        Err(_) => host.to_path_buf(),
+    }
+}
+
 /// The host paths the guest writes to: the path map's writable entries,
 /// or the root without a path map. None before [`init`].
 pub fn writable_hosts() -> Option<Vec<PathBuf>> {

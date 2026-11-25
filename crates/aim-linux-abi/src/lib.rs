@@ -13,6 +13,7 @@
 
 pub mod a64;
 pub mod cache;
+mod case_volume;
 pub mod context;
 pub mod diag;
 pub mod elf;
@@ -116,6 +117,9 @@ pub fn run_fork_child(opts: RunOptions) -> String {
     if let Err(e) = vfs::init(opts.root, opts.path_map) {
         return e;
     }
+    if let Err(e) = vfs::require_case_sensitive_backing() {
+        return e;
+    }
     if let Err(error) = start_verity_runtime() {
         return error;
     }
@@ -170,6 +174,9 @@ pub fn run(mut opts: RunOptions) -> String {
         return error;
     }
     if let Err(e) = vfs::init(opts.root, opts.path_map) {
+        return e;
+    }
+    if let Err(e) = vfs::require_case_sensitive_backing() {
         return e;
     }
     if let Some(runtime) = vfs::standalone_runtime()

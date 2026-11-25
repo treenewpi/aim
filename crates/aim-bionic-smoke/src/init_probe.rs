@@ -590,6 +590,10 @@ fn case_volume_error(dir: &Path) -> String {
 
 /// `pathconf(_PC_CASE_SENSITIVE)` on macOS, and a probe file everywhere.
 /// A case-insensitive volume stores one file under both spellings.
+/// APFS also treats NFC and NFD of one name as one file. The pinned
+/// layer has 3743 paths, all ASCII, and an offline NFC/NFD comparison
+/// finds 0 collisions. Cargo.lock has no normalization crate, so prepare
+/// does not recompute that count and does not rename.
 fn require_case_sensitive_volume(dir: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     if pathconf_case_sensitive(dir)? == Some(false) {
