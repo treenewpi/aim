@@ -15,7 +15,11 @@
 //!   the file faults (SIGBUS), and MADV_DONTNEED reads the file again. A
 //!   mapping of a file that needs rewriting is rewritten when it becomes
 //!   executable ([`mprotect`]), which copies only the pages written.
-//! - Shared file mappings go straight to Darwin `mmap`.
+//! - Shared file mappings go straight to Darwin `mmap`. An offset that is
+//!   a multiple of 4 KiB but not of 16 KiB is the enclosing host pages,
+//!   and the pointer is displaced into that mapping. `mmap_rnd_bits` does
+//!   not move the file offset. A `MAP_FIXED` request whose address and
+//!   offset disagree modulo 16 KiB is `EINVAL`: a copy would not be shared.
 //! - A BoringSSL FIPS module rewritten at load time gets its integrity hash
 //!   recomputed in memory, as the translator does for cached files.
 
@@ -24,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::context::GuestContext;
-use crate::errno::{self, EEXIST, EINVAL, ENOMEM};
+use crate::errno::{self, EEXIST, EINVAL, EIO, ENOMEM};
 use crate::patch;
 use crate::xlate::fips;
 use crate::xrt::{self, ExecSource};
@@ -547,6 +551,98 @@ fn mmap_owned(a: [u64; 6]) -> i64 {
     }
     mmap_kernel(a)
 }
+fn file_len(fd: i32) -> Result<u64, i64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(-(errno::last() as i64));
+    }
+    Ok(st.st_size.max(0) as u64)
+}
+
+/// `MAP_SHARED` of a 4 KiB-aligned file offset. The host mapping starts at
+/// `offset & ~0x3fff` and the returned pointer is `base + (offset & 0x3fff)`.
+/// Slack at either end of a host page is released only when that page's
+/// guest slices are all gone (`PAGE_PIECES`).
+fn mmap_shifted_shared(addr: u64, len: u64, prot: u64, _flags: u64, fd: i32, off: u64) -> i64 {
+    let plan = match aim_guest_page::shifted_file_map(off, len) {
+        Ok(plan) => plan,
+        Err(error) => return -(error as i64),
+    };
+    let file_len = match file_len(fd) {
+        Ok(len) => len,
+        Err(error) => return error,
+    };
+    if aim_guest_page::guest_page_wholly_past_eof(off, plan.guest_length, file_len) {
+        crate::diag!(
+            "[linux-abi] mmap: file offset {off:#x} length {:#x} includes a 4 KiB page wholly past EOF {file_len:#x}; refusing a zero-filled page",
+            plan.guest_length
+        );
+        return -(EIO as i64);
+    }
+    if plan.host_offset.saturating_add(plan.host_length) > file_len {
+        crate::diag!(
+            "[linux-abi] mmap: shared file map offset {off:#x} guest length {:#x} host {:#x}+{:#x} extends past EOF {file_len:#x}; the guest range stays {:#x} bytes and is not widened",
+            plan.guest_length,
+            plan.host_offset,
+            plan.host_length,
+            plan.guest_length
+        );
+    }
+    let hint = arena::hint(addr.wrapping_sub(plan.displacement), plan.host_length);
+    let placing = arena::placing();
+    let base = match host_mmap(
+        hint,
+        plan.host_length,
+        host_prot(prot),
+        libc::MAP_SHARED,
+        fd,
+        plan.host_offset as i64,
+    ) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
+    if !arena::contains(base, plan.host_length) {
+        unsafe { libc::munmap(base as *mut _, plan.host_length as usize) };
+        return -(ENOMEM as i64);
+    }
+    drop(placing);
+    let guest = base + plan.displacement;
+    note_shifted_slack(base, guest, &plan, prot);
+    note_file_copy(guest, plan.guest_length, fd, off);
+    guest as i64
+}
+
+fn note_shifted_slack(
+    host: u64,
+    guest: u64,
+    plan: &aim_guest_page::ShiftedFileMap,
+    prot: u64,
+) {
+    let guest_end = guest + plan.guest_length;
+    let host_end = host + plan.host_length;
+    let prot = aim_guest_page::prot_bits(prot as u32);
+    let mut page = host;
+    while page < host_end {
+        let mut present = 0u8;
+        for slot in 0..4 {
+            let at = page + slot * GUEST_PAGE;
+            if at >= guest && at + GUEST_PAGE <= guest_end {
+                present |= 1 << slot;
+            }
+        }
+        if present != 0 && present != 0b1111 {
+            PAGE_PIECES.lock().unwrap().insert(
+                page,
+                PagePieces {
+                    present,
+                    prot: [prot; 4],
+                },
+            );
+        }
+        page += PAGE;
+    }
+}
+
 fn mmap_kernel(a: [u64; 6]) -> i64 {
     let (addr, len, prot, flags, fd, off) = (
         a[0],
@@ -562,9 +658,24 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
     // Private file maps consult `private_file_map`: a 16 KiB-aligned offset
     // stays a host file mapping, and a 4 KiB offset is copied so the
     // returned pointer starts at that file offset.
+    let mut shift_shared = false;
     let copy_file = if flags & MAP_ANONYMOUS == 0 && flags & MAP_TYPE == MAP_PRIVATE {
         match aim_guest_page::private_file_map(off, len) {
-            Ok(aim_guest_page::PrivateFileMap::Copy { .. }) => true,
+            Ok(aim_guest_page::PrivateFileMap::Copy { .. }) => {
+                let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+                if fixed && !aim_guest_page::fixed_residue_matches(addr, off) {
+                    if prot & PROT_WRITE != 0 {
+                        crate::diag!(
+                            "[linux-abi] mmap: MAP_FIXED writable private map at {addr:#x} offset {off:#x} is not a host file mapping; refusing a copy"
+                        );
+                        return -(EINVAL as i64);
+                    }
+                    crate::diag!(
+                        "[linux-abi] mmap: read-only MAP_PRIVATE at {addr:#x} offset {off:#x} copied; address and offset differ mod 16 KiB"
+                    );
+                }
+                true
+            }
             Ok(_) => false,
             Err(error) => return -(error as i64),
         }
@@ -578,12 +689,27 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
         }
         false
     } else {
-        if len == 0 || off & (PAGE - 1) != 0 {
+        // MAP_SHARED / MAP_SHARED_VALIDATE. A 4 KiB multiple that is not a
+        // 16 KiB multiple is a real shared mapping of the enclosing host
+        // pages. MAP_FIXED cannot place the slack without clobbering a
+        // neighbour, so it stays EINVAL rather than a private copy.
+        if len == 0 || off & (aim_guest_page::GUEST_PAGE - 1) != 0 {
             return -(EINVAL as i64);
+        }
+        let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+        if off & (PAGE - 1) != 0 || (fixed && addr & (PAGE - 1) != 0) {
+            if fixed {
+                crate::diag!(
+                    "[linux-abi] mmap: MAP_FIXED shared file at {addr:#x} offset {off:#x} is not a 16 KiB host mapping; not copying"
+                );
+                return -(EINVAL as i64);
+            }
+            shift_shared = true;
         }
         false
     };
-    if flags & MAP_ANONYMOUS == 0
+    if !shift_shared
+        && flags & MAP_ANONYMOUS == 0
         && let Some(file) = super::fuse_client::get(fd)
     {
         let shared = matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE);
@@ -620,6 +746,38 @@ fn mmap_kernel(a: [u64; 6]) -> i64 {
             .or_else(|| super::dma_heap::before_mmap(fd, len, off))
     {
         return e;
+    }
+    if shift_shared {
+        if flags & MAP_ANONYMOUS == 0
+            && let Some(file) = super::fuse_client::get(fd)
+        {
+            let cache = match super::fuse_cache::prepare(file, fd, true, prot & PROT_WRITE != 0) {
+                Ok(cache) => cache,
+                Err(error) => return -(error as i64),
+            };
+            let result = mmap_shifted_shared(addr, len, prot, flags, cache.fd() as i32, off);
+            if result >= 0 {
+                let guest_len = aim_guest_page::guest_page_len(len).unwrap_or(0);
+                if let Err(error) =
+                    super::fuse_cache::note(cache, result as u64, guest_len, off, true)
+                {
+                    if let Ok(plan) = aim_guest_page::shifted_file_map(off, len) {
+                        let host = (result as u64).wrapping_sub(plan.displacement);
+                        let mut pieces = PAGE_PIECES.lock().unwrap();
+                        let mut page = host;
+                        while page < host + plan.host_length {
+                            pieces.remove(&page);
+                            page += PAGE;
+                        }
+                        drop(pieces);
+                        unsafe { libc::munmap(host as *mut _, plan.host_length as usize) };
+                    }
+                    return -(error as i64);
+                }
+            }
+            return result;
+        }
+        return mmap_shifted_shared(addr, len, prot, flags, fd, off);
     }
     let mut fixed = flags & MAP_FIXED != 0;
     let noreplace = flags & MAP_FIXED_NOREPLACE != 0;
@@ -1301,6 +1459,25 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
         Ok(plan) => plan,
         Err(error) => return -(error as i64),
     };
+    for op in &host_ops {
+        if aim_guest_page::union_creates_wx(op.old, op.prot) {
+            crate::diag!(
+                "[linux-abi] mprotect: refusing W+X union on host page {:#x} ({:#x} -> {:#x})",
+                op.addr,
+                op.old,
+                op.prot
+            );
+            return -(EINVAL as i64);
+        }
+        if op.prot & !op.old != 0 {
+            crate::diag!(
+                "[linux-abi] mprotect: host page {:#x} takes the union of its 4 KiB slices ({:#x} -> {:#x})",
+                op.addr,
+                op.old,
+                op.prot
+            );
+        }
+    }
     for (done, op) in host_ops.iter().enumerate() {
         let mut result = host_mprotect(op.addr, PAGE, op.prot as i32);
         if result == -(errno::EACCES as i64) {
@@ -2447,13 +2624,21 @@ pub fn msync(a: [u64; 6]) -> i64 {
     const MS_INVALIDATE: u64 = 2;
     const MS_SYNC: u64 = 4;
     let (addr, len, flags) = (a[0], a[1], a[2]);
-    if addr & (PAGE - 1) != 0
+    if addr & (GUEST_PAGE - 1) != 0
         || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
         || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC)
     {
         return -(EINVAL as i64);
     }
-    if window::touches_reserved(addr, addr + page_up(len)) {
+    let Some(end) = addr.checked_add(len).map(|n| (n + GUEST_PAGE - 1) & !(GUEST_PAGE - 1)) else {
+        return -(EINVAL as i64);
+    };
+    if end == addr {
+        return 0;
+    }
+    let host_lo = addr & !(PAGE - 1);
+    let host_hi = (end + PAGE - 1) & !(PAGE - 1);
+    if window::touches_reserved(host_lo, host_hi) {
         return -(ENOMEM as i64);
     }
     let mut h = 0;
@@ -2466,16 +2651,18 @@ pub fn msync(a: [u64; 6]) -> i64 {
     if flags & MS_INVALIDATE != 0 {
         h |= libc::MS_INVALIDATE;
     }
-    // SAFETY: guest range.
-    let result =
-        errno::check(unsafe { libc::msync(addr as *mut _, page_up(len) as usize, h) } as i64);
+    // The guest address is 4 KiB-aligned. Darwin syncs the host pages
+    // that cover it.
+    let result = errno::check(unsafe {
+        libc::msync(host_lo as *mut _, (host_hi - host_lo) as usize, h)
+    } as i64);
     if result < 0 {
         return result;
     }
     let flushed = if flags & MS_SYNC != 0 {
-        super::fuse_cache::flush_range(addr, page_up(len))
+        super::fuse_cache::flush_range(host_lo, host_hi - host_lo)
     } else {
-        super::fuse_cache::schedule_range(addr, page_up(len))
+        super::fuse_cache::schedule_range(host_lo, host_hi - host_lo)
     };
     match flushed {
         Ok(()) => 0,

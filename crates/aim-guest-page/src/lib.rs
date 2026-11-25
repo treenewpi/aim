@@ -60,6 +60,79 @@ pub fn private_file_map(offset: u64, length: u64) -> Result<PrivateFileMap, i32>
     }
 }
 
+/// A non-`MAP_FIXED` file map whose offset is a multiple of 4 KiB.
+///
+/// The host maps `host_offset` (`offset` cleared to 16 KiB) for
+/// `host_length`. The guest pointer is `displacement` bytes into that
+/// mapping, still 4 KiB-aligned, and the guest range is `guest_length`.
+/// The bytes before the pointer and after the guest range are host slack.
+/// They stay mapped until every guest slice of that host page is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShiftedFileMap {
+    pub host_offset: u64,
+    pub displacement: u64,
+    pub host_length: u64,
+    pub guest_length: u64,
+}
+
+/// `length` and `offset` are the guest arguments. An offset that is not a
+/// multiple of 4 KiB, or a zero length, is [`EINVAL`].
+pub fn shifted_file_map(offset: u64, length: u64) -> Result<ShiftedFileMap, i32> {
+    if length == 0 || offset & (GUEST_PAGE - 1) != 0 {
+        return Err(EINVAL);
+    }
+    let guest_length = guest_page_len(length)?;
+    if guest_length == 0 {
+        return Err(EINVAL);
+    }
+    let host_offset = offset & !(PAGE - 1);
+    let displacement = offset - host_offset;
+    let span = displacement.checked_add(guest_length).ok_or(ENOMEM)?;
+    let host_length = host_span(span)?;
+    Ok(ShiftedFileMap {
+        host_offset,
+        displacement,
+        host_length,
+        guest_length,
+    })
+}
+
+/// True when a 4 KiB page of `[offset, offset+guest_length)` starts at or
+/// after `file_len`. Linux raises SIGBUS for a touch of that page. Mapping
+/// it as zeros would widen the file.
+pub fn guest_page_wholly_past_eof(offset: u64, guest_length: u64, file_len: u64) -> bool {
+    if guest_length == 0 {
+        return false;
+    }
+    let mut page = offset & !(GUEST_PAGE - 1);
+    let end = match offset.checked_add(guest_length) {
+        Some(end) => end,
+        None => return true,
+    };
+    while page < end {
+        if page >= file_len {
+            return true;
+        }
+        page += GUEST_PAGE;
+    }
+    false
+}
+
+/// `MAP_FIXED` can be a host file mapping only when the address and the
+/// file offset have the same residue modulo 16 KiB. Otherwise the slack
+/// before the guest pointer would land on a different address than the
+/// file page.
+pub fn fixed_residue_matches(addr: u64, offset: u64) -> bool {
+    addr & (PAGE - 1) == offset & (PAGE - 1)
+}
+
+/// The union of two 4 KiB slices newly makes the host page both writable
+/// and executable.
+pub fn union_creates_wx(old_union: u32, new_union: u32) -> bool {
+    let wx = PROT_WRITE | PROT_EXEC;
+    new_union & wx == wx && old_union & wx != wx
+}
+
 /// Bytes of a copied mapping that come from the file, and bytes that stay
 /// zero because they are past EOF. `length` is the guest length.
 pub fn copied_file_bytes(offset: u64, length: u64, file_len: u64) -> Result<(u64, u64), i32> {
@@ -416,6 +489,33 @@ mod tests {
         // A 16 KiB-aligned address is not this path. The caller keeps the
         // old rounding for it. Zero length is still a no-op here.
         assert_eq!(begin_subpage(0x18c000, 0, RO), Ok(0));
+    }
+
+    #[test]
+    fn apexd_shared_zip_map_shifts_onto_the_host_page() {
+        // mmap(NULL, 0x24a9, PROT_READ, MAP_SHARED, fd, 0x5a000).
+        let plan = shifted_file_map(0x5a000, 0x24a9).unwrap();
+        assert_eq!(plan.host_offset, 0x58000);
+        assert_eq!(plan.displacement, 0x2000);
+        assert_eq!(plan.guest_length, 0x3000);
+        assert_eq!(plan.host_length, 0x8000);
+        assert_eq!(plan.host_offset + plan.displacement, 0x5a000);
+        assert!(!guest_page_wholly_past_eof(
+            0x5a000,
+            plan.guest_length,
+            0x5a000 + 0x24a9
+        ));
+        assert!(guest_page_wholly_past_eof(0x5a000, plan.guest_length, 0x5c000));
+        assert_eq!(shifted_file_map(0x5a100, 0x24a9), Err(EINVAL));
+        assert!(!fixed_residue_matches(0x1000, 0x5a000));
+        assert!(fixed_residue_matches(0x2000, 0x5a000));
+    }
+
+    #[test]
+    fn a_writable_executable_union_is_distinct_from_write_protected() {
+        assert!(union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE | PROT_EXEC));
+        assert!(!union_creates_wx(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE));
+        assert!(!union_creates_wx(PROT_READ | PROT_WRITE | PROT_EXEC, PROT_READ | PROT_EXEC));
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub(crate) use pstate::initialize_umask;
 mod ptimer;
 mod ptrace;
 mod random;
+mod reboot;
 mod selinuxfs;
 mod sharedfile;
 mod sigframe;
@@ -469,6 +470,7 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
         278 => misc::getrandom(a),
         aim_hostcall::SYSCALL_NR => crate::hostcall::call(a[0], a[1], a[2], a[3]),
         // process lifecycle
+        142 => reboot::reboot(a),
         221 => exec::execve(ctx, a),
         281 => exec::execveat(ctx, a),
         95 => wait::waitid(a),

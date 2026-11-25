@@ -106,8 +106,23 @@ the earlier file. prepare-init now stops before copying when the root's
 volume is case-insensitive (`pathconf(_PC_CASE_SENSITIVE)` on macOS,
 and a probe file). The init root has to be a case-sensitive APFS image
 mounted on the empty `_build/redroid-16-init` directory. Creating and
-attaching that image does not need sudo. This check is not remeasured
-on macmini. A path the bionic root already holds is a conflict when
+attaching that image does not need sudo. linux-run applies the same
+probe at startup to every host directory the guest can create files in:
+the path map's writable directories (`/data`, `/cache`, and the other
+writable layers), kernfs host trees, `<runtime>/tmpfs`, socket
+directories, scratch, and `TMPDIR`. A folding volume fails startup and
+the message names each directory. `<runtime>` (`<data>.run`) is not
+inside the data image, and a linux-run without a path map keeps its
+runtime in `TMPDIR`, so those directories have to sit on a
+case-sensitive APFS image as well. This is not remeasured on macmini.
+APFS stays normalization-insensitive on a case-sensitive volume: NFC
+and NFD of one name are one file, and Linux compares bytes. The pinned
+layer's 3743 paths are all ASCII. An offline NFC and NFD comparison
+(Unicode 15.0.0) finds 0 collisions. `Cargo.lock` has no normalization
+crate (`unicode-ident` only), so prepare does not add one and does not
+recompute that count. The lock stays
+`7c5398c25903c8b014fdb094b5113fc2b4195ccff481b01f48678bf12cde1ac5`.
+A path the bionic root already holds is a conflict when
 its type or content differs. The only covered conflict is a member
 `prepare` staged from this layer: the layer entry is kept and the
 manifest records both sides. Any other difference fails and the
@@ -120,7 +135,24 @@ call 1065) returns `EINVAL`. Linux would return 0 with `CAP_SYS_ADMIN`
 the capability and continues. A cgroup namespace is not invented here.
 `kptr_restrict` stays mode 0644, 0..=2, default 0. `mmap_rnd_bits`
 (18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same kind of file.
-Guest mmap does not consult those two values. The trace logs a bounded
+Guest mmap does not consult those two values. A shared file map whose
+offset is a multiple of 4096 but not of 16384 is the enclosing host
+pages, and the pointer is `base + (offset & 0x3fff)`. It stays a real
+`MAP_SHARED` of the file. `MAP_FIXED` whose address and offset disagree
+modulo 16 KiB returns `EINVAL` and is not replaced by a copy. A
+read-only `MAP_PRIVATE` at that residue stays the private copy, and the
+trace says so. A 4 KiB page that starts at or past EOF returns `EIO`.
+`mprotect` keeps the union of the slices in one host page and refuses a
+union that newly makes that page writable and executable. `msync`
+accepts a 4 KiB address and syncs the covering host pages. `AT_PAGESZ`
+and `sysconf(_SC_PAGESIZE)` both stay 16384. `reboot` (arm64 142) kills
+this namespace init: `SIGHUP` for `RESTART` and `RESTART2`, `SIGINT` for
+`POWER_OFF` and `HALT`. The diagnostics line and
+`<runtime>/reboot-reason` record `guest-requested reboot:` plus the
+argument. For this apexd failure that argument is
+`reboot,bootloader,bootstrap-apexd-failed`. The exit is the recorded
+reboot. It does not make apexd succeed. Not remeasured on macmini.
+The trace logs a bounded
 `/proc/sys` read or write payload, including a failed write, and a
 `readlinkat` result on failure. `write` of
 fd 3 for 61 bytes returned 61

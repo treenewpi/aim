@@ -538,6 +538,27 @@ hdiutil create -size 8g -fs 'Case-sensitive APFS' -volname aim-init -type SPARSE
 hdiutil attach -nobrowse -mountpoint "$PWD/_build/redroid-16-init" "$PWD/_build/aim-init.sparseimage"
 ```
 
+linux-run uses the same probe on every host directory the guest creates
+files in. For this probe that is the init root and `TMPDIR`: the
+standalone runtime, its `<runtime>/tmpfs` backing directories, scratch,
+and socket directories live under `TMPDIR`. Put `TMPDIR` on that image
+before `--init`:
+
+```sh
+mkdir -p "$PWD/_build/redroid-16-init/tmp"
+export TMPDIR="$PWD/_build/redroid-16-init/tmp"
+```
+
+A guest-init boot has the same requirement for `<data>.run` (`/dev`,
+socket directories, tmpfs backing). The data image does not contain
+that directory. The pinned layer has 0 NFC/NFD collisions across 3743
+ASCII paths. prepare does not rename, and it does not add a
+normalization crate: `Cargo.lock` has none. A shared file `mmap` at a
+4096-byte offset maps the enclosing 16 KiB host pages. `AT_PAGESZ`
+stays 16384. A guest `reboot` ends the run and records
+`guest-requested reboot:` plus the argument in the diagnostics line
+and in `<runtime>/reboot-reason`.
+
 A same-path difference with the bionic root is printed as
 `bionic-smoke: conflict ...` and recorded in provenance. The only
 covered case is a member `prepare` staged from the layer: the layer

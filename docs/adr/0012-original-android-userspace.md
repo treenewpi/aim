@@ -261,7 +261,10 @@ of our own.
 - **Syscall cost:** a lean integer-only path costs about 3–4 ns. The full
   save is only for clone, signals and sigreturn.
 - **16 KiB pages:** match a Linux 16K kernel. Large reservations are cheap.
-  Nothing maps below 4 GiB, hence the ART exception above.
+  Nothing maps below 4 GiB, hence the ART exception above. A file `mmap`
+  whose offset is a multiple of 4 KiB maps the enclosing host pages and
+  returns a pointer displaced by `offset & 0x3fff`. `AT_PAGESZ` stays
+  16384, which is what bionic `sysconf(_SC_PAGESIZE)` reads.
 
 ## P1 binder driver (2026-09-27)
 

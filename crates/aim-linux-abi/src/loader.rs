@@ -800,6 +800,9 @@ pub fn build_stack(inp: &StackInputs) -> Result<u64, String> {
     let auxv: Vec<(u64, u64)> = vec![
         (AT_SYSINFO_EHDR, vdso),
         (AT_HWCAP, hwcap),
+        // ADR 0012 keeps a 16 KiB guest page. Bionic `sysconf(_SC_PAGESIZE)`
+        // reads this value, so both are 16384. File `mmap` still accepts a
+        // 4 KiB offset; that granule is not this auxv entry.
         (AT_PAGESZ, PAGE),
         (AT_CLKTCK, 100),
         (AT_PHDR, p.phdr),
