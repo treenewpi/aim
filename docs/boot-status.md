@@ -53,32 +53,40 @@ linker then gets `ENOENT` for `/linkerconfig/ld.config.txt` (call 126)
 and the other `ld.config` paths, then `ENOENT` for `libc.so` under
 `/system/lib64/bootstrap`, `/system/lib64` (call 307), `/odm/lib64`, and
 `/vendor/lib64`, and exits with `CANNOT LINK EXECUTABLE`. The 479
-restarts are that failure repeating. The syscall trace records the guest
-path and the errno. It does not record the host path, and the archive is
-not in this tree.
+restarts are that failure repeating.
 
-The parent resolves those paths at process start, before
-`MountExtraFilesystems`, with no covering mount: `lookup` falls through
-to the image root (`Area::Image`). That is the prepared root's
-`linkerconfig/ld.config.txt`, which is why main init links. The same
-startup lookup is where `/system/lib64/bootstrap/libc.so` is opened when
-the root has that file. `MountExtraFilesystems` then mounts an empty
-tmpfs on `/apex` and, because `/system/bin/recovery` is absent, on
-`/bootstrap-apex` and `/linkerconfig`. `unshare(CLONE_NEWNS)` copies that
-whole table (`duplicate_table`) and clones the journal (`clone_to`:
-base, events, and mount records). It does not create an empty or partial
-table. The copy includes those tmpfs mounts. `/system` is not one of
-them, so it stays the image root. `setns` installs the copied table and
-sets cwd to `/`. An absolute lookup does not use cwd, and the image root
-is unchanged. Exec keeps that namespace: `load_own_mounts` replays the
-cloned journal rather than building a new empty view. The child's
-`ld.config.txt` `ENOENT` is the copied tmpfs directory, which hides the
-image file the parent opened before the mount. `/system/lib64/libc.so`
-in the layer is a symlink into `/apex`, which the same tmpfs hides.
-`/system/lib64/bootstrap/libc.so` stays on the image root in this code;
-call 307's `ENOENT` means that host path has no such file in the root
-that was run. A failed absolute `openat` or `newfstatat` now logs the
-lookup host and area. `unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
+On `850846a` (archive
+`87ff9070e16826be4928f9f7a0bec625d4cf4fa251fbb0bcb0fbe4a76a989d52`) the
+parent's second-stage exec is call 1185, before the tmpfs mounts at
+calls 5953, 5955, and 5956. That process links through the image
+`linkerconfig/ld.config.txt` and the `system/lib64/libc.so` symlink into
+`/apex`. The vendor_init child execs after those mounts, so the tmpfs
+hides both. That is the Android order. The tmpfs is unchanged.
+`unshare(CLONE_NEWNS)` copies the full table from that moment, including
+the empty `/linkerconfig` and `/apex` tmpfs. `/system` is not one of
+those mounts, so it stays the image root. `setns` installs that table
+and sets cwd to `/`. An absolute lookup does not use cwd.
+
+Both sides open `/system/lib64/bootstrap/libc.so` first. The traced host
+is `_build/redroid-16-init/root/system/lib64/bootstrap/libc.so`, area
+`image`, and the result is `ENOENT`. That directory in the prepared root
+contains only `libdl_android.so`. The pinned layer
+(`efbc1c6b9440932189927a386ba3fc991f8a6b88bb8f56f1fd9b26ee8d7475b6`,
+733630886 bytes) stores the bootstrap set as regular files, not
+symlinks and not hardlinks: `libc.so` 1208608 bytes, `libm.so` 248968,
+`libdl.so` 50760, `libdl_android.so` 34672. The layer has no hardlink
+entries at all. `system/lib64/libc.so`, `libm.so`, `libdl.so`, and
+`libdl_android.so` are symlinks to
+`/apex/com.android.runtime/lib64/bionic/`. prepare kept the bootstrap
+`libdl_android.so` because that basename was not already in the bionic
+root, and dropped the other three because `find_lib` treated the
+`system/lib64` symlink as the library. `prepare-init` now copies the
+layer's own files and fails unless each path matches the layer's type,
+size, and hash. It still does not copy `dev/__properties__`, children of
+`linkerconfig`, or children of `bootstrap-apex`, and it does not copy a
+device node. It does not invent a library the layer lacks. `/linkerconfig`
+and the tmpfs mounts are unchanged. This copy is not remeasured on
+macmini. `unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
 call 1065) returns `EINVAL`. Linux would return 0 with `CAP_SYS_ADMIN`
 (since 4.6). This is the unsupported-namespace gate (ADR 0012). Init has
 the capability and continues. A cgroup namespace is not invented here.

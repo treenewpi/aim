@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
@@ -64,6 +65,33 @@ const REQUIRED_CONTEXTS: &[&str] = &[
 /// `mount` return ENOENT, which that function's `CHECKCALL` aborts on.
 const MOUNTPOINTS: &[&str] = &["bootstrap-apex", "linkerconfig"];
 
+/// Bootstrap bionic set the linker opens before APEX activation. Each one
+/// is a regular file in the pinned layer. prepare fails if the layer lacks
+/// it, and does not write a substitute.
+const BOOTSTRAP_LIBS: &[&str] = &[
+    "system/lib64/bootstrap/libc.so",
+    "system/lib64/bootstrap/libm.so",
+    "system/lib64/bootstrap/libdl.so",
+];
+
+/// Layer paths the prepared root is not required to match. Anything else
+/// must match the layer's path, type, size, and hash.
+///
+/// `dev/__properties__` is not copied and not created.
+/// `linkerconfig/*` is not copied. That directory stays as the bionic root
+/// left it, including the generated `ld.config.txt`.
+/// `bootstrap-apex/*` is not copied. Init mounts tmpfs on that directory.
+/// A character device, block device, or fifo is not copied.
+const LAYER_DIFFERENCES: &[&str] = &[
+    "dev/__properties__",
+    "dev/__properties__/*",
+    "linkerconfig/*",
+    "bootstrap-apex/*",
+    "char-device",
+    "block-device",
+    "fifo",
+];
+
 struct LayerRootFiles {
     contexts: Vec<String>,
     dev_from_layer: bool,
@@ -100,6 +128,11 @@ pub fn prepare_init() -> Result<PathBuf, String> {
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     copy_tree(&bionic, &root)?;
     set_mode(&root, 0o755)?;
+    // The bionic root already has `system/lib64/libc.so` as a symlink into
+    // the apex. The basename walk treats that as the library and never
+    // copies the regular file at `system/lib64/bootstrap/libc.so`. Copy the
+    // layer first so that file, and every other layer path, is the layer's.
+    install_layer(&layer, &root)?;
     let copied = extract_closure(&layer, &root)?;
     let init_path = root.join(INIT_GUEST.trim_start_matches('/'));
     let info = read_elf(&fs::read(&init_path).map_err(|e| e.to_string())?)?;
@@ -122,6 +155,7 @@ pub fn prepare_init() -> Result<PathBuf, String> {
     if !root.join("dev").is_dir() {
         return Err("init probe root has no /dev directory".into());
     }
+    audit_layer(&layer, &root)?;
     write_provenance(&root, &layer, &copied, &root_files)?;
     for name in ["init-guest.stdout", "init-guest.stderr", "init-probe.txt"] {
         if let Some(parent) = root.parent() {
@@ -276,6 +310,249 @@ fn scan_wanted(
         found += 1;
     }
     Ok(found)
+}
+
+fn layer_skipped(name: &str, kind: tar::EntryType) -> bool {
+    LAYER_DIFFERENCES.iter().any(|rule| match *rule {
+        "dev/__properties__" => name == "dev/__properties__",
+        "dev/__properties__/*" => name.starts_with("dev/__properties__/"),
+        "linkerconfig/*" => name.starts_with("linkerconfig/"),
+        "bootstrap-apex/*" => name.starts_with("bootstrap-apex/"),
+        "char-device" => kind.is_character_special(),
+        "block-device" => kind.is_block_special(),
+        "fifo" => kind.is_fifo(),
+        _ => false,
+    })
+}
+
+fn open_layer(layer: &Path) -> Result<tar::Archive<flate2::read::GzDecoder<File>>, String> {
+    let file = File::open(layer).map_err(|e| format!("open {}: {e}", layer.display()))?;
+    Ok(tar::Archive::new(flate2::read::GzDecoder::new(file)))
+}
+
+fn entry_name(entry: &tar::Entry<flate2::read::GzDecoder<File>>) -> Result<String, String> {
+    let raw = entry.path().map_err(|e| format!("tar path: {e}"))?;
+    Ok(tar_rel(raw.as_ref()))
+}
+
+fn link_text(entry: &tar::Entry<flate2::read::GzDecoder<File>>) -> Result<String, String> {
+    let link = entry
+        .link_name()
+        .map_err(|e| format!("link target: {e}"))?
+        .ok_or_else(|| "link entry has no target".to_string())?;
+    Ok(link.to_string_lossy().into_owned())
+}
+
+fn clear_dest(dest: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", dest.display())),
+    };
+    let file_type = meta.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        fs::remove_dir_all(dest).map_err(|e| format!("remove {}: {e}", dest.display()))?;
+    } else {
+        fs::remove_file(dest).map_err(|e| format!("remove {}: {e}", dest.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_parent(dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Copy every layer path except [`LAYER_DIFFERENCES`]. A symlink stays a
+/// symlink. A hard link stays a hard link to the earlier layer member.
+/// Bytes are the layer's; nothing here is a written substitute.
+fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
+    let mut archive = open_layer(layer)?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read layer tar: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let name = entry_name(&entry)?;
+        if name.is_empty() {
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        if layer_skipped(&name, kind) {
+            continue;
+        }
+        let dest = root.join(&name);
+        if kind.is_dir() {
+            fs::create_dir_all(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+            let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
+            set_mode(&dest, mode)?;
+            continue;
+        }
+        if kind.is_file() || kind.is_contiguous() {
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("read {name}: {e}"))?;
+            clear_dest(&dest)?;
+            ensure_parent(&dest)?;
+            fs::write(&dest, &data).map_err(|e| format!("write {name}: {e}"))?;
+            let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+            set_mode(&dest, mode)?;
+            continue;
+        }
+        if kind.is_symlink() {
+            let target = link_text(&entry)?;
+            clear_dest(&dest)?;
+            ensure_parent(&dest)?;
+            std::os::unix::fs::symlink(&target, &dest)
+                .map_err(|e| format!("symlink {name} -> {target}: {e}"))?;
+            continue;
+        }
+        if kind.is_hard_link() {
+            let target = tar_rel(Path::new(&link_text(&entry)?));
+            let source = root.join(&target);
+            if fs::symlink_metadata(&source).is_err() {
+                return Err(format!(
+                    "hardlink {name} names {target}, which is not in the root"
+                ));
+            }
+            clear_dest(&dest)?;
+            ensure_parent(&dest)?;
+            fs::hard_link(&source, &dest).map_err(|e| format!("hardlink {name} -> {target}: {e}"))?;
+            continue;
+        }
+        return Err(format!(
+            "layer entry {name} type {kind:?} is not a documented difference"
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_sha(&Sha256::digest(bytes))
+}
+
+fn hex_sha(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Compare the layer's file list to `root`. A missing path, a different
+/// type, a different size, or a different hash fails prepare.
+fn audit_layer(layer: &Path, root: &Path) -> Result<(), String> {
+    let mut archive = open_layer(layer)?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read layer tar: {e}"))?;
+    let mut bootstrap = BTreeSet::new();
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let name = entry_name(&entry)?;
+        if name.is_empty() {
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        if BOOTSTRAP_LIBS.contains(&name.as_str()) && !(kind.is_file() || kind.is_contiguous()) {
+            return Err(format!(
+                "{name} is {kind:?} in the layer; refusing to substitute a bootstrap library"
+            ));
+        }
+        if layer_skipped(&name, kind) {
+            continue;
+        }
+        let dest = root.join(&name);
+        let meta = fs::symlink_metadata(&dest)
+            .map_err(|e| format!("layer path {name} is missing from the root: {e}"))?;
+        let file_type = meta.file_type();
+        if kind.is_dir() {
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(format!("{name} is not a directory in the root"));
+            }
+            if entry.size() != 0 {
+                return Err(format!("{name} directory size {} is not 0", entry.size()));
+            }
+            continue;
+        }
+        if kind.is_symlink() {
+            if !file_type.is_symlink() {
+                return Err(format!("{name} is not a symlink in the root"));
+            }
+            let image = link_text(&entry)?;
+            let got = fs::read_link(&dest)
+                .map_err(|e| format!("readlink {name}: {e}"))?
+                .to_string_lossy()
+                .into_owned();
+            let image_hash = sha256_bytes(image.as_bytes());
+            let root_hash = sha256_bytes(got.as_bytes());
+            if got != image || image_hash != root_hash || entry.size() != 0 {
+                return Err(format!(
+                    "{name} symlink target {got:?} hash {root_hash} != layer {image:?} hash {image_hash} size {}",
+                    entry.size()
+                ));
+            }
+            continue;
+        }
+        if kind.is_hard_link() {
+            let target = tar_rel(Path::new(&link_text(&entry)?));
+            let source = root.join(&target);
+            let source_meta = fs::symlink_metadata(&source)
+                .map_err(|e| format!("hardlink {name} -> {target}: {e}"))?;
+            let image_hash = sha256_bytes(target.as_bytes());
+            if meta.ino() != source_meta.ino() || entry.size() != 0 {
+                return Err(format!(
+                    "{name} is not a hardlink to {target} (hash {image_hash}, layer size {})",
+                    entry.size()
+                ));
+            }
+            continue;
+        }
+        if kind.is_file() || kind.is_contiguous() {
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(format!("{name} is not a regular file in the root"));
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("read {name}: {e}"))?;
+            if data.len() as u64 != entry.size() || meta.len() != entry.size() {
+                return Err(format!(
+                    "{name} size root {} layer {} header {}",
+                    meta.len(),
+                    data.len(),
+                    entry.size()
+                ));
+            }
+            let image_hash = sha256_bytes(&data);
+            let root_hash = sha256_file(&dest)?;
+            if image_hash != root_hash {
+                return Err(format!("{name} sha256 {root_hash} != layer {image_hash}"));
+            }
+            if BOOTSTRAP_LIBS.contains(&name.as_str()) {
+                bootstrap.insert(name);
+            }
+            continue;
+        }
+        return Err(format!(
+            "layer entry {name} type {kind:?} is not a documented difference"
+        ));
+    }
+    for lib in BOOTSTRAP_LIBS {
+        if !bootstrap.contains(*lib) {
+            return Err(format!(
+                "layer has no {lib}; refusing to invent a bootstrap library"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `372d08ff` aborted in `PropertyInit` because `/dev` and the property
@@ -477,6 +754,7 @@ fn write_provenance(
          original system/bin/init\n\
          interpreter /system/bin/bootstrap/linker64\n\
          closure transitive-dt-needed\n\
+         layer_manifest compared\n\
          {libraries}\
          {contexts}\
          dev_directory {dev}\n\
@@ -784,6 +1062,10 @@ fn first_failed_leave(stderr: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
     use super::{
         context_rel, dev_rel, first_observation, mountpoint_rel, property_area_rel, tar_rel,
     };
@@ -861,5 +1143,190 @@ mod tests {
         assert!(stopped.contains("stage unconfirmed"));
         assert!(stopped.contains("libext2_uuid.so"));
         assert!(stopped.contains("first failed syscall none"));
+    }
+
+    #[test]
+    fn layer_differences_are_the_documented_rules() {
+        use tar::EntryType;
+        assert!(super::layer_skipped(
+            "dev/__properties__",
+            EntryType::dir()
+        ));
+        assert!(super::layer_skipped(
+            "dev/__properties__/property_info",
+            EntryType::file()
+        ));
+        assert!(super::layer_skipped(
+            "linkerconfig/ld.config.txt",
+            EntryType::file()
+        ));
+        assert!(super::layer_skipped("bootstrap-apex/payload", EntryType::file()));
+        assert!(!super::layer_skipped("linkerconfig", EntryType::dir()));
+        assert!(!super::layer_skipped("bootstrap-apex", EntryType::dir()));
+        assert!(!super::layer_skipped(
+            "system/lib64/bootstrap/libc.so",
+            EntryType::file()
+        ));
+        assert!(super::layer_skipped("dev/kmsg", EntryType::character_special()));
+        assert!(super::layer_skipped("dev/block", EntryType::block_special()));
+        assert!(super::layer_skipped("dev/fifo", EntryType::fifo()));
+        assert!(!super::layer_skipped("system/bin/init", EntryType::file()));
+    }
+
+    /// The bionic root's `system/lib64/libc.so` symlink used to satisfy the
+    /// basename walk, so the regular bootstrap file was never copied.
+    #[test]
+    fn bootstrap_regular_files_are_copied_beside_the_apex_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "bionic-smoke-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        fs::create_dir_all(root.join("system/lib64")).unwrap();
+        fs::create_dir_all(root.join("linkerconfig")).unwrap();
+        fs::write(root.join("linkerconfig/ld.config.txt"), b"generated").unwrap();
+        std::os::unix::fs::symlink(
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+            root.join("system/lib64/libc.so"),
+        )
+        .unwrap();
+        let layer = dir.join("layer.tar.gz");
+        write_layer(
+            &layer,
+            &[
+                ("system/lib64/bootstrap/libc.so", Item::File(b"bootstrap-libc")),
+                ("system/lib64/bootstrap/libm.so", Item::File(b"bootstrap-libm")),
+                ("system/lib64/bootstrap/libdl.so", Item::File(b"bootstrap-libdl")),
+                (
+                    "system/lib64/bootstrap/libdl_android.so",
+                    Item::File(b"bootstrap-dl-android"),
+                ),
+                (
+                    "system/lib64/libc.so",
+                    Item::Symlink("/apex/com.android.runtime/lib64/bionic/libc.so"),
+                ),
+                ("system/bin/tool", Item::File(b"tool-bytes")),
+                ("system/bin/tool-link", Item::Hardlink("system/bin/tool")),
+                ("system/bin/init", Item::File(b"init-bytes")),
+                (
+                    "dev/__properties__/property_info",
+                    Item::File(b"not-copied"),
+                ),
+                ("linkerconfig/from-layer", Item::File(b"do-not-touch")),
+                ("bootstrap-apex/child", Item::File(b"hidden-by-tmpfs")),
+                ("system/etc/kept.so", Item::File(b"kept")),
+            ],
+        );
+        super::install_layer(&layer, &root).unwrap();
+        super::audit_layer(&layer, &root).unwrap();
+        assert_eq!(
+            fs::read(root.join("system/lib64/bootstrap/libc.so")).unwrap(),
+            b"bootstrap-libc"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("system/lib64/bootstrap/libc.so"))
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(root.join("system/lib64/bootstrap/libm.so")).unwrap(),
+            b"bootstrap-libm"
+        );
+        assert_eq!(
+            fs::read(root.join("system/lib64/bootstrap/libdl.so")).unwrap(),
+            b"bootstrap-libdl"
+        );
+        assert_eq!(
+            fs::read_link(root.join("system/lib64/libc.so")).unwrap(),
+            PathBuf::from("/apex/com.android.runtime/lib64/bionic/libc.so")
+        );
+        assert_eq!(
+            fs::read(root.join("linkerconfig/ld.config.txt")).unwrap(),
+            b"generated"
+        );
+        assert!(!root.join("linkerconfig/from-layer").exists());
+        assert!(!root.join("dev/__properties__").exists());
+        assert!(!root.join("bootstrap-apex/child").exists());
+        assert_eq!(fs::read(root.join("system/etc/kept.so")).unwrap(), b"kept");
+        let tool = fs::symlink_metadata(root.join("system/bin/tool")).unwrap();
+        let link = fs::symlink_metadata(root.join("system/bin/tool-link")).unwrap();
+        assert_eq!(tool.ino(), link.ino());
+        assert_eq!(fs::read(root.join("system/bin/tool-link")).unwrap(), b"tool-bytes");
+        fs::write(root.join("system/lib64/bootstrap/libc.so"), b"bootstrap-ZZZZ").unwrap();
+        let err = super::audit_layer(&layer, &root).unwrap_err();
+        assert!(err.contains("system/lib64/bootstrap/libc.so"), "{err}");
+        assert!(err.contains("sha256"), "{err}");
+        fs::write(root.join("system/lib64/bootstrap/libc.so"), b"bootstrap-libc").unwrap();
+        fs::remove_file(root.join("system/bin/init")).unwrap();
+        let err = super::audit_layer(&layer, &root).unwrap_err();
+        assert!(err.contains("system/bin/init"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_layer_without_bootstrap_libc_is_refused() {
+        let dir = std::env::temp_dir().join(format!("bionic-smoke-noboot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let layer = dir.join("layer.tar.gz");
+        write_layer(
+            &layer,
+            &[
+                ("system/lib64/bootstrap/libm.so", Item::File(b"m")),
+                ("system/lib64/bootstrap/libdl.so", Item::File(b"dl")),
+            ],
+        );
+        super::install_layer(&layer, &root).unwrap();
+        let err = super::audit_layer(&layer, &root).unwrap_err();
+        assert!(err.contains("system/lib64/bootstrap/libc.so"), "{err}");
+        assert!(err.contains("refusing to invent"), "{err}");
+        assert!(!root.join("system/lib64/bootstrap/libc.so").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    enum Item {
+        File(&'static [u8]),
+        Symlink(&'static str),
+        Hardlink(&'static str),
+    }
+
+    fn write_layer(path: &std::path::Path, entries: &[(&str, Item)]) {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            for (name, item) in entries {
+                let mut header = tar::Header::new_gnu();
+                match item {
+                    Item::File(bytes) => {
+                        header.set_entry_type(tar::EntryType::file());
+                        header.set_mode(0o644);
+                        header.set_size(bytes.len() as u64);
+                        header.set_cksum();
+                        builder.append_data(&mut header, name, *bytes).unwrap();
+                    }
+                    Item::Symlink(target) => {
+                        header.set_entry_type(tar::EntryType::symlink());
+                        header.set_mode(0o777);
+                        header.set_size(0);
+                        builder.append_link(&mut header, name, target).unwrap();
+                    }
+                    Item::Hardlink(target) => {
+                        header.set_entry_type(tar::EntryType::Link);
+                        header.set_mode(0o644);
+                        header.set_size(0);
+                        builder.append_link(&mut header, name, target).unwrap();
+                    }
+                }
+            }
+            builder.finish().unwrap();
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        use std::io::Write;
+        enc.write_all(&raw).unwrap();
+        fs::write(path, enc.finish().unwrap()).unwrap();
     }
 }
