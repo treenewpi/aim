@@ -14,8 +14,14 @@ layer exposes the device nodes (#167). Original init mounts binderfs
 issues `BINDER_CTL_ADD` (`0xc1086201`) on `binder-control`. The
 argument is `struct binderfs_device`: `char name[256]`, then `__u32
 major`, then `__u32 minor`. That creates `binder`, `hwbinder` and
-`vndbinder` in that mount. A name this driver has no
+`vndbinder` in that mount. The ioctl copies all 264 bytes in and, after
+the add, copies them back with major and minor written. `EINVAL` is only
+a name with no NUL in the first 255 bytes, or a `/` before that NUL. An
+existing context is `EEXIST`. A name this driver has no
 context for is `ENODEV`. A name that was not allocated is `ENOENT`.
+Init's `/dev/binder` is a symlink to `/dev/binderfs/binder` (and the
+same for `hwbinder` and `vndbinder`); opening the symlink reaches the
+node.
 Opening an allocated node with no binder host is `ENODEV`. `/dev/binder`,
 `/dev/hwbinder` and `/dev/vndbinder` are those three contexts when
 `--binder` is set, which is how the standalone servicemanager steps open

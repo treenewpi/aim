@@ -370,7 +370,15 @@ init's `/dev/binderfs/{hwbinder,binder,vndbinder}`, servicemanager's
 post-fs at 6.4s. `struct binderfs_device` is `char name[256]`, then
 `__u32 major`, then `__u32 minor` (264 bytes, the `0x108` in the ioctl).
 The name was read at offset 8. `binder` is seven bytes including its
-NUL, so that read was an empty string and `allocate` returned `EINVAL`.
+NUL, so that read was an empty string and the old `allocate` returned
+`EINVAL`. The ioctl copies all 264 bytes in and, after a successful
+add, copies them back with major and minor at offsets 256 and 260.
+`EINVAL` is only a name with no NUL in the first 255 bytes, or a `/`
+before that NUL. An existing context is `EEXIST`. The binderfs root
+then holds `binder`, `hwbinder` and `vndbinder`, and init's
+`/dev/binder` symlink to `/dev/binderfs/binder` (and the `hwbinder` and
+`vndbinder` twins) resolves to those nodes. The trace names the reason
+and the node.
 The ioctl reaches the control handler because the fd's kind is
 `BinderControl`, copied onto the pin; the host fd is `/dev/null` and
 its rdev is not `10:58`. A forked child is `linux-run --fork-child`
