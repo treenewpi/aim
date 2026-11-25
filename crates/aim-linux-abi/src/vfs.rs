@@ -486,6 +486,9 @@ pub fn refresh_fuse_mounts() -> Result<(), Errno> {
         }
         if mount_propagation(fields[0]) == Propagation::Private
             || !origin_visible(namespace.id(), receiving.as_slice(), fields[0], &origin)?
+            || mounts.iter().any(|mount| {
+                mount.guest == fields[0] && !mount.shared_fuse && !hidden(&mounts, mount)
+            })
         {
             continue;
         }
@@ -1151,6 +1154,14 @@ pub(crate) fn switch_mount_namespace(target: &Arc<MountNs>) -> Result<(), Errno>
         let _ = unpark(&current);
         return Err(error);
     }
+    // A peer may have appended mounts while this namespace was parked.
+    // The walking table is this process's, so entering the namespace
+    // replays its journal before the next lookup.
+    if let Err(error) = refresh_namespace() {
+        set_current_ns(Arc::clone(&current));
+        let _ = unpark(&current);
+        return Err(error);
+    }
     *current_task().fs.cwd.lock().unwrap() = "/".to_owned();
     Ok(())
 }
@@ -1537,6 +1548,30 @@ fn apply_namespace_state(state: aim_storage::mount_namespace::State) -> Result<(
         } else if let Some(rest) = event.strip_prefix("propagation-flags\t") {
             let (guest, flags) = rest.rsplit_once('\t').ok_or(errno::EIO)?;
             set_mount_propagation(guest, flags.parse().map_err(|_| errno::EIO)?)?;
+        } else if let Some(rest) = event.strip_prefix("propagated\t") {
+            let line = rest.lines().next().unwrap_or(rest);
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 7 {
+                return Err(errno::EINVAL);
+            }
+            let area = match fields[2] {
+                "ro" => Area::Image,
+                "rw" => Area::Writable,
+                "kernfs" => Area::Kernfs,
+                "host-device" => Area::HostDevice,
+                "input" => Area::Input,
+                _ => return Err(errno::EINVAL),
+            };
+            add_mount(
+                fields[3],
+                PathBuf::from(fields[4]),
+                area,
+                fields[5],
+                fields[6],
+            )?;
+            if let Some((_, rest)) = event.split_once('\n') {
+                load_own_mounts(rest)?;
+            }
         } else if let Some(rest) = event.strip_prefix("move\t") {
             let (from, to) = rest.split_once('\t').ok_or(errno::EIO)?;
             move_mount(from, to)?;
@@ -2902,7 +2937,16 @@ fn namespace_backend_points(id: &str) -> Result<Vec<MountPoint>, Errno> {
                     }
                     continue;
                 }
-                let fields = line.split('\t').collect::<Vec<_>>();
+                let propagated = line.strip_prefix("propagated\t");
+                let fields = if let Some(rest) = propagated {
+                    let extra = rest.split('\t').collect::<Vec<_>>();
+                    if extra.len() != 7 {
+                        return Err(errno::EINVAL);
+                    }
+                    vec![extra[2], extra[3], extra[4], extra[5], extra[6]]
+                } else {
+                    line.split('\t').collect::<Vec<_>>()
+                };
                 if fields.len() == 3 && fields[0] == "bind-source" {
                     if let Some(mount) = mounts
                         .iter_mut()
@@ -3278,6 +3322,7 @@ fn install_mount(
             event.push_str(&format!("bind-source\t{guest}\t{source}\n"));
         }
         namespace_event(&event)?;
+        propagate_created(guest)?;
         if let Some(route) = &route {
             publish_fuse_route(guest, &host, source, Some(route))?;
         } else {
@@ -3410,6 +3455,130 @@ pub fn remount_fuse(guest: &str, read_only: bool) -> Result<bool, Errno> {
     Ok(true)
 }
 
+/// Namespaces that receive a mount or unmount under `guest`.
+///
+/// The containing mount is the parent, unless `guest` is that mount. A
+/// shared containing mount propagates to its peers and to its slaves.
+/// A private or slave mount sends nothing.
+fn propagation_peers(guest: &str) -> Result<Vec<aim_storage::mount_namespace::Namespace>, Errno> {
+    if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
+        return Ok(Vec::new());
+    }
+    let Some(owner) = NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.clone())
+    else {
+        return Ok(Vec::new());
+    };
+    let state = owner.read().map_err(namespace_error)?;
+    let Some(mount) = state
+        .mounts
+        .iter()
+        .filter(|mount| mount.guest == guest)
+        .max_by_key(|mount| mount.id)
+    else {
+        return Ok(Vec::new());
+    };
+    let group = if mount.parent != mount.id {
+        state
+            .mounts
+            .iter()
+            .find(|parent| parent.id == mount.parent)
+            .filter(|parent| parent.shared != 0)
+            .map(|parent| parent.shared)
+    } else {
+        (mount.shared != 0).then_some(mount.shared)
+    };
+    let Some(group) = group else {
+        return Ok(Vec::new());
+    };
+    let runtime = owner.runtime().to_path_buf();
+    let mut peers = Vec::new();
+    for id in aim_storage::mount_namespace::Namespace::ids(&runtime).map_err(namespace_error)? {
+        if id == owner.id() {
+            continue;
+        }
+        let peer = aim_storage::mount_namespace::Namespace::open(&runtime, &id)
+            .map_err(namespace_error)?;
+        let peer_state = peer.read().map_err(namespace_error)?;
+        if peer_state
+            .mounts
+            .iter()
+            .any(|mount| mount.shared == group || mount.master == group)
+        {
+            peers.push(peer);
+        }
+    }
+    Ok(peers)
+}
+
+fn fanout(
+    peers: &[aim_storage::mount_namespace::Namespace],
+    event: &str,
+) -> Result<(), Errno> {
+    for peer in peers {
+        peer.append(event).map_err(namespace_error)?;
+    }
+    Ok(())
+}
+
+/// Copy the mount just created at `guest` into every peer of its parent.
+fn propagate_created(guest: &str) -> Result<(), Errno> {
+    let peers = propagation_peers(guest)?;
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let owner = NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.clone())
+        .ok_or(errno::ENODEV)?;
+    let state = owner.read().map_err(namespace_error)?;
+    let record = state
+        .mounts
+        .iter()
+        .filter(|mount| mount.guest == guest)
+        .max_by_key(|mount| mount.id)
+        .ok_or(errno::ENOENT)?;
+    let group = state
+        .mounts
+        .iter()
+        .find(|mount| mount.id == record.parent)
+        .map(|parent| parent.shared)
+        .unwrap_or(0);
+    for peer in &peers {
+        let peer_state = peer.read().map_err(namespace_error)?;
+        let Some(receiver) = peer_state
+            .mounts
+            .iter()
+            .filter(|mount| mount.shared == group || mount.master == group)
+            .max_by_key(|mount| (mount.guest.len(), mount.id))
+        else {
+            continue;
+        };
+        let (shared, master) = if receiver.shared == group {
+            (record.shared, record.master)
+        } else if receiver.shared == 0 {
+            (0, record.shared)
+        } else {
+            (
+                peer.propagated_group(record.id, receiver.shared)
+                    .map_err(namespace_error)?,
+                record.shared,
+            )
+        };
+        peer.append(&format!(
+            "propagated\t{shared}\t{master}\t{}\t{}\t{}\t{}\t{}",
+            record.kind, record.guest, record.host, record.source, record.fstype
+        ))
+        .map_err(namespace_error)?;
+    }
+    Ok(())
+}
+
 /// Remove the latest mount this process made at `guest`.
 pub fn remove_mount(guest: &str) -> Result<bool, Errno> {
     refresh_namespace()?;
@@ -3423,7 +3592,9 @@ pub fn remove_mount(guest: &str) -> Result<bool, Errno> {
         {
             return Ok(false);
         }
+        let peers = propagation_peers(guest)?;
         namespace_event(&format!("remove\t{guest}"))?;
+        fanout(&peers, &format!("remove\t{guest}"))?;
         publish_fuse_route(guest, Path::new(""), "", None)?;
         return Ok(true);
     }
@@ -3486,7 +3657,9 @@ pub fn detach_mount(guest: &str) -> Result<bool, Errno> {
             .collect::<Vec<_>>()
     };
     if !REPLAYING_NAMESPACE.with(std::cell::Cell::get) && mount_namespace_id().is_some() {
+        let peers = propagation_peers(guest)?;
         namespace_event(&format!("detach\t{guest}"))?;
+        fanout(&peers, &format!("detach\t{guest}"))?;
         for mount in detached.iter().filter(|mount| mount.shared_fuse) {
             publish_fuse_route(&mount.guest, Path::new(""), "", None)?;
         }
@@ -3527,7 +3700,9 @@ pub fn move_mount(from: &str, to: &str) -> Result<bool, Errno> {
         if !moved.iter().any(|mount| mount.guest == from) {
             return Ok(false);
         }
+        let peers = propagation_peers(from)?;
         namespace_event(&format!("move\t{from}\t{to}"))?;
+        fanout(&peers, &format!("move\t{from}\t{to}"))?;
         for mount in moved {
             if mount.shared_fuse {
                 publish_fuse_route(&mount.guest, Path::new(""), "", None)?;

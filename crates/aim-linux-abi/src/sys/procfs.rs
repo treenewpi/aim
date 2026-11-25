@@ -3710,6 +3710,9 @@ mod tests {
         assert_ne!(default_link, boot_link);
         assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
 
+        // The mounts below name the namespace. `/` is shared until told
+        // otherwise, so this tree is made private before them.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
         let host = root.join("ns-default");
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
@@ -3845,6 +3848,9 @@ mod tests {
         let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
         let default_link = ns_text("/proc/self/ns/mnt");
         assert_ne!(default_link, boot_link);
+        // The mounts below name the namespace. `/` is shared until told
+        // otherwise, so this tree is made private before them.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
         let host = root.join("ns-default");
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(
@@ -4223,6 +4229,9 @@ mod tests {
         let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
         assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
 
+        // The other thread stays in the bootstrap namespace. This tree is
+        // made private so the mount is not a peer of that namespace.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
         let host = root.join("ns-other-thread");
         std::fs::create_dir_all(&host).unwrap();
         crate::vfs::add_mount(

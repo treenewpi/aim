@@ -50,6 +50,27 @@ impl Namespace {
     pub fn id(&self) -> &str {
         &self.id
     }
+    /// Every namespace journal in `runtime`, in directory order.
+    pub fn ids(runtime: &Path) -> io::Result<Vec<String>> {
+        let directory = runtime.join("mount-namespaces");
+        let mut ids = Vec::new();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(id) = name.strip_suffix(".state") {
+                ids.push(id.to_owned());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
     pub fn runtime(&self) -> &Path {
         &self.runtime
     }

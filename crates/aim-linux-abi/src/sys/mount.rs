@@ -2,11 +2,11 @@
 //!
 //! zygote unshares its mount namespace and mounts storage views for each
 //! child (`MountEmulatedStorage`, app data isolation): bind mounts and
-//! tmpfs. Here a process's mounts are entries of its own path table
-//! (`vfs::add_mount`), inherited by fork and carried over exec
-//! (`--mounts`), so every process behaves as if it had unshared: nothing
-//! propagates to other processes. The other namespaces are answered
-//! "unsupported" (ADR 0012 appendix).
+//! tmpfs. `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` and `MS_REC` change the
+//! mount they name. `unshare(CLONE_NEWNS)` keeps a shared mount in that
+//! peer group. A later mount or unmount under a shared mount is applied
+//! in the peers and the slaves of that group. A private mount is not.
+//! The other namespaces are answered "unsupported" (ADR 0012 appendix).
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -474,5 +474,242 @@ mod tests {
         // The stubs zygote gave root's owner did not change the app's.
         assert_eq!(owner("/data/data/com.example"), Some(APP as u32));
         assert_eq!(owner("/data/user/0/com.example"), Some(APP as u32));
+    }
+
+    fn propagation_line(guest: &str) -> String {
+        vfs::own_mounts_text()
+            .lines()
+            .find(|line| *line == format!("propagation\t{guest}\tshared")
+                || *line == format!("propagation\t{guest}\tslave")
+                || *line == format!("propagation\t{guest}\tprivate")
+                || line.starts_with(&format!("propagation\t{guest}\t")))
+            .unwrap_or("(no propagation rule)")
+            .to_owned()
+    }
+
+    fn mount_line(guest: &str) -> Option<String> {
+        vfs::own_mounts_text()
+            .lines()
+            .find(|line| {
+                let mut fields = line.split('\t');
+                let _kind = fields.next();
+                fields.next() == Some(guest)
+            })
+            .map(str::to_owned)
+    }
+
+    fn journal_events() -> Vec<String> {
+        let text = vfs::own_mounts_text();
+        let id = text
+            .lines()
+            .find_map(|line| line.strip_prefix("namespace-owner\t"))
+            .unwrap();
+        let runtime = text
+            .lines()
+            .find_map(|line| line.strip_prefix("namespace-runtime\t"))
+            .unwrap();
+        aim_storage::mount_namespace::Namespace::open(std::path::Path::new(runtime), id)
+            .unwrap()
+            .read()
+            .unwrap()
+            .events
+    }
+
+    fn shared_id(guest: &str) -> u64 {
+        vfs::mount_points()
+            .unwrap_or_else(|error| panic!("mount_points errno={error}"))
+            .into_iter()
+            .filter(|point| point.guest == guest)
+            .map(|point| point.shared)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `SetupMountNamespaces` then apexd-bootstrap, as Android init runs it.
+    ///
+    /// `/` is made slave and then shared. The `/apex` tmpfs is mounted and
+    /// made `MS_SHARED|MS_REC`. `unshare(CLONE_NEWNS)` copies that peer
+    /// group into the default namespace. A later mount under `/apex` in
+    /// the bootstrap namespace is visible in the default namespace, and
+    /// unmounting it removes it from both. A mount whose parent was made
+    /// private stays in the namespace that created it.
+    #[test]
+    fn apex_mounts_propagate_from_the_bootstrap_namespace() {
+        let (_view, root) = vfs::test_view();
+        std::fs::create_dir_all(root.join("root/apex")).unwrap();
+        std::fs::create_dir_all(host("/data/peer")).unwrap();
+        let boot = super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let slave = MS_SLAVE | 0x4000;
+        let shared = MS_SHARED | 0x4000;
+        let private = MS_PRIVATE | 0x4000;
+        let slash = at("/");
+        let apex = at("/apex");
+        let tmpfs = at("tmpfs");
+        let mode = at("mode=0755");
+        assert_eq!(mount([0, p(&slash), 0, slave, 0, 0]), 0, "MS_SLAVE|MS_REC /");
+        assert_eq!(
+            mount([0, p(&slash), 0, shared, 0, 0]),
+            0,
+            "MS_SHARED|MS_REC /"
+        );
+        assert_eq!(
+            mount([p(&tmpfs), p(&apex), p(&tmpfs), 0, p(&mode), 0]),
+            0,
+            "mount tmpfs /apex"
+        );
+        assert_eq!(
+            mount([0, p(&apex), 0, shared, 0, 0]),
+            0,
+            "MS_SHARED|MS_REC /apex ({})",
+            propagation_line("/apex")
+        );
+        assert!(
+            propagation_line("/apex").ends_with("\tshared")
+                || (propagation_line("/").ends_with("\tshared")
+                    && !propagation_line("/apex").ends_with("\tprivate")
+                    && !propagation_line("/apex").ends_with("\tslave")),
+            "journal recorded /apex private: {}\n{}",
+            propagation_line("/apex"),
+            vfs::own_mounts_text()
+        );
+        let apex_group = shared_id("/apex");
+        assert_ne!(apex_group, 0, "MS_SHARED left /apex with no peer group");
+
+        assert_eq!(unshare([CLONE_NEWNS, 0, 0, 0, 0, 0]), 0);
+        let default_ns =
+            super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            shared_id("/apex"),
+            apex_group,
+            "unshare dropped /apex out of its peer group\n{}",
+            vfs::own_mounts_text()
+        );
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+
+        let runtime = at("/apex/com.android.runtime");
+        assert_eq!(
+            fsops::mkdirat([LINUX_AT_FDCWD as u64, p(&runtime), 0o755, 0, 0, 0]),
+            0,
+            "mkdir /apex/com.android.runtime"
+        );
+        assert_eq!(
+            mount([p(&tmpfs), p(&runtime), p(&tmpfs), 0, p(&mode), 0]),
+            0,
+            "mount under /apex"
+        );
+        let marker = host("/apex/com.android.runtime");
+        assert_ne!(
+            marker,
+            host("/apex").join("com.android.runtime"),
+            "creating namespace does not walk the new mount\n{}",
+            vfs::own_mounts_text()
+        );
+        let marker = marker.join("linker64");
+        std::fs::write(&marker, b"runtime").unwrap();
+        let child_group = shared_id("/apex/com.android.runtime");
+        assert_ne!(
+            child_group, 0,
+            "a mount under shared /apex got no peer group\n{}",
+            vfs::own_mounts_text()
+        );
+
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        let propagated = journal_events();
+        assert!(
+            propagated.iter().any(|event| {
+                event.starts_with(&format!("propagated\t{child_group}\t"))
+                    && event.contains("\t/apex/com.android.runtime\t")
+            }),
+            "default journal has no peer of the apex mount\n{propagated:?}"
+        );
+        let seen = host("/apex/com.android.runtime/linker64");
+        assert_eq!(
+            std::fs::read(&seen).ok(),
+            Some(b"runtime".to_vec()),
+            "default namespace did not receive the /apex mount\n{}",
+            vfs::own_mounts_text()
+        );
+        // A fork child reloads the namespace journal rather than the
+        // parent's in-memory table. The propagated mount has to be in
+        // that journal, or the child sees the empty /apex tmpfs.
+        let inherited = vfs::fork_mounts_text(false).unwrap();
+        vfs::load_own_mounts(&inherited).unwrap();
+        let reloaded = vfs::own_mounts_text();
+        assert!(
+            reloaded.contains("/apex/com.android.runtime"),
+            "child reload dropped the propagated mount\n{reloaded}"
+        );
+        let child = vfs::resolve(LINUX_AT_FDCWD, b"/apex/com.android.runtime/linker64", true)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "child linker64 errno={error} ({})\n{reloaded}",
+                    super::super::names::errno_name(error)
+                )
+            });
+        assert_eq!(
+            std::fs::read(OsStr::from_bytes(child.host.as_bytes())).ok(),
+            Some(b"runtime".to_vec()),
+            "child reload walks {} rather than the propagated mount\n{reloaded}",
+            child.host.to_string_lossy()
+        );
+        assert_eq!(
+            shared_id("/apex/com.android.runtime"),
+            child_group,
+            "propagated mount is not in the creating mount's peer group"
+        );
+
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert_eq!(umount2([p(&runtime), 0, 0, 0, 0, 0]), 0, "umount apex child");
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert!(
+            mount_line("/apex/com.android.runtime").is_none(),
+            "umount did not propagate\n{}",
+            vfs::own_mounts_text()
+        );
+        let again = vfs::resolve(LINUX_AT_FDCWD, b"/apex/com.android.runtime/linker64", true)
+            .expect("lookup");
+        assert!(
+            std::fs::read(OsStr::from_bytes(again.host.as_bytes())).is_err(),
+            "default namespace still reads the unmounted apex at {}\n{}",
+            again.host.to_string_lossy(),
+            vfs::own_mounts_text()
+        );
+
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        let peer = at("/data/peer");
+        assert_eq!(mount([p(&tmpfs), p(&peer), p(&tmpfs), 0, p(&mode), 0]), 0);
+        assert_eq!(mount([0, p(&peer), 0, private, 0, 0]), 0, "MS_PRIVATE|MS_REC");
+        let hidden = at("/data/peer/hidden");
+        assert_eq!(
+            fsops::mkdirat([LINUX_AT_FDCWD as u64, p(&hidden), 0o755, 0, 0, 0]),
+            0
+        );
+        assert_eq!(mount([p(&tmpfs), p(&hidden), p(&tmpfs), 0, p(&mode), 0]), 0);
+        std::fs::write(host("/data/peer/hidden").join("secret"), b"no").unwrap();
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert!(
+            mount_line("/data/peer/hidden").is_none(),
+            "a private mount propagated\n{}",
+            vfs::own_mounts_text()
+        );
+        let secret =
+            vfs::resolve(LINUX_AT_FDCWD, b"/data/peer/hidden/secret", true).expect("lookup");
+        assert!(
+            std::fs::read(OsStr::from_bytes(secret.host.as_bytes())).is_err(),
+            "a private mount's file is visible at {}\n{}",
+            secret.host.to_string_lossy(),
+            vfs::own_mounts_text()
+        );
+
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        for dir in ["/data/peer/hidden", "/data/peer", "/apex"] {
+            let t = at(dir);
+            assert_eq!(umount2([p(&t), MNT_DETACH, 0, 0, 0, 0]), 0, "cleanup {dir}");
+        }
+        assert_eq!(
+            super::super::fs::close([default_ns as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(super::super::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
     }
 }

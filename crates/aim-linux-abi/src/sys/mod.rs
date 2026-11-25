@@ -223,10 +223,16 @@ pub(crate) fn guest_cstr(p: u64) -> Result<Vec<u8>, crate::errno::Errno> {
     user_memory::read_cstr(p, user_memory::PATH_MAX)
 }
 
-/// One traced argument. `mount` (40) is `source, target, fstype, flags, data`;
-/// the four strings are decoded, and a null `data` pointer stays `NULL`.
+/// One traced argument. `mount` (40) is `source, target, fstype, flags, data`.
+/// A null pointer is `NULL`. The flag word is decoded.
 fn trace_arg(nr: u64, index: usize, value: u64) -> String {
-    let string = (nr == 40 && matches!(index, 0 | 1 | 2 | 4) && !(index == 4 && value == 0))
+    if nr == 40 && matches!(index, 0 | 1 | 2 | 4) && value == 0 {
+        return "NULL".to_owned();
+    }
+    if nr == 40 && index == 3 {
+        return mount_flags(value);
+    }
+    let string = (nr == 40 && matches!(index, 0 | 1 | 2 | 4))
         || (path_arg(nr) == Some(index) && nr != 17);
     if string {
         return match guest_cstr(value) {
@@ -239,6 +245,54 @@ fn trace_arg(nr: u64, index: usize, value: u64) -> String {
     } else {
         format!("{value:#x}")
     }
+}
+
+fn mount_flags(flags: u64) -> String {
+    const NAMED: &[(u64, &str)] = &[
+        (1, "MS_RDONLY"),
+        (2, "MS_NOSUID"),
+        (4, "MS_NODEV"),
+        (8, "MS_NOEXEC"),
+        (16, "MS_SYNCHRONOUS"),
+        (32, "MS_REMOUNT"),
+        (64, "MS_MANDLOCK"),
+        (128, "MS_DIRSYNC"),
+        (1024, "MS_NOATIME"),
+        (2048, "MS_NODIRATIME"),
+        (4096, "MS_BIND"),
+        (8192, "MS_MOVE"),
+        (1 << 14, "MS_REC"),
+        (1 << 15, "MS_SILENT"),
+        (1 << 16, "MS_POSIXACL"),
+        (1 << 17, "MS_UNBINDABLE"),
+        (1 << 18, "MS_PRIVATE"),
+        (1 << 19, "MS_SLAVE"),
+        (1 << 20, "MS_SHARED"),
+        (1 << 21, "MS_RELATIME"),
+        (1 << 22, "MS_KERNMOUNT"),
+        (1 << 23, "MS_I_VERSION"),
+        (1 << 24, "MS_STRICTATIME"),
+        (1 << 25, "MS_LAZYTIME"),
+    ];
+    if flags == 0 {
+        return "0".to_owned();
+    }
+    let mut left = flags;
+    let mut names = Vec::new();
+    for (bit, name) in NAMED {
+        if flags & bit != 0 {
+            names.push(*name);
+            left &= !bit;
+        }
+    }
+    let mut text = names.join("|");
+    if left != 0 {
+        if !text.is_empty() {
+            text.push('|');
+        }
+        text.push_str(&format!("{left:#x}"));
+    }
+    text
 }
 
 /// Syscalls whose first or second argument is a path, for tracing.
@@ -588,6 +642,22 @@ pub unsafe fn fgetpath(fd: i32, buf: *mut u8) -> i32 {
             *buf.add(bytes.len()) = 0;
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::trace_arg;
+
+    #[test]
+    fn mount_trace_prints_null_and_decoded_flags() {
+        assert_eq!(trace_arg(40, 0, 0), "NULL");
+        assert_eq!(trace_arg(40, 2, 0), "NULL");
+        assert_eq!(trace_arg(40, 4, 0), "NULL");
+        assert_eq!(trace_arg(40, 3, 0), "0");
+        assert_eq!(trace_arg(40, 3, (1 << 20) | (1 << 14)), "MS_REC|MS_SHARED");
+        assert_eq!(trace_arg(40, 3, (1 << 19) | (1 << 14)), "MS_REC|MS_SLAVE");
+        assert_eq!(crate::sys::names::errno_name(19), "ENODEV");
     }
 }
 

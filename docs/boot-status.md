@@ -391,11 +391,28 @@ which then waits for `apexd.status` `activated`. `on zygote-start` is
 queued after that and starts zygote; `on nonencrypted` does
 `class_start main`, which starts mediaserver. linkerconfig's
 `ld.config.txt` names those APEX directories. They are absent until
-apexd mounts them, so the linker reports the libraries missing. logd is
-`start logd` in the early-init action. Exit 127 is still that service's
-status: init's child `_exit(127)` after `execve` fails, and a failed
-`execve` is traced with the path and errno. This fix is not
-Mac-remeasured. The pinned layer has 35
+apexd mounts them, so the linker reports the libraries missing. `4f2593f1b36261a6ba6109650b844c7a595a4c63` (archive SHA256
+`64cc6c39f4cee6b0d9ebca02de2d32c3f502efc17c97e6a89a914c9bd6c08271`)
+remeasured that name fix. `BINDER_CTL_ADD` returned 0 three times. init,
+servicemanager, hwservicemanager and vold opened binder. vold stayed up
+and init reached post-fs-data. `setns` into the default mount namespace
+returned 0, the linkerconfig bind ran, and kmsg said `Switched to default
+mount namespace`. Every fork child then failed
+`/apex/com.android.runtime/bin/linker64` with errno 19 (the trace printed
+`(E?)`) and `/apex` still the empty tmpfs copied at `unshare`. vdc, logd
+and apexd failed the same way (exit 127) and init rebooted
+`reboot,apexd-failed` at 6.2s. `/` and the `/apex` tmpfs are
+`MS_SHARED|MS_REC` before that `unshare`, so the copy stays in the peer
+group and a later mount or umount under `/apex` in the bootstrap namespace
+is written into the default namespace's journal. A private parent does
+not propagate. `mount` traces a null source, fstype or data pointer as
+`NULL` and decodes the flag word. errno 19 is `ENODEV`. The first logd
+`execve` in that archive returned `-13` `EACCES`. That return is
+`classify`: the file is not a regular file, or the host `access(X_OK)`
+fails on the host mode as the host uid. File capabilities and a security
+label are not checked there. A directory on the walk can also return
+`EACCES` for the guest identity, and logd's service uid is 1036. This
+propagation change is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
