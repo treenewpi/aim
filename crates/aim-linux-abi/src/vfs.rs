@@ -26,7 +26,7 @@ use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::errno::{self, Errno};
@@ -1207,24 +1207,47 @@ impl Drop for MountsWrite<'_> {
 
 /// `ns->event` for this process's mount namespace (`touch_mnt_namespace`).
 static MOUNT_EVENT: AtomicU64 = AtomicU64::new(0);
-static MOUNT_WAKE: OnceLock<(i32, i32)> = OnceLock::new();
+static MOUNT_WAKE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static MOUNT_WAKE_ERRNO: AtomicI32 = AtomicI32::new(0);
+/// Tests force the wake pipe closed. A failure is not remembered: the next
+/// call creates the pipe again.
+#[cfg(test)]
+static FAIL_MOUNT_WAKE: AtomicBool = AtomicBool::new(false);
 
 /// The mount generation an open `/proc/mounts` file samples (`p->event`).
 pub fn mount_event() -> u64 {
     MOUNT_EVENT.load(Ordering::Acquire)
 }
 
+/// A fork child starts from the parent's generation, so a copied `p->event`
+/// does not become a new edge.
+pub(crate) fn restore_mount_event(event: u64) {
+    MOUNT_EVENT.store(event, Ordering::Release);
+}
+
 /// Read end of the pipe `note_mount_table` writes. Hidden from the guest.
+/// Negative when the pipe cannot be created; the errno is
+/// [`mount_wake_errno`]. A failed attempt is not cached.
 pub fn mount_wake_fd() -> i32 {
-    mount_wake().0
+    match mount_wake() {
+        Ok((read, _)) => read,
+        Err(error) => {
+            MOUNT_WAKE_ERRNO.store(error, Ordering::Release);
+            -1
+        }
+    }
+}
+
+/// Errno from the last failed [`mount_wake_fd`].
+pub fn mount_wake_errno() -> i32 {
+    MOUNT_WAKE_ERRNO.load(Ordering::Acquire)
 }
 
 /// Drop bytes left by a generation a waiter has already observed.
 pub fn drain_mount_wake() {
-    let fd = mount_wake().0;
-    if fd < 0 {
+    let Ok((fd, _)) = mount_wake() else {
         return;
-    }
+    };
     let mut buf = [0u8; 64];
     // SAFETY: our nonblocking pipe, local buffer.
     unsafe {
@@ -1232,34 +1255,49 @@ pub fn drain_mount_wake() {
     }
 }
 
-fn mount_wake() -> (i32, i32) {
-    *MOUNT_WAKE.get_or_init(|| {
-        let mut fds = [0; 2];
-        // SAFETY: a private pipe, then moved out of the guest fd range.
-        unsafe {
-            if libc::pipe(fds.as_mut_ptr()) != 0 {
-                return (-1, -1);
-            }
-            for fd in fds {
-                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
+fn mount_wake() -> Result<(i32, i32), i32> {
+    #[cfg(test)]
+    if FAIL_MOUNT_WAKE.load(Ordering::Relaxed) {
+        return Err(crate::errno::EMFILE);
+    }
+    let mut slot = MOUNT_WAKE.lock().unwrap();
+    if let Some(fds) = *slot {
+        return Ok(fds);
+    }
+    let mut fds = [0; 2];
+    // SAFETY: a private pipe, then moved out of the guest fd range.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(crate::errno::last());
         }
-        (
-            crate::sys::fdtab::hide(fds[0]),
-            crate::sys::fdtab::hide(fds[1]),
-        )
-    })
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    let pair = (
+        crate::sys::fdtab::hide(fds[0]),
+        crate::sys::fdtab::hide(fds[1]),
+    );
+    *slot = Some(pair);
+    Ok(pair)
+}
+
+/// Make `mount_wake` fail with `EMFILE` until cleared. The generation still
+/// moves; only the wake pipe is absent.
+#[cfg(test)]
+pub(crate) fn testing_fail_mount_wake(fail: bool) {
+    FAIL_MOUNT_WAKE.store(fail, Ordering::Relaxed);
 }
 
 /// Bump `ns->event` and wake mount-file pollers. Several notes before a
-/// poll are one edge: the file stores the generation it observes.
+/// poll are one edge: the file stores the generation it observes. The
+/// generation moves even when the pipe cannot be written.
 fn note_mount_table() {
     MOUNT_EVENT.fetch_add(1, Ordering::Release);
-    let fd = mount_wake().1;
-    if fd < 0 {
+    let Ok((_, fd)) = mount_wake() else {
         return;
-    }
+    };
     let byte = [1u8];
     // SAFETY: our nonblocking pipe. A full buffer already has a wake pending.
     unsafe {

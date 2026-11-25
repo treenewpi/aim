@@ -482,6 +482,16 @@ fn host_poll(fds: &mut [libc::pollfd], ms: i32, mask: u64) -> i64 {
 #[cfg(test)]
 thread_local! {pub(super) static BEFORE_WAIT:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};}
 
+/// A blocking mount wait with no wake pipe returns the pipe errno. A zero
+/// timeout does not: it reports only the generation `mounts_poll` sees.
+fn mount_wait_error(any_mount: bool, ready: bool, left: i32) -> Option<i64> {
+    if any_mount && !ready && left != 0 && super::procfs::mount_wake_fd() < 0 {
+        Some(-(super::procfs::mount_wake_errno() as i64))
+    } else {
+        None
+    }
+}
+
 pub fn ppoll(a: [u64; 6]) -> i64 {
     let (fds, nfds, ts, mask) = (a[0], a[1], a[2], a[3]);
     if nfds > 1 << 20 {
@@ -639,6 +649,9 @@ pub fn ppoll(a: [u64; 6]) -> i64 {
                     bits & (entry.events | POLLERR | POLLHUP | POLLNVAL) != 0
                 })
             });
+        if let Some(error) = mount_wait_error(any_mount, mounts_ready, left) {
+            return error;
+        }
         // Darwin poll waits for a socket's pending error only through a
         // read or write event (filt_soread, filt_sowrite), which
         // `sock_poll` reports whatever was asked, and never reports an
@@ -839,6 +852,9 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
                 super::procfs::mount_poll_bits(fd as i32)
                     .is_some_and(|bits| bits & (asked | POLLERR | POLLHUP) != 0)
             });
+        if let Some(error) = mount_wait_error(any_mount, mounts_ready, left) {
+            return error;
+        }
         // Darwin never reports what a socket polls from state this layer
         // keeps, nor an error a recvmmsg kept, for the sets asked:
         // POLLIN_SET (IN, HUP, ERR) and POLLOUT_SET (OUT, ERR), not

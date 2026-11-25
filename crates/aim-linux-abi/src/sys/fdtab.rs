@@ -1512,6 +1512,7 @@ pub(super) fn restore_kqueue(fd: i32, source: i32) -> Result<(), crate::errno::E
 
 pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
     let mut records = Vec::new();
+    let mut mount_ids: Vec<*const ()> = Vec::new();
     for (fd, kind) in TABLE.read().unwrap().iter() {
         if !visible(*fd) {
             continue;
@@ -1556,8 +1557,30 @@ pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
                 "signal\t{fd}\t{}",
                 super::signalfd::shared(description).as_raw_fd()
             )),
+            Kind::Content => {
+                let Some(ptr) = super::procfs::mount_poll_ptr(*fd) else {
+                    continue;
+                };
+                let Some((info, seen, filled)) = super::procfs::mount_poll_record(*fd) else {
+                    continue;
+                };
+                let id = match mount_ids.iter().position(|have| *have == ptr) {
+                    Some(id) => id,
+                    None => {
+                        mount_ids.push(ptr);
+                        mount_ids.len() - 1
+                    }
+                };
+                records.push(format!(
+                    "mounts\t{fd}\t{id}\t{}\t{seen}\t{filled}",
+                    u8::from(info)
+                ));
+            }
             _ => {}
         }
+    }
+    if !mount_ids.is_empty() {
+        records.push(format!("mountevent\t{}", crate::vfs::mount_event()));
     }
     Ok(records.join("\n"))
 }
@@ -1615,8 +1638,39 @@ pub(crate) fn prepare_regular_exec() -> Result<ExecWriterFlags, crate::errno::Er
 pub(crate) fn restore_regular_exec(text: &str) -> Result<(), crate::errno::Errno> {
     let mut inherited = Vec::new();
     let mut signals = std::collections::HashMap::new();
+    let mut mounts = super::procfs::MountPollCache::new();
     for line in text.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.first() == Some(&"mountevent") {
+            if fields.len() != 2 {
+                return Err(crate::errno::EINVAL);
+            }
+            let event = fields[1]
+                .parse::<u64>()
+                .map_err(|_| crate::errno::EINVAL)?;
+            crate::vfs::restore_mount_event(event);
+            continue;
+        }
+        if fields.first() == Some(&"mounts") {
+            if fields.len() != 6 {
+                return Err(crate::errno::EINVAL);
+            }
+            let fd = fields[1].parse::<i32>().map_err(|_| crate::errno::EINVAL)?;
+            let id = fields[2].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            let info = match fields[3] {
+                "1" => true,
+                "0" => false,
+                _ => return Err(crate::errno::EINVAL),
+            };
+            let seen = fields[4].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            let filled = fields[5]
+                .parse::<u64>()
+                .map_err(|_| crate::errno::EINVAL)?;
+            require_guest_visible(fd)?;
+            super::procfs::restore_mount_exec(&mut mounts, fd, id, info, seen, filled);
+            insert(fd, Kind::Content);
+            continue;
+        }
         if fields.first() == Some(&"spath") {
             if fields.len() != 4 {
                 return Err(crate::errno::EINVAL);
@@ -2062,7 +2116,13 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             | Kind::ProxyFile
             | Kind::ProcMem(_)
             | Kind::Path(_) => std::ptr::null(),
-            Kind::Content | Kind::Evdev(_) | Kind::Binder(_) => continue,
+            // A mount file's cursor is the open file, shared by dup. Another
+            // content file stays the parent's.
+            Kind::Content => match super::procfs::mount_poll_ptr(*fd) {
+                Some(ptr) => ptr,
+                None => continue,
+            },
+            Kind::Evdev(_) | Kind::Binder(_) => continue,
         };
         let (i, new) = match objects.iter().position(|&o| !p.is_null() && o == p) {
             Some(i) => (i, false),
@@ -2176,7 +2236,11 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 w.u32(21);
                 pidfd.save(w);
             }
-            Kind::Content | Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
+            Kind::Content => {
+                w.u32(23);
+                super::procfs::save_mount_poll(fd, w);
+            }
+            Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
         }
     });
     // Private targets are installed from the explicit fork receipt before the
@@ -2186,17 +2250,25 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
         w.i32(fd)
     });
     super::fasync::fork_save(w);
+    // The child's mount generation, so a copied `p->event` is not a new edge.
+    w.u64(crate::vfs::mount_event());
 }
 
 pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
     let mut objects: Vec<Kind> = Vec::new();
+    let mut mount_files: Vec<Option<Arc<super::procfs::MountPoll>>> = Vec::new();
+    let mut pending_mount = None;
     let mut inherited_writers = Vec::new();
     let entries = r.seq(|r| {
         let fd = r.i32();
         let i = r.u64() as usize;
         if !r.bool() {
+            if let Some(Some(poll)) = mount_files.get(i) {
+                super::procfs::install_mount_poll(fd, Arc::clone(poll));
+            }
             return (fd, objects.get(i).cloned());
         }
+        pending_mount = None;
         let k = match r.u32() {
             0 => Kind::Event(event::load_event(r)),
             1 => Kind::Timer(event::load_timer(r)),
@@ -2301,9 +2373,16 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                     }
                 }
             }
+            23 => {
+                let poll = super::procfs::load_mount_poll(r);
+                super::procfs::install_mount_poll(fd, Arc::clone(&poll));
+                pending_mount = Some(poll);
+                Kind::Content
+            }
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
+        mount_files.push(pending_mount.take());
         (fd, Some(k))
     });
     for (fd, k) in entries {
@@ -2339,6 +2418,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
             }
         }
     }
+    crate::vfs::restore_mount_event(r.u64());
 }
 
 /// Fork child: hide the parent's hidden fds that came along, beside this

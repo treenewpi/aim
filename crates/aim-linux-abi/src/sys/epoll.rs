@@ -134,6 +134,10 @@ struct Interest {
     /// until the socket leaves `TCP_CLOSE`. Some(0) once an edge-triggered
     /// interest in a bpf map was reported ([`polled_maps`]).
     reported: Option<u32>,
+    /// An edge-triggered mount file has not yet delivered the `EPOLLIN`
+    /// `mounts_poll` always reports. Level-triggered interests stay fresh:
+    /// `ep_send_events` puts them back on the ready list.
+    mount_fresh: bool,
 }
 
 impl Interest {
@@ -196,6 +200,7 @@ fn pty_ctl(
             disabled: false,
             seen: 0,
             reported: None,
+            mount_fresh: true,
         })
     };
     let mut retired = None;
@@ -543,6 +548,7 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
             disabled: false,
             seen: 0,
             reported: None,
+            mount_fresh: true,
         })
     } else {
         None
@@ -626,6 +632,13 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
     drop(reaps);
     drop(interest);
     drop((alias, stale));
+    if new.is_some() && super::procfs::is_mount_poll(fd) {
+        // `ep_insert` and `ep_modify` call `vfs_poll`. `mounts_poll` stores
+        // `ns->event` before `ep_item_poll` masks, so a change between open
+        // and this ctl is consumed. `ep_send_events` polls again and does
+        // not deliver that edge.
+        let _ = super::procfs::take_mount_edge(fd);
+    }
     trace_ctl(epfd, op, fd, new.or(old));
     0
 }
@@ -845,7 +858,10 @@ fn polled_maps(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
 
 /// Armed interests in a proc mount file whose `mounts_poll` reports
 /// something this interest asked for. The edge is not consumed here; the
-/// waiter that delivers it advances `p->event`.
+/// waiter that delivers it advances `p->event`. `EPOLLIN` is always ready.
+/// An edge-triggered interest reports that current state once, then only
+/// when a new generation arrives (`ep_send_events` does not requeue
+/// `EPOLLET`).
 fn polled_mounts(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
     let interests: Vec<(i32, Interest)> = ep
         .interest
@@ -859,7 +875,13 @@ fn polled_mounts(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
         .into_iter()
         .filter_map(|(fd, interest)| {
             let raw = super::procfs::mount_poll_bits(fd)? as u32;
-            let events = raw & (interest.events | EPOLLERR | EPOLLHUP);
+            let mut events = raw & (interest.events | EPOLLERR | EPOLLHUP);
+            if interest.events & EPOLLET != 0
+                && events & (EPOLLERR | EPOLLPRI) == 0
+                && !interest.mount_fresh
+            {
+                events &= !(EPOLLIN | EPOLLRDNORM);
+            }
             (events != 0 && registered(epfd, fd, &interest)).then_some((fd, events))
         })
         .collect()
@@ -925,6 +947,14 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
             super::procfs::drain_mount_wake();
         }
         let mounts = polled_mounts(&ep, epfd);
+        let block = left.is_none_or(|t| t.tv_sec != 0 || t.tv_nsec != 0);
+        if mount_wait && mounts.is_empty() && block && super::procfs::mount_wake_fd() < 0 {
+            // A blocking wait with no wake pipe would sleep through a later
+            // generation. The generation is the event; this does not invent
+            // one. A zero timeout still falls through and reports only what
+            // `mounts_poll` says now.
+            return -(super::procfs::mount_wake_errno() as i64);
+        }
         let wait = if kept.is_empty() && maps.is_empty() && mounts.is_empty() {
             left
         } else {
@@ -1231,6 +1261,9 @@ fn ready(
         if i.events & EPOLLONESHOT != 0 {
             i.disabled = true;
         }
+        if i.events & EPOLLET != 0 {
+            i.mount_fresh = false;
+        }
         out.push((fd, b, i.data));
     }
     drop(interest);
@@ -1337,6 +1370,7 @@ pub(super) fn save(ep: &Epoll, w: &mut super::fork_state::Writer) {
         w.u32(i.events);
         w.u64(i.data);
         w.bool(i.disabled);
+        w.bool(i.mount_fresh);
     });
     drop(interest);
     let ptys = ep.ptys.lock().unwrap();
@@ -1359,6 +1393,7 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Arc<Epoll> {
                 events: r.u32(),
                 data: r.u64(),
                 disabled: r.bool(),
+                mount_fresh: r.bool(),
                 seen: 0,
                 reported: None,
             },
@@ -1374,6 +1409,7 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Arc<Epoll> {
             disabled: r.bool(),
             seen: 0,
             reported: None,
+            mount_fresh: true,
         };
         let watch = super::pty_owner::Watch::restore(r);
         let valid = match (identity, watch) {

@@ -1643,7 +1643,7 @@ struct Pool(Mutex<Vec<i32>>);
 /// An open mounts or mountinfo file. `seen` is Linux `proc_mounts.event`:
 /// dup shares it, and the poll that observes a generation change consumes
 /// it. The host fd stays the content file (`fstat` is a regular file).
-struct MountPoll {
+pub(super) struct MountPoll {
     host_pid: i32,
     info: bool,
     seen: AtomicU64,
@@ -1746,6 +1746,10 @@ pub(super) fn mount_wake_fd() -> i32 {
     vfs::mount_wake_fd()
 }
 
+pub(super) fn mount_wake_errno() -> i32 {
+    vfs::mount_wake_errno()
+}
+
 pub(super) fn drain_mount_wake() {
     vfs::drain_mount_wake();
 }
@@ -1760,6 +1764,83 @@ pub(super) fn dup_mount_poll(old: i32, new: i32) {
 
 pub(super) fn close_mount_poll(fd: i32) {
     MOUNT_POLLS.lock().unwrap().remove(&fd);
+}
+
+/// Identity of the open file's `mounts_poll` cursor, for a fork that shares
+/// one description across dup.
+pub(super) fn mount_poll_ptr(fd: i32) -> Option<*const ()> {
+    MOUNT_POLLS
+        .lock()
+        .unwrap()
+        .get(&fd)
+        .map(|poll| Arc::as_ptr(poll) as *const ())
+}
+
+pub(super) fn mount_poll_record(fd: i32) -> Option<(bool, u64, u64)> {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let poll = polls.get(&fd)?;
+    Some((
+        poll.info,
+        poll.seen.load(Ordering::Acquire),
+        poll.filled.load(Ordering::Acquire),
+    ))
+}
+
+pub(super) fn save_mount_poll(fd: i32, w: &mut super::fork_state::Writer) {
+    let (info, seen, filled) = mount_poll_record(fd).expect("mount poll");
+    w.bool(info);
+    w.u64(seen);
+    w.u64(filled);
+}
+
+pub(super) fn load_mount_poll(r: &mut super::fork_state::Reader) -> Arc<MountPoll> {
+    Arc::new(MountPoll {
+        host_pid: pid(),
+        info: r.bool(),
+        seen: AtomicU64::new(r.u64()),
+        filled: AtomicU64::new(r.u64()),
+    })
+}
+
+pub(super) fn install_mount_poll(fd: i32, poll: Arc<MountPoll>) {
+    MOUNT_POLLS.lock().unwrap().insert(fd, poll);
+}
+
+/// Exec shares one cursor per open file, keyed by the id in the exec text.
+pub(super) struct MountPollCache(BTreeMap<u64, Arc<MountPoll>>);
+
+impl MountPollCache {
+    pub(super) fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+pub(super) fn restore_mount_exec(
+    cache: &mut MountPollCache,
+    fd: i32,
+    id: u64,
+    info: bool,
+    seen: u64,
+    filled: u64,
+) {
+    let poll = cache
+        .0
+        .entry(id)
+        .or_insert_with(|| {
+            Arc::new(MountPoll {
+                host_pid: pid(),
+                info,
+                seen: AtomicU64::new(seen),
+                filled: AtomicU64::new(filled),
+            })
+        })
+        .clone();
+    install_mount_poll(fd, poll);
+}
+
+#[cfg(test)]
+pub(crate) fn detach_mount_polls() {
+    MOUNT_POLLS.lock().unwrap().clear();
 }
 
 /// Rewrite the content file when the mount generation moved, keeping the
@@ -3083,6 +3164,331 @@ mod tests {
         assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
         drop(cleanup);
         for name in names {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    fn mount_at(root: &std::path::Path, name: &str) -> String {
+        let host = root.join(name);
+        std::fs::create_dir_all(&host).unwrap();
+        let guest = format!("/mnt/{name}");
+        crate::vfs::add_mount(
+            &guest,
+            host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        guest
+    }
+
+    fn pri(fd: i64) -> (i64, i16) {
+        let mut entry = libc::pollfd {
+            fd: fd as i32,
+            events: 0x2,
+            revents: 0,
+        };
+        let timeout = [0i64; 2];
+        let n = crate::sys::poll::ppoll([
+            &mut entry as *mut libc::pollfd as u64,
+            1,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        (n, entry.revents)
+    }
+
+    /// `ep_insert` polls the file. `mounts_poll` consumes a change between
+    /// open and ADD, and `ep_send_events` polls again, so that edge is not
+    /// delivered. `EPOLLIN` is the current state: once for `EPOLLET`, on
+    /// every wait when level-triggered.
+    #[test]
+    fn proc_mounts_epoll_insert_observes_the_open_file() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        cleanup.0.push(mount_at(&root, "mount-insert-a"));
+        let interest = [0xau64, 0x11];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(pri(mounts), (0, 0));
+        let wait = |ep: i64, ms: i64| {
+            let mut out = [0u64; 2];
+            let n = crate::sys::epoll::epoll_pwait([
+                ep as u64,
+                out.as_mut_ptr() as u64,
+                1,
+                ms as u64,
+                0,
+                0,
+            ]);
+            (n, out)
+        };
+        assert_eq!(wait(ep, 0).0, 0);
+        cleanup.0.push(mount_at(&root, "mount-insert-b"));
+        let (n, out) = wait(ep, 0);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x11));
+        assert_eq!(wait(ep, 0).0, 0);
+
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        let edge = crate::sys::epoll::epoll_create1([0; 6]);
+        let et = [1u64 | (1 << 31), 0x22];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                edge as u64,
+                1,
+                copied as u64,
+                et.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        let (n, out) = wait(edge, 0);
+        assert_eq!(n, 1);
+        assert_eq!(out[0] & (0x1 | 0x40), 0x1 | 0x40);
+        assert_eq!(out[0] & 0x2, 0);
+        assert_eq!(out[1], 0x22);
+        assert_eq!(wait(edge, 0).0, 0);
+        cleanup.0.push(mount_at(&root, "mount-insert-c"));
+        let (n, out) = wait(edge, 0);
+        assert_eq!(n, 1);
+        assert_eq!(out[0] & (0x1 | 0x40 | 0x8), 0x1 | 0x40 | 0x8);
+        assert_eq!(wait(edge, 0).0, 0);
+
+        let level_fd = super::open("/proc/self/mounts", 0, libc::O_RDONLY).unwrap();
+        let level = crate::sys::epoll::epoll_create1([0; 6]);
+        let inn = [1u64, 0x33];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                level as u64,
+                1,
+                level_fd as u64,
+                inn.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        for _ in 0..2 {
+            let (n, out) = wait(level, 0);
+            assert_eq!(n, 1);
+            assert_eq!(out[0] & (0x1 | 0x40), 0x1 | 0x40);
+            assert_eq!(out[1], 0x33);
+        }
+        for fd in [mounts, copied, level_fd, ep, edge, level] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        drop(cleanup);
+        for name in ["mount-insert-a", "mount-insert-b", "mount-insert-c"] {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    /// Fork copies the open file's cursor and this process's generation.
+    /// dup shares that copy. exec of a non-`CLOEXEC` mount fd does too.
+    /// Closing one fd leaves the other.
+    #[test]
+    fn proc_mounts_fork_keeps_the_poll_cursor() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        cleanup.0.push(mount_at(&root, "mount-fork-a"));
+        assert_eq!(pri(mounts), (1, 0x2 | 0x8));
+        assert_eq!(pri(copied), (0, 0));
+
+        let save = || {
+            let mut writer = crate::sys::fork_state::Writer::default();
+            crate::sys::fdtab::fork_save(&mut writer);
+            writer.into_bytes()
+        };
+        let restore = |blob: &[u8]| {
+            super::detach_mount_polls();
+            crate::vfs::restore_mount_event(0);
+            let mut reader = crate::sys::fork_state::Reader::new(blob);
+            crate::sys::fdtab::fork_restore(&mut reader);
+            assert!(reader.ok(), "{}", reader.diagnostic());
+        };
+        let caught_up = save();
+        super::detach_mount_polls();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        let interest = [0xau64, 1];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            -(crate::errno::EPERM as i64)
+        );
+        restore(&caught_up);
+        assert_eq!(pri(mounts), (0, 0));
+        assert_eq!(pri(copied), (0, 0));
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+
+        cleanup.0.push(mount_at(&root, "mount-fork-b"));
+        let pending = save();
+        restore(&pending);
+        assert_eq!(pri(mounts), (1, 0x2 | 0x8));
+        assert_eq!(pri(copied), (0, 0));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        assert!(super::is_mount_poll(copied as i32));
+        cleanup.0.push(mount_at(&root, "mount-fork-c"));
+        assert_eq!(pri(copied), (1, 0x2 | 0x8));
+
+        let again = crate::sys::fs::dup([copied as u64, 0, 0, 0, 0, 0]);
+        cleanup.0.push(mount_at(&root, "mount-fork-d"));
+        let text = crate::sys::fdtab::regular_exec_text().unwrap();
+        let mounts_only = text
+            .lines()
+            .filter(|line| line.starts_with("mounts\t") || line.starts_with("mountevent\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        super::detach_mount_polls();
+        crate::vfs::restore_mount_event(0);
+        crate::sys::fdtab::restore_regular_exec(&mounts_only).unwrap();
+        assert_eq!(pri(copied), (1, 0x2 | 0x8));
+        assert_eq!(pri(again), (0, 0));
+        assert_eq!(crate::sys::fs::close([copied as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([again as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in ["mount-fork-a", "mount-fork-b", "mount-fork-c", "mount-fork-d"] {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    /// A missing wake pipe fails a blocking wait. It does not invent an
+    /// edge, and a generation that already moved is still one edge.
+    #[test]
+    fn proc_mounts_wake_failure_reports_the_pipe_errno() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Arm;
+        impl Drop for Arm {
+            fn drop(&mut self) {
+                crate::vfs::testing_fail_mount_wake(false);
+            }
+        }
+        let _arm = Arm;
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        let interest = [0xau64, 0x44];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        crate::vfs::testing_fail_mount_wake(true);
+        cleanup.0.push(mount_at(&root, "mount-wake-a"));
+        let mut out = [0u64; 2];
+        let n = crate::sys::epoll::epoll_pwait([
+            ep as u64,
+            out.as_mut_ptr() as u64,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x44));
+        assert_eq!(
+            crate::sys::epoll::epoll_pwait([ep as u64, out.as_mut_ptr() as u64, 1, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            crate::sys::epoll::epoll_pwait([ep as u64, out.as_mut_ptr() as u64, 1, 200, 0, 0]),
+            -(crate::errno::EMFILE as i64)
+        );
+        assert_eq!(pri(mounts), (0, 0));
+        let mut entry = libc::pollfd {
+            fd: mounts as i32,
+            events: 0x2,
+            revents: 0,
+        };
+        let timeout = [0i64, 200_000_000];
+        assert_eq!(
+            crate::sys::poll::ppoll([
+                &mut entry as *mut libc::pollfd as u64,
+                1,
+                timeout.as_ptr() as u64,
+                0,
+                0,
+                0,
+            ]),
+            -(crate::errno::EMFILE as i64)
+        );
+        crate::vfs::testing_fail_mount_wake(false);
+        cleanup.0.push(mount_at(&root, "mount-wake-b"));
+        let n = crate::sys::epoll::epoll_pwait([
+            ep as u64,
+            out.as_mut_ptr() as u64,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x44));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in ["mount-wake-a", "mount-wake-b"] {
             let _ = std::fs::remove_dir(root.join(name));
         }
     }
