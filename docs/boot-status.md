@@ -80,13 +80,41 @@ entries at all. `system/lib64/libc.so`, `libm.so`, `libdl.so`, and
 `/apex/com.android.runtime/lib64/bionic/`. prepare kept the bootstrap
 `libdl_android.so` because that basename was not already in the bionic
 root, and dropped the other three because `find_lib` treated the
-`system/lib64` symlink as the library. `prepare-init` now copies the
+`system/lib64` symlink as the library. `prepare-init` copies the
 layer's own files and fails unless each path matches the layer's type,
 size, and hash. It still does not copy `dev/__properties__`, children of
 `linkerconfig`, or children of `bootstrap-apex`, and it does not copy a
 device node. It does not invent a library the layer lacks. `/linkerconfig`
-and the tmpfs mounts are unchanged. This copy is not remeasured on
-macmini. `unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
+and the tmpfs mounts are unchanged.
+
+On `2089ec5` (archive
+`4f524c8f2ba65c0eabed0d4d6b6b83c4cc787d47dff01f205fad95c73086e550`)
+prepare-init exited 1 after 21.6s. Its only line was
+`system/product/media/audio/notifications/Arcturus.ogg size root 7908 layer 7933 header 7933`.
+The root file's sha256 is
+`6487240c9d6dffe7c569ca12079d2c8d41a28af50b30d471eae9a3e2e377fa96`.
+Bootstrap `libc.so`, `libm.so`, and `libdl.so` are present with the
+layer hashes. The layer entry for `Arcturus.ogg` is a regular file,
+type flag `0`, 7933 bytes, sha256
+`2492fa4d4e84afff3c9a6ad378ba12b43e3018c7ae7d04ac12f15e005361e4c4`,
+with no pax header and no sparse map, at offset 1325846016. The same
+directory also has `arcturus.ogg`, a regular file of 7908 bytes later
+in the tar (offset 1327043072). That file's sha256 is the root hash
+above. The layer has seven such pairs and no other case-only
+collisions. macOS APFS is case-insensitive, so the later write replaces
+the earlier file. prepare-init now stops before copying when the root's
+volume is case-insensitive (`pathconf(_PC_CASE_SENSITIVE)` on macOS,
+and a probe file). The init root has to be a case-sensitive APFS image
+mounted on the empty `_build/redroid-16-init` directory. Creating and
+attaching that image does not need sudo. This check is not remeasured
+on macmini. A path the bionic root already holds is a conflict when
+its type or content differs. The only covered conflict is a member
+`prepare` staged from this layer: the layer entry is kept and the
+manifest records both sides. Any other difference fails and the
+existing bytes stay. On this layer those staged members match, so the
+conflict list is empty.
+
+`unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
 call 1065) returns `EINVAL`. Linux would return 0 with `CAP_SYS_ADMIN`
 (since 4.6). This is the unsupported-namespace gate (ADR 0012). Init has
 the capability and continues. A cgroup namespace is not invented here.

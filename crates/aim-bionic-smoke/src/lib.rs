@@ -65,6 +65,12 @@ const TAR_MEMBERS: &[&str] = &[
     "system/apex/com.android.runtime.apex",
 ];
 
+/// A layer path `prepare` copies into the bionic guest root. The apex
+/// payload stays beside that root, so it is not one of these.
+pub(crate) fn staged_guest_member(name: &str) -> bool {
+    TAR_MEMBERS.contains(&name) && name != "system/apex/com.android.runtime.apex"
+}
+
 const APEX_KEEP: &[&str] = &[
     "bin/linker64",
     "lib64/bionic/libc.so",

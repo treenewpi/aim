@@ -92,6 +92,14 @@ const LAYER_DIFFERENCES: &[&str] = &[
     "fifo",
 ];
 
+/// The only same-path difference that prepare may overwrite. The path is
+/// one `prepare` copied from this layer into the bionic root. The init
+/// root keeps the layer entry: that root is the image, and the bionic
+/// root is the earlier subset. The conflict is recorded. Any other
+/// difference fails prepare, and the existing bytes stay.
+const STAGED_MEMBER_CONFLICT: &str =
+    "bionic prepare staged this layer member; the init root keeps the image entry";
+
 struct LayerRootFiles {
     contexts: Vec<String>,
     dev_from_layer: bool,
@@ -126,13 +134,24 @@ pub fn prepare_init() -> Result<PathBuf, String> {
         fs::remove_dir_all(&root).map_err(|e| format!("remove {}: {e}", root.display()))?;
     }
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    // Before the copy. A case-insensitive volume would let the later
+    // `arcturus.ogg` replace `Arcturus.ogg` and the size check would fail
+    // on the survivor.
+    require_case_sensitive_volume(&root)?;
     copy_tree(&bionic, &root)?;
     set_mode(&root, 0o755)?;
     // The bionic root already has `system/lib64/libc.so` as a symlink into
     // the apex. The basename walk treats that as the library and never
     // copies the regular file at `system/lib64/bootstrap/libc.so`. Copy the
     // layer first so that file, and every other layer path, is the layer's.
-    install_layer(&layer, &root)?;
+    let conflicts = install_layer(&layer, &root)?;
+    if conflicts.is_empty() {
+        println!("bionic-smoke: layer conflicts 0");
+    } else {
+        for conflict in &conflicts {
+            println!("bionic-smoke: {}", conflict.line());
+        }
+    }
     let copied = extract_closure(&layer, &root)?;
     let init_path = root.join(INIT_GUEST.trim_start_matches('/'));
     let info = read_elf(&fs::read(&init_path).map_err(|e| e.to_string())?)?;
@@ -156,7 +175,7 @@ pub fn prepare_init() -> Result<PathBuf, String> {
         return Err("init probe root has no /dev directory".into());
     }
     audit_layer(&layer, &root)?;
-    write_provenance(&root, &layer, &copied, &root_files)?;
+    write_provenance(&root, &layer, &copied, &root_files, &conflicts)?;
     for name in ["init-guest.stdout", "init-guest.stderr", "init-probe.txt"] {
         if let Some(parent) = root.parent() {
             let _ = fs::remove_file(parent.join(name));
@@ -365,10 +384,97 @@ fn ensure_parent(dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// One same-path difference between the bionic root and the layer.
+#[derive(Debug)]
+struct LayerConflict {
+    path: String,
+    bionic: String,
+    layer: String,
+    kept: &'static str,
+    reason: &'static str,
+}
+
+impl LayerConflict {
+    fn line(&self) -> String {
+        format!(
+            "conflict {} bionic {} layer {} kept {} because {}",
+            self.path, self.bionic, self.layer, self.kept, self.reason
+        )
+    }
+}
+
+fn existing_meta(dest: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match fs::symlink_metadata(dest) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", dest.display())),
+    }
+}
+
+fn describe_meta(path: &Path, meta: &std::fs::Metadata) -> Result<String, String> {
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        let target = fs::read_link(path).map_err(|e| format!("readlink {}: {e}", path.display()))?;
+        let text = target.to_string_lossy().into_owned();
+        return Ok(format!(
+            "symlink size 0 target {text} sha256 {}",
+            sha256_bytes(text.as_bytes())
+        ));
+    }
+    if file_type.is_dir() {
+        return Ok(format!("directory size {}", meta.len()));
+    }
+    if file_type.is_file() {
+        return Ok(format!(
+            "file size {} sha256 {}",
+            meta.len(),
+            sha256_file(path)?
+        ));
+    }
+    Ok(format!("other size {}", meta.len()))
+}
+
+/// [`STAGED_MEMBER_CONFLICT`] is the only rule that keeps one side. Every
+/// other difference is an error, and the bionic file is left in place.
+fn cover_conflict(name: &str, bionic: String, layer: String) -> Result<LayerConflict, String> {
+    if super::staged_guest_member(name) {
+        return Ok(LayerConflict {
+            path: name.to_string(),
+            bionic,
+            layer,
+            kept: "layer",
+            reason: STAGED_MEMBER_CONFLICT,
+        });
+    }
+    Err(format!(
+        "{name} conflicts with the bionic root and no documented rule covers it. bionic {bionic}. layer {layer}. refusing to overwrite or skip"
+    ))
+}
+
+fn file_agrees(dest: &Path, meta: &std::fs::Metadata, data: &[u8]) -> Result<bool, String> {
+    let file_type = meta.file_type();
+    if !file_type.is_file() || file_type.is_symlink() || meta.len() != data.len() as u64 {
+        return Ok(false);
+    }
+    Ok(sha256_file(dest)? == sha256_bytes(data))
+}
+
+fn symlink_agrees(dest: &Path, meta: &std::fs::Metadata, target: &str) -> Result<bool, String> {
+    if !meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let got = fs::read_link(dest).map_err(|e| format!("readlink {}: {e}", dest.display()))?;
+    Ok(got == Path::new(target))
+}
+
 /// Copy every layer path except [`LAYER_DIFFERENCES`]. A symlink stays a
 /// symlink. A hard link stays a hard link to the earlier layer member.
-/// Bytes are the layer's; nothing here is a written substitute.
-fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
+/// Bytes are the layer's; nothing here is a written substitute. A path
+/// the bionic root already has is a conflict when the type or content
+/// differs: [`cover_conflict`] records a covered one and prepare fails
+/// on the rest.
+fn install_layer(layer: &Path, root: &Path) -> Result<Vec<LayerConflict>, String> {
+    let mut conflicts = Vec::new();
     let mut archive = open_layer(layer)?;
     let entries = archive
         .entries()
@@ -385,6 +491,18 @@ fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
         }
         let dest = root.join(&name);
         if kind.is_dir() {
+            if let Some(meta) = existing_meta(&dest)? {
+                let file_type = meta.file_type();
+                if !(file_type.is_dir() && !file_type.is_symlink()) {
+                    let bionic = describe_meta(&dest, &meta)?;
+                    conflicts.push(cover_conflict(
+                        &name,
+                        bionic,
+                        format!("directory size {}", entry.size()),
+                    )?);
+                    clear_dest(&dest)?;
+                }
+            }
             fs::create_dir_all(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
             let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
             set_mode(&dest, mode)?;
@@ -395,6 +513,17 @@ fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
             entry
                 .read_to_end(&mut data)
                 .map_err(|e| format!("read {name}: {e}"))?;
+            if let Some(meta) = existing_meta(&dest)? {
+                if !file_agrees(&dest, &meta, &data)? {
+                    let bionic = describe_meta(&dest, &meta)?;
+                    let layer_desc = format!(
+                        "file size {} sha256 {}",
+                        data.len(),
+                        sha256_bytes(&data)
+                    );
+                    conflicts.push(cover_conflict(&name, bionic, layer_desc)?);
+                }
+            }
             clear_dest(&dest)?;
             ensure_parent(&dest)?;
             fs::write(&dest, &data).map_err(|e| format!("write {name}: {e}"))?;
@@ -404,6 +533,16 @@ fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
         }
         if kind.is_symlink() {
             let target = link_text(&entry)?;
+            if let Some(meta) = existing_meta(&dest)? {
+                if !symlink_agrees(&dest, &meta, &target)? {
+                    let bionic = describe_meta(&dest, &meta)?;
+                    let layer_desc = format!(
+                        "symlink size 0 target {target} sha256 {}",
+                        sha256_bytes(target.as_bytes())
+                    );
+                    conflicts.push(cover_conflict(&name, bionic, layer_desc)?);
+                }
+            }
             clear_dest(&dest)?;
             ensure_parent(&dest)?;
             std::os::unix::fs::symlink(&target, &dest)
@@ -413,10 +552,19 @@ fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
         if kind.is_hard_link() {
             let target = tar_rel(Path::new(&link_text(&entry)?));
             let source = root.join(&target);
-            if fs::symlink_metadata(&source).is_err() {
-                return Err(format!(
-                    "hardlink {name} names {target}, which is not in the root"
-                ));
+            let source_meta = fs::symlink_metadata(&source).map_err(|_| {
+                format!("hardlink {name} names {target}, which is not in the root")
+            })?;
+            if let Some(meta) = existing_meta(&dest)? {
+                let same = !meta.file_type().is_symlink() && meta.ino() == source_meta.ino();
+                if !same {
+                    let bionic = describe_meta(&dest, &meta)?;
+                    let layer_desc = format!(
+                        "hardlink size 0 target {target} sha256 {}",
+                        sha256_bytes(target.as_bytes())
+                    );
+                    conflicts.push(cover_conflict(&name, bionic, layer_desc)?);
+                }
             }
             clear_dest(&dest)?;
             ensure_parent(&dest)?;
@@ -427,7 +575,57 @@ fn install_layer(layer: &Path, root: &Path) -> Result<(), String> {
             "layer entry {name} type {kind:?} is not a documented difference"
         ));
     }
+    Ok(conflicts)
+}
+
+fn case_volume_error(dir: &Path) -> String {
+    let parent = dir.parent().unwrap_or(dir);
+    format!(
+        "prepare root {} is on a case-insensitive volume. The pinned layer has paths that differ only by case, and the later entry replaces the earlier one: system/product/media/audio/notifications/Arcturus.ogg is a regular file of 7933 bytes and arcturus.ogg is a regular file of 7908 bytes (sha256 6487240c9d6dffe7c569ca12079d2c8d41a28af50b30d471eae9a3e2e377fa96). Mount a case-sensitive APFS image on the empty directory {} before prepare-init. Creating and attaching it does not need sudo: hdiutil create -size 8g -fs 'Case-sensitive APFS' -volname aim-init -type SPARSE _build/aim-init.sparseimage && hdiutil attach -nobrowse -mountpoint {} _build/aim-init.sparseimage",
+        dir.display(),
+        parent.display(),
+        parent.display()
+    )
+}
+
+/// `pathconf(_PC_CASE_SENSITIVE)` on macOS, and a probe file everywhere.
+/// A case-insensitive volume stores one file under both spellings.
+fn require_case_sensitive_volume(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if pathconf_case_sensitive(dir)? == Some(false) {
+        return Err(case_volume_error(dir));
+    }
+    if !probe_case_sensitive(dir)? {
+        return Err(case_volume_error(dir));
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn pathconf_case_sensitive(dir: &Path) -> Result<Option<bool>, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| format!("{} has an interior nul", dir.display()))?;
+    let rc = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            return Ok(None);
+        }
+        return Err(format!("pathconf {}: {error}", dir.display()));
+    }
+    Ok(Some(rc == 1))
+}
+
+fn probe_case_sensitive(dir: &Path) -> Result<bool, String> {
+    let upper = dir.join(".aim-case-A");
+    let lower = dir.join(".aim-case-a");
+    let _ = fs::remove_file(&upper);
+    let _ = fs::remove_file(&lower);
+    fs::write(&upper, b"A").map_err(|e| format!("probe {}: {e}", upper.display()))?;
+    let folded = lower.exists();
+    let _ = fs::remove_file(&upper);
+    Ok(!folded)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -712,6 +910,7 @@ fn write_provenance(
     layer: &Path,
     copied: &[String],
     root_files: &LayerRootFiles,
+    conflicts: &[LayerConflict],
 ) -> Result<(), String> {
     let mut libraries = String::new();
     for rel in copied {
@@ -746,6 +945,15 @@ fn write_provenance(
     } else {
         "kernel_log_marker dev/kmsg already-regular-file\n"
     };
+    let mut conflict_lines = String::new();
+    if conflicts.is_empty() {
+        conflict_lines.push_str("layer_conflicts 0\n");
+    } else {
+        for conflict in conflicts {
+            conflict_lines.push_str(&conflict.line());
+            conflict_lines.push('\n');
+        }
+    }
     let text = format!(
         "kind original-init-probe\n\
          layer {}\n\
@@ -755,6 +963,7 @@ fn write_provenance(
          interpreter /system/bin/bootstrap/linker64\n\
          closure transitive-dt-needed\n\
          layer_manifest compared\n\
+         {conflict_lines}\
          {libraries}\
          {contexts}\
          dev_directory {dev}\n\
@@ -1218,7 +1427,8 @@ mod tests {
                 ("system/etc/kept.so", Item::File(b"kept")),
             ],
         );
-        super::install_layer(&layer, &root).unwrap();
+        let conflicts = super::install_layer(&layer, &root).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
         super::audit_layer(&layer, &root).unwrap();
         assert_eq!(
             fs::read(root.join("system/lib64/bootstrap/libc.so")).unwrap(),
@@ -1285,6 +1495,74 @@ mod tests {
         assert!(err.contains("system/lib64/bootstrap/libc.so"), "{err}");
         assert!(err.contains("refusing to invent"), "{err}");
         assert!(!root.join("system/lib64/bootstrap/libc.so").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_root_must_be_case_sensitive() {
+        let dir = std::env::temp_dir().join(format!("bionic-smoke-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        super::require_case_sensitive_volume(&dir).unwrap();
+        assert!(!dir.join(".aim-case-A").exists());
+        assert!(!dir.join(".aim-case-a").exists());
+        let text = super::case_volume_error(std::path::Path::new(
+            "_build/redroid-16-init/root",
+        ));
+        assert!(text.contains("case-insensitive"), "{text}");
+        assert!(text.contains("Arcturus.ogg"), "{text}");
+        assert!(text.contains("7908"), "{text}");
+        assert!(text.contains("7933"), "{text}");
+        assert!(text.contains("6487240c9d6dffe7c569ca12079d2c8d41a28af50b30d471eae9a3e2e377fa96"), "{text}");
+        assert!(text.contains("hdiutil create"), "{text}");
+        assert!(text.contains("Case-sensitive APFS"), "{text}");
+        assert!(text.contains("_build/redroid-16-init"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `system/lib64/libc.so` is a member `prepare` staged from the layer.
+    /// A different symlink is kept from the layer and recorded. A different
+    /// file that `prepare` did not stage fails, and its bytes stay.
+    #[test]
+    fn a_staged_member_conflict_keeps_the_layer_and_records_both_sides() {
+        let dir = std::env::temp_dir().join(format!("bionic-smoke-conflict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        fs::create_dir_all(root.join("system/lib64")).unwrap();
+        fs::create_dir_all(root.join("system/bin")).unwrap();
+        std::os::unix::fs::symlink("/bionic/libc.so", root.join("system/lib64/libc.so")).unwrap();
+        fs::write(root.join("system/bin/not-elf"), b"bionic-bytes").unwrap();
+        let layer = dir.join("layer.tar.gz");
+        write_layer(
+            &layer,
+            &[(
+                "system/lib64/libc.so",
+                Item::Symlink("/apex/com.android.runtime/lib64/bionic/libc.so"),
+            )],
+        );
+        let conflicts = super::install_layer(&layer, &root).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        let line = conflicts[0].line();
+        assert!(line.contains("system/lib64/libc.so"), "{line}");
+        assert!(line.contains("bionic symlink size 0 target /bionic/libc.so"), "{line}");
+        assert!(line.contains(
+            "layer symlink size 0 target /apex/com.android.runtime/lib64/bionic/libc.so"
+        ), "{line}");
+        assert!(line.contains("kept layer because"), "{line}");
+        assert!(line.contains("image entry"), "{line}");
+        assert_eq!(
+            fs::read_link(root.join("system/lib64/libc.so")).unwrap(),
+            PathBuf::from("/apex/com.android.runtime/lib64/bionic/libc.so")
+        );
+        write_layer(
+            &layer,
+            &[("system/bin/not-elf", Item::File(b"layer-bytes"))],
+        );
+        let err = super::install_layer(&layer, &root).unwrap_err();
+        assert!(err.contains("system/bin/not-elf"), "{err}");
+        assert!(err.contains("no documented rule"), "{err}");
+        assert!(err.contains("refusing to overwrite or skip"), "{err}");
+        assert_eq!(fs::read(root.join("system/bin/not-elf")).unwrap(), b"bionic-bytes");
         let _ = fs::remove_dir_all(&dir);
     }
 

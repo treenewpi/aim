@@ -520,6 +520,30 @@ device. Provenance lists each copied path and its sha256, the mount
 points, the marker, and device nodes under `dev/` that were left in
 the layer. `dev/__properties__` is not copied. The root still has no
 property area.
+
+The pinned layer has seven path pairs that differ only by case.
+`system/product/media/audio/notifications/Arcturus.ogg` is 7933 bytes
+and the later `arcturus.ogg` is 7908. On a case-insensitive volume the
+later file replaces the earlier one, and prepare-init then fails the
+size check. prepare-init refuses that volume before it copies.
+`--prepare` can stay on the default volume: it does not copy those
+pairs. `--prepare-init` writes `_build/redroid-16-init/root`, so that
+parent has to be a case-sensitive APFS image. If that directory already
+holds a root, move it aside first. The mountpoint has to be empty.
+Creating the image and attaching it there does not need sudo:
+
+```sh
+mkdir -p "$PWD/_build/redroid-16-init"
+hdiutil create -size 8g -fs 'Case-sensitive APFS' -volname aim-init -type SPARSE "$PWD/_build/aim-init.sparseimage"
+hdiutil attach -nobrowse -mountpoint "$PWD/_build/redroid-16-init" "$PWD/_build/aim-init.sparseimage"
+```
+
+A same-path difference with the bionic root is printed as
+`bionic-smoke: conflict ...` and recorded in provenance. The only
+covered case is a member `prepare` staged from the layer: the layer
+bytes are kept. Any other difference fails prepare and the existing
+file stays. Paths that already match are not conflicts.
+`bionic-smoke: layer conflicts 0` is that result for the pinned layer.
 `bionic-smoke --init LINUX_RUN` runs that binary for at most eight
 seconds. Guest stdout and stderr are files, so a full pipe cannot stall
 the guest or the harness. With `--trace`, `linux-run` duplicates stderr
