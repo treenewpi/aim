@@ -26,7 +26,7 @@ use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::errno::{self, Errno};
@@ -112,7 +112,11 @@ fn mount_propagation(guest: &str) -> Propagation {
 }
 pub fn set_mount_propagation(guest: &str, flags: u64) -> Result<(), Errno> {
     if !REPLAYING_NAMESPACE.with(std::cell::Cell::get) && mount_namespace_id().is_some() {
-        return namespace_event(&format!("propagation-flags\t{guest}\t{flags}"));
+        namespace_event(&format!("propagation-flags\t{guest}\t{flags}"))?;
+        // Propagation is not a mount-vec field. Linux still advances
+        // `ns->event`, so a mounts file wakes even when its text does not.
+        note_mount_table();
+        return Ok(());
     }
     let kind = if flags & (1 << 19) != 0 {
         Propagation::Slave
@@ -127,7 +131,9 @@ pub fn set_mount_propagation(guest: &str, flags: u64) -> Result<(), Errno> {
     });
     rules.push((guest.into(), kind));
     drop(rules);
-    refresh_fuse_mounts()
+    refresh_fuse_mounts()?;
+    note_mount_table();
+    Ok(())
 }
 static PRIVATE_MOUNTS: AtomicBool = AtomicBool::new(false);
 fn fuse_table() -> Option<PathBuf> {
@@ -1116,13 +1122,19 @@ struct Table {
     mounts: Vec<Mount>,
     visible: OnceLock<Vec<bool>>,
     generation: u64,
+    /// Identity of the mounts a proc mount file's poll last published.
+    /// `mounts_poll` reports one priority edge per real change, so a write
+    /// that leaves the table the same is not one.
+    poll_stamp: u64,
 }
 impl MountTable {
     fn new(mounts: Vec<Mount>) -> Self {
+        let poll_stamp = mount_stamp(&mounts);
         Self(RwLock::new(Table {
             mounts,
             visible: OnceLock::new(),
             generation: 0,
+            poll_stamp,
         }))
     }
     fn read(&self) -> std::sync::LockResult<MountsRead<'_>> {
@@ -1183,8 +1195,111 @@ impl std::ops::DerefMut for MountsWrite<'_> {
 }
 impl Drop for MountsWrite<'_> {
     fn drop(&mut self) {
+        let stamp = mount_stamp(&self.0.mounts);
+        let changed = stamp != self.0.poll_stamp;
+        self.0.poll_stamp = stamp;
         self.0.changed();
+        if changed {
+            note_mount_table();
+        }
     }
+}
+
+/// `ns->event` for this process's mount namespace (`touch_mnt_namespace`).
+static MOUNT_EVENT: AtomicU64 = AtomicU64::new(0);
+static MOUNT_WAKE: OnceLock<(i32, i32)> = OnceLock::new();
+
+/// The mount generation an open `/proc/mounts` file samples (`p->event`).
+pub fn mount_event() -> u64 {
+    MOUNT_EVENT.load(Ordering::Acquire)
+}
+
+/// Read end of the pipe `note_mount_table` writes. Hidden from the guest.
+pub fn mount_wake_fd() -> i32 {
+    mount_wake().0
+}
+
+/// Drop bytes left by a generation a waiter has already observed.
+pub fn drain_mount_wake() {
+    let fd = mount_wake().0;
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    // SAFETY: our nonblocking pipe, local buffer.
+    unsafe {
+        while libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 {}
+    }
+}
+
+fn mount_wake() -> (i32, i32) {
+    *MOUNT_WAKE.get_or_init(|| {
+        let mut fds = [0; 2];
+        // SAFETY: a private pipe, then moved out of the guest fd range.
+        unsafe {
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return (-1, -1);
+            }
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        (
+            crate::sys::fdtab::hide(fds[0]),
+            crate::sys::fdtab::hide(fds[1]),
+        )
+    })
+}
+
+/// Bump `ns->event` and wake mount-file pollers. Several notes before a
+/// poll are one edge: the file stores the generation it observes.
+fn note_mount_table() {
+    MOUNT_EVENT.fetch_add(1, Ordering::Release);
+    let fd = mount_wake().1;
+    if fd < 0 {
+        return;
+    }
+    let byte = [1u8];
+    // SAFETY: our nonblocking pipe. A full buffer already has a wake pending.
+    unsafe {
+        libc::write(fd, byte.as_ptr().cast(), 1);
+    }
+}
+
+fn mount_stamp(mounts: &[Mount]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    for mount in mounts {
+        mix(mount.guest.as_bytes());
+        mix(mount.host.as_os_str().as_encoded_bytes());
+        mix(mount.source.as_deref().unwrap_or("").as_bytes());
+        mix(mount.fstype.as_deref().unwrap_or("").as_bytes());
+        mix(mount.bind_source.as_deref().unwrap_or("").as_bytes());
+        mix(&mount.seq.to_le_bytes());
+        let area = match mount.area {
+            Area::Image => 1,
+            Area::Writable => 2,
+            Area::Kernfs => 3,
+            Area::HostDevice => 4,
+            Area::Input => 5,
+        };
+        mix(&[
+            area,
+            u8::from(mount.own),
+            u8::from(mount.shared_fuse),
+            u8::from(mount.projected_fuse),
+            u8::from(mount.fuse.as_ref().is_some_and(|route| route.read_only)),
+        ]);
+    }
+    hash
 }
 
 static VFS: OnceLock<Vfs> = OnceLock::new();

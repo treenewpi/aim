@@ -392,8 +392,9 @@ fn changes(
 ) -> Vec<libc::kevent> {
     // A bpf map's file is regular, which a knote always finds readable:
     // its knotes stay disabled, dropping with the fd, and its readiness is
-    // the map's poll, read each wait ([`polled_maps`]).
-    let map = matches!(fdtab::get(fd), Some(Kind::Bpf));
+    // the map's poll, read each wait ([`polled_maps`]). A proc mount file
+    // is the same kind of regular file: `mounts_poll` is not the vnode.
+    let map = matches!(fdtab::get(fd), Some(Kind::Bpf)) || super::procfs::is_mount_poll(fd);
     let mut v = Vec::new();
     for (filter, want) in [
         (
@@ -526,8 +527,11 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
     }
     let kind = fdtab::get(fd);
     // A bpf object's file is regular; a map's polls (`bpf_map_poll`).
+    // `/proc/mounts` is a regular file too, and `mounts_poll` is why
+    // `file_can_poll` accepts it. Another regular file stays EPERM.
     let map = matches!(kind, Some(Kind::Bpf)) && super::bpf::poll(fd).is_some();
-    if !map && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
+    let mounts = super::procfs::is_mount_poll(fd);
+    if !map && !mounts && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
         return -(EPERM as i64);
     }
     let new = if op != EPOLL_CTL_DEL {
@@ -839,6 +843,34 @@ fn polled_maps(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
         .collect()
 }
 
+/// Armed interests in a proc mount file whose `mounts_poll` reports
+/// something this interest asked for. The edge is not consumed here; the
+/// waiter that delivers it advances `p->event`.
+fn polled_mounts(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
+    let interests: Vec<(i32, Interest)> = ep
+        .interest
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, interest)| !interest.disabled)
+        .map(|(fd, interest)| (*fd, *interest))
+        .collect();
+    interests
+        .into_iter()
+        .filter_map(|(fd, interest)| {
+            let raw = super::procfs::mount_poll_bits(fd)? as u32;
+            let events = raw & (interest.events | EPOLLERR | EPOLLHUP);
+            (events != 0 && registered(epfd, fd, &interest)).then_some((fd, events))
+        })
+        .collect()
+}
+
+fn watches_mounts(ep: &Epoll) -> bool {
+    ep.interest.lock().unwrap().iter().any(|(fd, interest)| {
+        !interest.disabled && super::procfs::is_mount_poll(*fd)
+    })
+}
+
 /// Milliseconds for poll(2), rounded up, -1 for none.
 fn poll_ms(timeout: Option<libc::timespec>) -> i32 {
     timeout.map_or(-1, |t| {
@@ -886,7 +918,14 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         let signals = signal_interests(&ep);
         let kept = kept_interests(&ep);
         let maps = polled_maps(&ep, epfd);
-        let wait = if kept.is_empty() && maps.is_empty() {
+        let mount_wait = watches_mounts(&ep);
+        if mount_wait {
+            // A byte only wakes. The generation is what `mounts_poll` reads,
+            // so draining a byte already observed does not drop an edge.
+            super::procfs::drain_mount_wake();
+        }
+        let mounts = polled_mounts(&ep, epfd);
+        let wait = if kept.is_empty() && maps.is_empty() && mounts.is_empty() {
             left
         } else {
             Some(zero)
@@ -916,31 +955,40 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         };
         let old_mask = user_try!(super::poll::swap_sigmask(mask));
         // With signalfds the wait is on the kqueue and the wake token, then
-        // the kqueue is read without waiting.
-        let (n, woke) = match &polling {
-            None => {
-                let n = fetch_events(wait.as_ref());
-                (n, n != 0)
-            }
-            Some(polling) => {
+        // the kqueue is read without waiting. A mount file has no vnode
+        // knote that means `mounts_poll`, so the same wait also watches the
+        // namespace wake pipe.
+        let wake = (mount_wait && mounts.is_empty()).then(super::procfs::mount_wake_fd);
+        let (n, woke) = if polling.is_none() && wake.is_none_or(|fd| fd < 0) {
+            let n = fetch_events(wait.as_ref());
+            (n, n != 0)
+        } else {
+            if let Some(polling) = &polling {
                 polling.sync();
-                let mut fds = [
-                    libc::pollfd {
-                        fd: epfd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: polling.fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                // SAFETY: a pollfd array we own.
-                match unsafe { libc::poll(fds.as_mut_ptr(), 2, poll_ms(wait)) } {
-                    woke if woke <= 0 => (woke, woke != 0),
-                    _ => (fetch_events(Some(&zero)), true),
-                }
+            }
+            let mut fds = vec![libc::pollfd {
+                fd: epfd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            if let Some(polling) = &polling {
+                fds.push(libc::pollfd {
+                    fd: polling.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if let Some(fd) = wake.filter(|fd| *fd >= 0) {
+                fds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            // SAFETY: a pollfd array we own.
+            match unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u32, poll_ms(wait)) } {
+                woke if woke <= 0 => (woke, woke != 0),
+                _ => (fetch_events(Some(&zero)), true),
             }
         };
         let err = errno::last();
@@ -950,13 +998,22 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         }
         // SAFETY: the kernel filled n entries.
         unsafe { kevs.set_len(n as usize) };
-        let (found, rearm) = ready(&ep, &kevs, maxevents as usize, &signals, &kept, &maps);
+        let (found, rearm) = ready(
+            &ep,
+            &kevs,
+            maxevents as usize,
+            &signals,
+            &kept,
+            &maps,
+            &mounts,
+        );
         apply(epfd, &rearm);
         // An inotify fd that woke the wait with nothing to read, or an
         // unconnected socket another waiter reported or a change removed
-        // since it was found: wait on.
+        // since it was found: wait on. A mount wake with no new edge does
+        // the same.
         if !found.is_empty()
-            || !woke && kept.is_empty() && maps.is_empty()
+            || !woke && kept.is_empty() && maps.is_empty() && mounts.is_empty()
             || left.is_some_and(|t| t.tv_sec == 0 && t.tv_nsec == 0)
         {
             break found;
@@ -991,6 +1048,7 @@ fn ready(
     signals: &[(i32, Arc<super::signalfd::SignalFd>, u64)],
     kept: &[(i32, super::net::Kept)],
     maps: &[(i32, u32)],
+    mounts: &[(i32, u32)],
 ) -> (Vec<(i32, u32, u64)>, Vec<libc::kevent>) {
     let mut out: Vec<(i32, u32, u64)> = Vec::with_capacity(kevs.len().min(limit));
     let mut rearm = Vec::new();
@@ -1149,6 +1207,27 @@ fn ready(
         }
         i.reported = Some(0);
         // Its knotes stay disabled ([`changes`]).
+        if i.events & EPOLLONESHOT != 0 {
+            i.disabled = true;
+        }
+        out.push((fd, b, i.data));
+    }
+    for &(fd, peeked) in mounts {
+        let Some(i) = interest.get_mut(&fd) else {
+            continue;
+        };
+        if i.disabled || out.len() == limit || !super::procfs::is_mount_poll(fd) {
+            continue;
+        }
+        let mut b = peeked;
+        // `mounts_poll` stores the generation it observed. Only the waiter
+        // that delivers the edge does; a full ready list leaves it pending.
+        if b & (EPOLLERR | EPOLLPRI) != 0 && !super::procfs::take_mount_edge(fd) {
+            b &= !(EPOLLERR | EPOLLPRI);
+        }
+        if b == 0 {
+            continue;
+        }
         if i.events & EPOLLONESHOT != 0 {
             i.disabled = true;
         }

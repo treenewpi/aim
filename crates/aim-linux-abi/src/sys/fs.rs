@@ -879,6 +879,7 @@ pub(super) fn is_path_fd(fd: i32) -> bool {
 
 /// read/readv on an fd with Linux state. None: a plain host fd.
 fn special_read(fd: i32, iov: &[libc::iovec]) -> Option<i64> {
+    super::procfs::refresh_mount_file(fd);
     let pin = match fdtab::pin_guest_io(fd) {
         Ok(pin) => pin,
         Err(error) => return Some(-(error as i64)),
@@ -950,6 +951,9 @@ fn append_end(actual: i32) -> Option<Result<i64, i64>> {
 }
 
 fn special_pio(fd: i32, buf: u64, len: usize, pos: i64, write: bool) -> Option<i64> {
+    if !write {
+        super::procfs::refresh_mount_file(fd);
+    }
     let pin = match fdtab::pin_guest_io(fd) {
         Ok(pin) => pin,
         Err(error) => return Some(-(error as i64)),
@@ -1685,6 +1689,9 @@ pub fn preadv(write: bool, v2: bool, a: [u64; 6]) -> i64 {
     // do_preadv: a negative offset is EINVAL, before the descriptor.
     if pos < 0 && !(v2 && pos == -1) {
         return -(EINVAL as i64);
+    }
+    if !write {
+        super::procfs::refresh_mount_file(fd);
     }
     let flags = if v2 { a[5] as u32 } else { 0 };
     let pin = match fdtab::pin_guest_io(fd) {

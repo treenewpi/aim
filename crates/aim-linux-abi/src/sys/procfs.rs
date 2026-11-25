@@ -3,6 +3,9 @@
 //!
 //! - Files are generated when opened and handed to the guest as an unlinked
 //!   temporary file, so reads, seeks and fstat behave like a regular file.
+//!   `/proc/mounts` and `mountinfo` are that file plus `mounts_poll`: always
+//!   readable, and `POLLERR|POLLPRI` for one observation after this
+//!   process's mount table changes. A later read shows the table then.
 //! - Directories are directory streams with fixed entries (see `dir`).
 //! - Values init wrote under `<runtime>/kernfs/...`
 //!   (`docs/guest-init-contract.md` section 7) take precedence over the
@@ -12,8 +15,10 @@
 //!   the process's record (`procrec`: threads, names, tracers, command
 //!   line) and its agent (`ptrace`: memory maps and fds).
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::dir::{self, DirStream, Entry};
@@ -1635,6 +1640,173 @@ const POOL_MAX: usize = 8;
 
 struct Pool(Mutex<Vec<i32>>);
 
+/// An open mounts or mountinfo file. `seen` is Linux `proc_mounts.event`:
+/// dup shares it, and the poll that observes a generation change consumes
+/// it. The host fd stays the content file (`fstat` is a regular file).
+struct MountPoll {
+    host_pid: i32,
+    info: bool,
+    seen: AtomicU64,
+    filled: AtomicU64,
+}
+
+static MOUNT_POLLS: Mutex<BTreeMap<i32, Arc<MountPoll>>> = Mutex::new(BTreeMap::new());
+
+const MOUNT_IN: i16 = 0x1;
+const MOUNT_PRI: i16 = 0x2;
+const MOUNT_ERR: i16 = 0x8;
+const MOUNT_RDNORM: i16 = 0x40;
+
+fn open_mount_table(host_pid: i32, info: bool, cloexec: bool) -> i64 {
+    // Sample the generation around the read. A mount during the read
+    // retries so the file does not open already holding an edge. A storm
+    // that never settles still opens: the next change remains visible.
+    let mut prepared = (String::new(), 0u64);
+    for _ in 0..8 {
+        let event = vfs::mount_event();
+        let text = match process_mount_points(host_pid) {
+            Ok(points) => {
+                if info {
+                    mountinfo(points)
+                } else {
+                    mounts(points)
+                }
+            }
+            Err(error) => return -(error as i64),
+        };
+        let stable = vfs::mount_event() == event;
+        prepared = (text, event);
+        if stable {
+            break;
+        }
+    }
+    let (text, event) = prepared;
+    let fd = content_fd_unpublished(text.as_bytes(), cloexec);
+    if fd < 0 {
+        return fd;
+    }
+    let fd_i = fd as i32;
+    MOUNT_POLLS.lock().unwrap().insert(
+        fd_i,
+        Arc::new(MountPoll {
+            host_pid,
+            info,
+            seen: AtomicU64::new(event),
+            filled: AtomicU64::new(event),
+        }),
+    );
+    if let Err(error) = fdtab::publish_guest(fd_i) {
+        fdtab::on_close(fd_i);
+        // SAFETY: the fd we just opened.
+        unsafe {
+            libc::close(fd_i);
+        }
+        return -(error as i64);
+    }
+    fd
+}
+
+/// `mounts_poll` without consuming the edge.
+pub(super) fn mount_poll_bits(fd: i32) -> Option<i16> {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let poll = polls.get(&fd)?;
+    let mut bits = MOUNT_IN | MOUNT_RDNORM;
+    // Another process's table is not this process's `ns->event`. The file
+    // is still pollable; it does not invent a priority edge.
+    if poll.host_pid == pid() && poll.seen.load(Ordering::Acquire) != vfs::mount_event() {
+        bits |= MOUNT_ERR | MOUNT_PRI;
+    }
+    Some(bits)
+}
+
+/// The poll that observes `ns->event` advances `p->event`. False when
+/// another waiter already did, or this fd is not a mount file.
+pub(super) fn take_mount_edge(fd: i32) -> bool {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let Some(poll) = polls.get(&fd) else {
+        return false;
+    };
+    if poll.host_pid != pid() {
+        return false;
+    }
+    let current = vfs::mount_event();
+    let seen = poll.seen.load(Ordering::Acquire);
+    if seen == current {
+        return false;
+    }
+    poll.seen.store(current, Ordering::Release);
+    true
+}
+
+pub(super) fn is_mount_poll(fd: i32) -> bool {
+    MOUNT_POLLS.lock().unwrap().contains_key(&fd)
+}
+
+pub(super) fn mount_wake_fd() -> i32 {
+    vfs::mount_wake_fd()
+}
+
+pub(super) fn drain_mount_wake() {
+    vfs::drain_mount_wake();
+}
+
+/// A dup shares the open file, including `p->event`.
+pub(super) fn dup_mount_poll(old: i32, new: i32) {
+    let mut polls = MOUNT_POLLS.lock().unwrap();
+    if let Some(poll) = polls.get(&old).cloned() {
+        polls.insert(new, poll);
+    }
+}
+
+pub(super) fn close_mount_poll(fd: i32) {
+    MOUNT_POLLS.lock().unwrap().remove(&fd);
+}
+
+/// Rewrite the content file when the mount generation moved, keeping the
+/// offset. `seq_read` shows the namespace as it is at the read.
+pub(super) fn refresh_mount_file(fd: i32) {
+    let poll = {
+        let polls = MOUNT_POLLS.lock().unwrap();
+        polls.get(&fd).cloned()
+    };
+    let Some(poll) = poll else {
+        return;
+    };
+    if poll.host_pid != pid() {
+        return;
+    }
+    for _ in 0..4 {
+        let event = vfs::mount_event();
+        if poll.filled.load(Ordering::Acquire) == event {
+            return;
+        }
+        let text = match process_mount_points(poll.host_pid) {
+            Ok(points) => {
+                if poll.info {
+                    mountinfo(points)
+                } else {
+                    mounts(points)
+                }
+            }
+            Err(_) => return,
+        };
+        if vfs::mount_event() != event {
+            continue;
+        }
+        // SAFETY: the content file's offset, restored after the rewrite.
+        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        fill(fd, text.as_bytes());
+        if pos > 0 {
+            let end = text.len() as i64;
+            unsafe {
+                libc::lseek(fd, pos.min(end), libc::SEEK_SET);
+            }
+        }
+        poll.filled.store(event, Ordering::Release);
+        return;
+    }
+}
+
 /// A file holding `data`, positioned at 0. Closing it gives the file back
 /// to the pool ([`recycle`]).
 pub(super) fn content_fd(data: &[u8], cloexec: bool) -> i64 {
@@ -2108,18 +2280,7 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
             if write {
                 return Some(-(EACCES as i64));
             }
-            match process_mount_points(host_pid) {
-                Ok(points) => content_fd(
-                    if info {
-                        mountinfo(points)
-                    } else {
-                        mounts(points)
-                    }
-                    .as_bytes(),
-                    cloexec,
-                ),
-                Err(error) => -(error as i64),
-            }
+            open_mount_table(host_pid, info, cloexec)
         }
         Some(Node::NetTable(kind)) => {
             if write {
@@ -2160,18 +2321,7 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
                 if write {
                     return Some(-(EACCES as i64));
                 }
-                match process_mount_points(host_pid) {
-                    Ok(points) => content_fd(
-                        if info {
-                            mountinfo(points)
-                        } else {
-                            mounts(points)
-                        }
-                        .as_bytes(),
-                        cloexec,
-                    ),
-                    Err(error) => -(error as i64),
-                }
+                open_mount_table(host_pid, info, cloexec)
             } else if let Some(Node::Dir(list)) = linked {
                 dir_fd(&canonical(&target), list, cloexec)
             } else if let Some(Node::File(data)) = linked.filter(|_| !write) {
@@ -2742,6 +2892,198 @@ mod tests {
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success());
             assert_eq!(out.stdout, data.as_bytes());
+        }
+    }
+
+    /// Linux `mounts_poll`: the fd is a regular file that poll can watch.
+    /// `EPOLLERR|EPOLLPRI` is one edge per mount-table change, shared by
+    /// dup, and a later read shows the new table. Another proc file stays
+    /// EPERM. Init's MountHandler registers exactly those two bits.
+    #[test]
+    fn proc_mounts_polls_once_per_mount_change() {
+        let (_view, root) = crate::vfs::test_view();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        assert!(ep >= 0, "epoll {ep}");
+        let stat = super::open("/proc/self/stat", 0, libc::O_RDONLY).unwrap();
+        assert!(stat >= 0, "stat {stat}");
+        let interest = [0xau64, 0x4d];
+        let add = |ep: i64, fd: i64| {
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                fd as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ])
+        };
+        assert_eq!(add(ep, stat), -(crate::errno::EPERM as i64));
+        assert_eq!(crate::sys::fs::close([stat as u64, 0, 0, 0, 0, 0]), 0);
+
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let info = super::open("/proc/self/mountinfo", 0, libc::O_RDONLY).unwrap();
+        assert!(mounts >= 0 && info >= 0 && mounts != info);
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(mounts as i32, &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
+        assert!(matches!(
+            crate::sys::fdtab::get(mounts as i32),
+            Some(crate::sys::fdtab::Kind::Content)
+        ));
+        assert_eq!(add(ep, info), 0);
+        assert_eq!(add(ep, mounts), 0);
+        let wait = |ms: i64| {
+            let mut out = [0u64; 2];
+            let n = crate::sys::epoll::epoll_pwait([
+                ep as u64,
+                out.as_mut_ptr() as u64,
+                1,
+                ms as u64,
+                0,
+                0,
+            ]);
+            (n, out)
+        };
+        assert_eq!(wait(0).0, 0);
+        let polled = |fd: i64, events: i16| {
+            let mut entry = libc::pollfd {
+                fd: fd as i32,
+                events,
+                revents: 0,
+            };
+            let mut timeout = [0i64; 2];
+            let n = crate::sys::poll::ppoll([
+                &mut entry as *mut libc::pollfd as u64,
+                1,
+                timeout.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+            ]);
+            (n, entry.revents)
+        };
+        assert_eq!(polled(mounts, 0x2), (0, 0));
+        let words = (mounts as usize + 1).div_ceil(64);
+        let mut read = vec![0u64; words];
+        let mut write = vec![0u64; words];
+        let mut exc = vec![0u64; words];
+        exc[(mounts as usize) / 64] |= 1u64 << ((mounts as usize) % 64);
+        let mut timeout = [0i64; 2];
+        assert_eq!(
+            crate::sys::poll::pselect6([
+                mounts as u64 + 1,
+                read.as_ptr() as u64,
+                write.as_ptr() as u64,
+                exc.as_mut_ptr() as u64,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(polled(mounts, 0x1 | 0x40), (1, 0x1 | 0x40));
+        assert_eq!(wait(0).0, 0);
+
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        let dupfd = crate::sys::fs::fcntl([mounts as u64, 0, 0, 0, 0, 0]);
+        assert!(copied >= 0 && dupfd >= 0 && copied != dupfd && copied != mounts);
+        let ep2 = crate::sys::epoll::epoll_create1([0; 6]);
+        assert_eq!(add(ep2, dupfd), 0);
+        assert_eq!(crate::sys::fs::close([ep2 as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([dupfd as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([info as u64, 0, 0, 0, 0, 0]), 0);
+
+        let mount_at = |name: &str| {
+            let host = root.join(name);
+            std::fs::create_dir_all(&host).unwrap();
+            let guest = format!("/mnt/{name}");
+            crate::vfs::add_mount(
+                &guest,
+                host,
+                crate::vfs::Area::Writable,
+                "tmpfs",
+                "tmpfs",
+            )
+            .unwrap();
+            guest
+        };
+        let names = ["mount-poll-a", "mount-poll-b", "mount-poll-c", "mount-poll-d"];
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let root_thread = root.clone();
+        let added = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let host = root_thread.join("mount-poll-a");
+            std::fs::create_dir_all(&host).unwrap();
+            crate::vfs::add_mount(
+                "/mnt/mount-poll-a",
+                host,
+                crate::vfs::Area::Writable,
+                "tmpfs",
+                "tmpfs",
+            )
+            .unwrap();
+        });
+        let (n, out) = wait(2_000);
+        added.join().unwrap();
+        cleanup.0.push("/mnt/mount-poll-a".into());
+        assert_eq!(n, 1, "epoll did not observe the mount");
+        assert_eq!(out[0] & 0xa, 0xa);
+        assert_eq!(out[0] & 0x1, 0);
+        assert_eq!(out[1], 0x4d);
+        assert_eq!(wait(0).0, 0);
+        assert_eq!(polled(copied, 0x2), (0, 0));
+
+        let mut bytes = vec![0u8; 65536];
+        let length = crate::sys::fs::pread64([
+            mounts as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(length > 0);
+        bytes.truncate(length as usize);
+        assert!(String::from_utf8(bytes).unwrap().contains(" /mnt/mount-poll-a "));
+
+        cleanup.0.push(mount_at("mount-poll-b"));
+        assert_eq!(polled(copied, 0x2), (1, 0x2 | 0x8));
+        assert_eq!(wait(0).0, 0);
+        assert_eq!(crate::sys::fs::close([copied as u64, 0, 0, 0, 0, 0]), 0);
+        cleanup.0.push(mount_at("mount-poll-c"));
+        let (n, out) = wait(0);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x4d));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        cleanup.0.push(mount_at("mount-poll-d"));
+        assert_eq!(wait(0).0, 0);
+        let again = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(add(ep, again), 0);
+        assert_eq!(wait(0).0, 0);
+        let mut bytes = vec![0u8; 65536];
+        let length = crate::sys::fs::pread64([
+            again as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(length > 0);
+        bytes.truncate(length as usize);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(" /mnt/mount-poll-d "));
+        assert_eq!(crate::sys::fs::close([again as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in names {
+            let _ = std::fs::remove_dir(root.join(name));
         }
     }
 }
