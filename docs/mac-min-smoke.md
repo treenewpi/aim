@@ -793,8 +793,9 @@ constant 4096 and does not read it, and Bionic is not rebuilt for this.
 The call succeeds. The host page's protection is write-wins over its
 4 KiB slices: a read-only slice keeps its writable neighbors, and
 execute is set only when some slice asks for it and none asks for
-write. A request that gives every slice the same protection updates the
-whole page.
+write. `PROT_NONE` does not count as write. A non-fixed mmap starts on
+a host-page boundary. A request that gives every slice the same
+protection updates the whole page.
 
 `a1d5909` then ran linker64. toybox stopped in
 `mmap(0, 0x12c0, PROT_READ, MAP_PRIVATE, libcrypto.so, 0x17a000)`: the

@@ -275,7 +275,12 @@ of our own.
   4 KiB slices on it, including another module's data and an anonymous
   mapping. Read is the union. Write is set if any slice asks for write.
   Execute is set only when some slice asks for execute and none asks for
-  write. The two are never set together. When the last writable slice is
+  write. `PROT_NONE`, including the linker's reservation gap between
+  segments, contributes nothing. A non-fixed mmap starts on a host-page
+  boundary. Sharing a host page is only for a guest `MAP_FIXED`, and the
+  diagnostic names the syscall that established each slice and that
+  slice's protection history. Write and execute are never set together.
+  When the last writable slice is
   dropped, by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is
   restored and `sys_icache_invalidate` covers the whole 16 KiB page.
   An instruction fetch from a slice that wants execute while a neighbor

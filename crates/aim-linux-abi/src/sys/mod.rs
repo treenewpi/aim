@@ -182,6 +182,15 @@ pub use window::init as init_heap_window;
 pub static TRACE: AtomicBool = AtomicBool::new(false);
 static TRACE_CALL: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    static ACTIVE_TRACE_CALL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The syscall currently running on this thread, when tracing is on.
+pub(crate) fn active_trace_call() -> Option<u64> {
+    ACTIVE_TRACE_CALL.with(|call| call.get())
+}
+
 /// Reclaims unused host memfd backing names after guest shutdown.
 pub fn sweep_unused_memfds() -> u64 {
     memfd::sweep_unused()
@@ -229,6 +238,16 @@ pub fn dispatch(ctx: &mut GuestContext) {
         let pid = unsafe { libc::getpid() };
         (pid, host_tid(), TRACE_CALL.fetch_add(1, Ordering::Relaxed))
     });
+    struct ClearCall;
+    impl Drop for ClearCall {
+        fn drop(&mut self) {
+            ACTIVE_TRACE_CALL.with(|call| call.set(None));
+        }
+    }
+    let _clear_call = ClearCall;
+    if let Some((_, _, call)) = trace {
+        ACTIVE_TRACE_CALL.with(|slot| slot.set(Some(call)));
+    }
     if let Some((pid, tid, call)) = trace {
         let name = match names::name(nr) {
             Some(n) => n,

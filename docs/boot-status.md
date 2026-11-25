@@ -185,8 +185,27 @@ by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is restored and
 fetch from a slice that wants execute while a neighbor wants write is
 `SIGSEGV` `SEGV_ACCERR` at that address. The diagnostic names the module
 and slice that wanted execute, the module and slice that holds write,
-and the thread. A request that itself asks for write and execute stays
-`EINVAL` on a private copy. `MAP_SHARED` residue mismatch stays
+the thread, the syscall that established each slice, and that slice's
+guest protection history. `PROT_NONE` is not write. A non-fixed mmap
+starts on a host-page boundary and does not reuse another mapping's
+leftover 4 KiB slices. Sharing a host page is only for a guest
+`MAP_FIXED`. A request that itself asks for write and execute stays
+`EINVAL` on a private copy. On `8735777ad` (archive
+`7333a5273cea919b4ec9d8af4b8b70d6e28bf178583037b3cab8c9899cbb4e9e`)
+property-r1 exited 1 after libbase, libc++, libc, libm, libdl, and
+liblog loaded, with no `CANNOT LINK`. Sixteen host-protection
+transitions ran and none restored execute. The fetch at `0x8009fdc9f0`
+is libc text (`mmap(0x8009f50000, 0x8cc30, R|X, PRIVATE|FIXED, fd 5,
+off 0x58000)`, guest end `0x8009fdcc30`). The slice at `0x8009fdd000`
+is not libc `.bss`: that LOAD has `p_filesz == p_memsz == 0x8cc30`, so
+`ElfReader::MapBssSection` does not mmap it, and the trace has no mmap
+of that address. It is the `PROT_NONE` anonymous reservation
+`ReserveWithAlignmentPadding` leaves between this segment and the next
+LOAD at `0x8009fe0000`. The fill of the text slice had recorded that
+gap as writable. `crash_dump64` then returned `ENOENT` and the signal
+was re-raised. The runtime apex payload contains `bin/crash_dump64`
+(511608 bytes); the guest's `/apex` does not, so
+`/apex/com.android.runtime/bin/crash_dump64` stays absent. `MAP_SHARED` residue mismatch stays
 `EINVAL`. On archive
 `778450d18ce8ff9affccd49ffd3f8bec461ade7feaf010bc710f07402e594487`,
 property-r1's getprop-before failed to link `liblog.so`: bias
@@ -277,7 +296,8 @@ this namespace init: `SIGHUP` for `RESTART` and `RESTART2`, `SIGINT` for
 `<runtime>/reboot-reason` record `guest-requested reboot:` plus the
 argument. For this apexd failure that argument is
 `reboot,bootloader,bootstrap-apexd-failed`. The exit is the recorded
-reboot. It does not make apexd succeed. Not remeasured on macmini.
+reboot. It does not make apexd succeed. The `8735777ad` property-r1
+run is the archive above. Init was not remeasured.
 The trace logs a bounded
 `/proc/sys` read or write payload, including a failed write, and a
 `readlinkat` result on failure. `write` of

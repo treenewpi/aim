@@ -227,8 +227,8 @@ pub fn private_copy_is_wx(prot: u32) -> bool {
 ///
 /// Read is the union. Write is set when any slice asks for it. Execute is
 /// set only when some slice asks for it and none asks for write. A zero
-/// word (absent or `PROT_NONE`) contributes nothing. The result never has
-/// write and execute together.
+/// word (absent or `PROT_NONE`) contributes nothing: a reservation gap is
+/// not a writable neighbor. The result never has write and execute together.
 pub fn host_protection(slices: impl IntoIterator<Item = u32>) -> u32 {
     let mut read = 0u32;
     let mut write = false;
@@ -249,6 +249,58 @@ pub fn host_protection(slices: impl IntoIterator<Item = u32>) -> u32 {
         host |= PROT_EXEC;
     }
     host
+}
+
+/// Guest protections after `MAP_FIXED` covers `cover` of one host page.
+///
+/// `prior` is the protection each slice had before this call. Slots outside
+/// `cover` keep it, including a `PROT_NONE` reservation (0). The caller
+/// passes that prior from before any temporary writable protection used to
+/// fill the new slices. A fill does not make the gap writable.
+pub fn overlay_fixed(prior: [u32; 4], prior_present: u8, cover: u8, prot: u32) -> ([u32; 4], u8) {
+    let prot = prot_bits(prot);
+    let mut out = prior.map(prot_bits);
+    let mut present = prior_present;
+    for slot in 0..4 {
+        if cover & (1 << slot) != 0 {
+            out[slot] = prot;
+            present |= 1 << slot;
+        }
+    }
+    (out, present)
+}
+
+/// Hint for a non-`MAP_FIXED` mapping.
+///
+/// Zero stays zero. An address that is already a host page stays. An
+/// address inside a host page moves to the next one, so the mapping does
+/// not start in another mapping's leftover 4 KiB slices. Sharing a host
+/// page is only for a guest `MAP_FIXED`.
+pub fn host_exclusive_hint(addr: u64) -> u64 {
+    if addr == 0 || addr & (PAGE - 1) == 0 {
+        addr
+    } else {
+        (addr | (PAGE - 1)).wrapping_add(1)
+    }
+}
+
+/// How a slice is named in the fault trace: the module, the syscall that
+/// established it, and the guest protections since then.
+pub fn slice_origin_label(name: &str, call: Option<u64>, history: &[u32]) -> String {
+    let call = match call {
+        Some(call) => call.to_string(),
+        None => "none".to_string(),
+    };
+    let history = if history.is_empty() {
+        "none".to_string()
+    } else {
+        history
+            .iter()
+            .map(|prot| format!("{prot:#x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!("{name} call {call} prot {history}")
 }
 
 /// Bytes of the host page to invalidate after a write-to-execute transition.
@@ -1227,6 +1279,94 @@ mod tests {
                 }],
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn libc_text_tail_keeps_execute_beside_a_prot_none_reservation() {
+        // apex libc.so LOAD RX: vaddr 0x58000, p_filesz == p_memsz == 0x8cc30,
+        // p_align 0x4000. Bias 0x8009ef8000 is the traced mapping
+        // mmap(0x8009f50000, 0x8cc30, R|X, PRIVATE|FIXED, fd, 0x58000).
+        // Guest end rounds to 0x8009fdd000. The next LOAD starts at vaddr
+        // 0xe8000 (0x8009fe0000). MapBssSection does not run: the file page
+        // end and the memory page end are the same. The three slices
+        // [0x8009fdd000, 0x8009fe0000) are the PROT_NONE reservation
+        // ReserveWithAlignmentPadding left between the segments. There is
+        // no second mmap. A fill of the text slice must not record that gap
+        // as writable.
+        let host = 0x8009fdc000u64;
+        let prior = [0, 0, 0, 0];
+        let (prot, present) = overlay_fixed(prior, 0b1111, 0b0001, RX);
+        assert_eq!(present, 0b1111);
+        assert_eq!(prot, [RX, 0, 0, 0]);
+        assert_eq!(host_protection(prot), RX);
+        let fixed = [
+            SliceView {
+                addr: host,
+                prot: RX,
+                module: "libc.so+0xe4000 call 200 prot 0x5",
+            },
+            SliceView {
+                addr: host + 0x1000,
+                prot: 0,
+                module: "anonymous call 40 prot 0x0",
+            },
+            SliceView {
+                addr: host + 0x2000,
+                prot: 0,
+                module: "anonymous call 40 prot 0x0",
+            },
+            SliceView {
+                addr: host + 0x3000,
+                prot: 0,
+                module: "anonymous call 40 prot 0x0",
+            },
+        ];
+        assert!(
+            exec_fault(0x8009fdc9f0, &fixed).is_none(),
+            "PROT_NONE is not a writer"
+        );
+        // The bug recorded the fill's writable host protection on the gap.
+        let leaked = [RX, RW, RW, RW];
+        assert_eq!(host_protection(leaked), RW);
+        let leaked_views = [
+            SliceView {
+                addr: host,
+                prot: RX,
+                module: "libc.so+0xe4000 call 200 prot 0x5",
+            },
+            SliceView {
+                addr: host + 0x1000,
+                prot: RW,
+                module: "anonymous call 40 prot 0x3",
+            },
+        ];
+        let fault = exec_fault(0x8009fdc9f0, &leaked_views).unwrap();
+        assert_eq!(fault.si_addr, 0x8009fdc9f0);
+        assert_eq!(fault.window.write_slice, host + 0x1000);
+        assert_eq!(fault.window.fetch_slice, host);
+        let msg = format_exec_window("guest tid 53315 pthread 0x1", &fault.window, 1);
+        assert!(msg.contains("anonymous call 40 prot 0x3"), "{msg}");
+        assert!(msg.contains("libc.so+0xe4000 call 200 prot 0x5"), "{msg}");
+        assert!(msg.contains("guest tid 53315"), "{msg}");
+        // A later MAP_FIXED anonymous writer in the gap is a real neighbor.
+        let (with_writer, _) = overlay_fixed(prot, present, 0b0010, RW);
+        assert_eq!(with_writer, [RX, RW, 0, 0]);
+        assert_eq!(host_protection(with_writer), RW);
+        assert_eq!(
+            host_exclusive_hint(0x8009fdd000),
+            0x8009fe0000,
+            "a non-fixed hint inside this page starts at the next host page"
+        );
+        assert_eq!(host_exclusive_hint(host), host);
+        assert_eq!(host_exclusive_hint(0), 0);
+        assert_eq!(
+            slice_origin_label("anonymous", Some(40), &[0]),
+            "anonymous call 40 prot 0x0"
+        );
+        assert_eq!(
+            slice_origin_label("anonymous", None, &[0, RW]),
+            "anonymous call none prot 0x0,0x3"
         );
     }
 }

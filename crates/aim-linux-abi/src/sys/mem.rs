@@ -227,6 +227,26 @@ fn store_hash(addr: u64, original: &fips::Hash, new: &fips::Hash) -> bool {
 
 /// mmap, counted against RLIMIT_AS and RLIMIT_DATA (`mmap_region`).
 pub fn mmap(a: [u64; 6]) -> i64 {
+    let result = mmap_accounted(a);
+    if result >= 0 {
+        let partial = a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0
+            && aim_guest_page::split_guest_range(a[0], a[1])
+                .ok()
+                .is_some_and(|split| split.is_partial());
+        let len = if partial {
+            aim_guest_page::guest_page_len(a[1]).unwrap_or(0)
+        } else {
+            page_up(a[1])
+        };
+        // After `mmap_guest` drops origins inside the new range. The
+        // reservation's slices outside that range keep the call that
+        // created them.
+        record_established(result as u64, len, a[2], a[3], a[4] as i32, a[5]);
+    }
+    result
+}
+
+fn mmap_accounted(a: [u64; 6]) -> i64 {
     if a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0
         && let Ok(split) = aim_guest_page::split_guest_range(a[0], a[1])
         && split.is_partial()
@@ -1299,6 +1319,13 @@ static GUEST_SLICES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
 static EOF_BUS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 fn forget_guest_slices(lo: u64, hi: u64) {
+    forget_guest_slice_state(lo, hi, true);
+}
+
+/// Drop per-slice protection rows in `[lo, hi)`. `drop_origin` is for
+/// unmap and for the range a new mmap replaces. A protection change keeps
+/// the establishing syscall and appends the new protection instead.
+fn forget_guest_slice_state(lo: u64, hi: u64, drop_origin: bool) {
     if lo >= hi {
         return;
     }
@@ -1313,7 +1340,9 @@ fn forget_guest_slices(lo: u64, hi: u64) {
         slices.remove(&page);
     }
     drop(slices);
-    forget_slice_modules(lo, hi);
+    if drop_origin {
+        forget_slice_modules(lo, hi);
+    }
     let mut pages = PAGE_PIECES.lock().unwrap();
     let hosts: Vec<u64> = pages
         .range(lo.saturating_sub(PAGE - 1)..hi)
@@ -1335,9 +1364,18 @@ struct PagePieces {
 
 static PAGE_PIECES: Mutex<BTreeMap<u64, PagePieces>> = Mutex::new(BTreeMap::new());
 
-/// Module that mapped each guest slice. The fault diagnostic names both the
-/// slice that wanted execute and the slice that still wants write.
-static SLICE_MODULE: Mutex<BTreeMap<u64, String>> = Mutex::new(BTreeMap::new());
+/// Who established each guest slice, and the guest protections since. The
+/// fault diagnostic names the syscall and this history, so a `PROT_NONE`
+/// reservation is distinguishable from a later writable mapping.
+struct SliceOrigin {
+    call: Option<u64>,
+    name: String,
+    history: Vec<u32>,
+}
+
+static SLICE_ORIGIN: Mutex<BTreeMap<u64, SliceOrigin>> = Mutex::new(BTreeMap::new());
+
+const PROT_HISTORY: usize = 8;
 
 static HOST_PROT_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 static EXEC_WINDOW_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -1360,15 +1398,96 @@ fn slice_module_name(anon: bool, fd: i32) -> String {
         .unwrap_or_else(|| format!("fd {fd}"))
 }
 
-fn remember_slice_module(addr: u64, name: &str) {
-    SLICE_MODULE.lock().unwrap().insert(addr, name.to_string());
+fn remember_slice(addr: u64, name: &str, prot: u32) {
+    SLICE_ORIGIN.lock().unwrap().insert(
+        addr,
+        SliceOrigin {
+            call: super::active_trace_call(),
+            name: name.to_string(),
+            history: vec![aim_guest_page::prot_bits(prot)],
+        },
+    );
+}
+
+fn note_slice_prot(addr: u64, prot: u32) {
+    let prot = aim_guest_page::prot_bits(prot);
+    let mut origins = SLICE_ORIGIN.lock().unwrap();
+    let Some(origin) = origins.get_mut(&addr) else {
+        return;
+    };
+    if origin.history.last().copied() == Some(prot) {
+        return;
+    }
+    if origin.history.len() == PROT_HISTORY {
+        origin.history.remove(0);
+    }
+    origin.history.push(prot);
+}
+
+fn slice_label(addr: u64, prot: u32) -> String {
+    let origin = SLICE_ORIGIN.lock().unwrap().get(&addr).map(|origin| {
+        (
+            origin.name.clone(),
+            origin.call,
+            origin.history.clone(),
+        )
+    });
+    let (name, call, history) = match origin {
+        Some((name, call, history)) => (name, call, history),
+        None => {
+            let described = crate::diag::describe(addr);
+            let name = if described == "?" {
+                "anonymous".to_string()
+            } else {
+                described
+            };
+            (name, None, vec![aim_guest_page::prot_bits(prot)])
+        }
+    };
+    aim_guest_page::slice_origin_label(&name, call, &history)
+}
+
+fn record_established(base: u64, len: u64, prot: u64, flags: u64, fd: i32, map_off: u64) {
+    if len == 0 {
+        return;
+    }
+    let prot = aim_guest_page::prot_bits((prot & !(PROT_BTI | PROT_MTE)) as u32);
+    let anon = flags & MAP_ANONYMOUS != 0;
+    let path = slice_module_name(anon, fd);
+    let mut at = base & !(GUEST_PAGE - 1);
+    let end = base.saturating_add(len);
+    while at < end {
+        let name = if anon {
+            path.clone()
+        } else {
+            format!(
+                "{path}+{:#x}",
+                aim_guest_page::file_offset_at(base, map_off, at)
+            )
+        };
+        remember_slice(at, &name, prot);
+        at += GUEST_PAGE;
+    }
+}
+
+fn note_prot_range(lo: u64, hi: u64, prot: u32) {
+    if lo >= hi {
+        return;
+    }
+    let mut at = lo & !(GUEST_PAGE - 1);
+    while at < hi {
+        if at + GUEST_PAGE > lo {
+            note_slice_prot(at, prot);
+        }
+        at += GUEST_PAGE;
+    }
 }
 
 fn forget_slice_modules(lo: u64, hi: u64) {
     if lo >= hi {
         return;
     }
-    let mut modules = SLICE_MODULE.lock().unwrap();
+    let mut modules = SLICE_ORIGIN.lock().unwrap();
     let keys: Vec<u64> = modules
         .range(lo..hi)
         .map(|(&addr, _)| addr)
@@ -1394,7 +1513,11 @@ fn trace_host_transition(host: u64, pieces: &PagePieces, old: u32, new: u32) {
             if pieces.present & (1 << slot) == 0 {
                 format!("{at:#x}:absent")
             } else {
-                format!("{at:#x}:{:#x}", pieces.prot[slot])
+                format!(
+                    "{at:#x}:{:#x} {}",
+                    pieces.prot[slot],
+                    slice_label(at, pieces.prot[slot])
+                )
             }
         })
         .collect();
@@ -1445,7 +1568,7 @@ fn punch_page(host: u64, cover: u8) -> i64 {
         if cover & (1 << slot) != 0 {
             let at = host + slot * GUEST_PAGE;
             forget_eof_bus(at, at + GUEST_PAGE);
-            SLICE_MODULE.lock().unwrap().remove(&at);
+            SLICE_ORIGIN.lock().unwrap().remove(&at);
         }
     }
     if cover == 0b1111 {
@@ -1513,6 +1636,31 @@ fn map_covered_slices(
         return -(EINVAL as i64);
     }
     let existed = page_prot(host);
+    // Snapshot before the fill makes this host page writable. The gap beside
+    // libc's text is the linker's PROT_NONE reservation: it has no mmap of
+    // its own. Reading the host protection after the fill stored that
+    // temporary write on the gap, and write-wins then dropped execute.
+    let existing = { PAGE_PIECES.lock().unwrap().get(&host).copied() };
+    let seeded = if let Some(entry) = existing {
+        entry
+    } else if let Some(bits) = existed {
+        let mut prior = [bits; 4];
+        for slot in 0..4usize {
+            let at = host + slot as u64 * GUEST_PAGE;
+            if let Ok(found) = slice_prot(at) {
+                prior[slot] = found;
+            }
+        }
+        PagePieces {
+            present: 0b1111,
+            prot: prior,
+        }
+    } else {
+        PagePieces {
+            present: 0,
+            prot: [0; 4],
+        }
+    };
     if existed.is_none() {
         match host_mmap(
             host,
@@ -1557,7 +1705,7 @@ fn map_covered_slices(
         } else if prot & libc::PROT_EXEC as u32 != 0 {
             patch::rewrite_region(at, GUEST_PAGE);
         }
-        remember_slice_module(at, &module);
+        remember_slice(at, &module, prot);
         if anon {
             crate::diag::register_module(at, at + GUEST_PAGE, "anonymous".to_string());
         } else {
@@ -1565,47 +1713,21 @@ fn map_covered_slices(
             crate::diag::register_fd_module(at, GUEST_PAGE, fd, file_off);
         }
     }
-    // A uniform page has no `PAGE_PIECES` row. Its guest slices can still
-    // differ from the host protection (`GUEST_SLICES`), so seed from those
-    // before folding write-wins. Neighbors include another module's data.
-    let existing = { PAGE_PIECES.lock().unwrap().get(&host).copied() };
-    let seeded = if let Some(entry) = existing {
-        entry
-    } else if let Some(bits) = existed {
-        let mut prot = [bits; 4];
-        for slot in 0..4usize {
-            let at = host + slot as u64 * GUEST_PAGE;
-            if let Ok(prior) = slice_prot(at) {
-                prot[slot] = prior;
-            }
-        }
-        PagePieces {
-            present: 0b1111,
-            prot,
-        }
-    } else {
-        PagePieces {
-            present: 0,
-            prot: [0; 4],
-        }
+    let (row, present) = aim_guest_page::overlay_fixed(seeded.prot, seeded.present, cover, prot);
+    let pieces = PagePieces {
+        present,
+        prot: row,
     };
-    let (old_host, new_host, pieces) = {
+    let old_host = aim_guest_page::host_protection(present_prots(&seeded));
+    let new_host = aim_guest_page::host_protection(present_prots(&pieces));
+    {
         let mut pages = PAGE_PIECES.lock().unwrap();
-        let entry = pages.entry(host).or_insert(seeded);
-        let old_host = aim_guest_page::host_protection(present_prots(entry));
-        for slot in 0..4 {
-            if cover & (1 << slot) != 0 {
-                entry.present |= 1 << slot;
-                entry.prot[slot] = prot;
-            }
-        }
-        let new_host = aim_guest_page::host_protection(present_prots(entry));
-        let pieces = *entry;
-        if entry.present == 0b1111 && entry.prot.iter().all(|item| *item == entry.prot[0]) {
+        if present == 0 || (present == 0b1111 && row.iter().all(|item| *item == row[0])) {
             pages.remove(&host);
+        } else {
+            pages.insert(host, pieces);
         }
-        (old_host, new_host, pieces)
-    };
+    }
     if aim_guest_page::private_copy_is_wx(prot) {
         // Anonymous request that itself asks for write and execute. This is
         // the MAP_JIT path, not a neighbor slice.
@@ -1713,23 +1835,13 @@ pub(super) fn note_exec_window(addr: u64) {
         return;
     }
     let mut owned = Vec::new();
-    {
-        let modules = SLICE_MODULE.lock().unwrap();
-        for s in 0..4usize {
-            if pieces.present & (1 << s) == 0 {
-                continue;
-            }
-            let at = host + s as u64 * GUEST_PAGE;
-            let module = modules.get(&at).cloned().unwrap_or_else(|| {
-                let described = crate::diag::describe(at);
-                if described == "?" {
-                    "anonymous".to_string()
-                } else {
-                    described
-                }
-            });
-            owned.push((at, pieces.prot[s], module));
+    for s in 0..4usize {
+        if pieces.present & (1 << s) == 0 {
+            continue;
         }
+        let at = host + s as u64 * GUEST_PAGE;
+        let module = slice_label(at, pieces.prot[s]);
+        owned.push((at, pieces.prot[s], module));
     }
     let views: Vec<aim_guest_page::SliceView<'_>> = owned
         .iter()
@@ -1886,6 +1998,7 @@ fn mprotect_subpage(a: [u64; 6]) -> i64 {
             }
         }
         for (page, prot) in slices {
+            note_slice_prot(page, prot);
             if prot == aim_guest_page::host_prot_at(&host_ops, &current, host_lo, page) {
                 recorded.remove(&page);
             } else {
@@ -1937,8 +2050,9 @@ pub fn mprotect(a: [u64; 6]) -> i64 {
     if result == 0 {
         vm_account::with(|s| s.protect(addr, addr + len, writable));
         // The length covered whole host pages, so every guest slice in it
-        // now has this protection.
-        forget_guest_slices(addr, addr + len);
+        // now has this protection. The establishing syscall stays.
+        note_prot_range(addr, addr + len, a[2] as u32);
+        forget_guest_slice_state(addr, addr + len, false);
     }
     result
 }
