@@ -665,8 +665,11 @@ fn save_vfork(w: &mut Writer, pipe: Option<(i32, i32)>) {
 /// Fork the calling guest thread's process; the child's pid.
 pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Result<i32, i64> {
     let exe = super::super::exec::launch_exe().ok_or(-(libc::ENOEXEC as i64))?;
-    let mount_text =
-        crate::vfs::fork_mounts_text(setup.new_mount_namespace).map_err(|error| -(error as i64))?;
+    let mount_text = crate::vfs::fork_mounts_text(setup.new_mount_namespace).map_err(|error| {
+        let error = -(error as i64);
+        crate::diag!("[linux-abi] clone: parent mount text errno {error}");
+        error
+    })?;
     let mut w = Writer::default();
     w.u64(setup.stack);
     w.opt(setup.tls, |w, v| w.u64(v));
@@ -761,12 +764,15 @@ pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Resu
         Ok(pid) => {
             if let Err(error) = crate::vfs::publish_fork_mounts(pid, &mount_text) {
                 abandon(pid, port);
-                return Err(-(error as i64));
+                let error = -(error as i64);
+                crate::diag!("[linux-abi] clone: parent publish mounts errno {error}");
+                return Err(error);
             }
             // Before the handover: the child keeps this entry.
             crate::sys::cred::note_child(pid);
             if let Err(error) = crate::sys::pty_owner::inherit_child(pid) {
                 abandon(pid, port);
+                crate::diag!("[linux-abi] clone: parent pty inherit errno {error}");
                 return Err(-(error as i64));
             }
             if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
@@ -1801,9 +1807,39 @@ fn become_child(h: Handover) -> String {
     super::child_started(c, stack, set_tid, clear_tid);
     if let Some(p) = thread_of {
         super::super::procrec::set_tgid(p);
+    } else {
+        note_child_apex();
     }
     // SAFETY: this thread's context, holding the forking thread's registers.
     unsafe { context::resume(ctx) }
+}
+
+/// Whether this new process can see the runtime APEX linker. A fork without
+/// `CLONE_NEWNS` reloaded the namespace journal, so an apexd mount in that
+/// namespace is here. The line is the child's, after `clone` has a pid.
+fn note_child_apex() {
+    if !crate::sys::tracing() {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    let path = b"/apex/com.android.runtime/bin/linker64";
+    let apex = crate::vfs::own_mounts_text()
+        .lines()
+        .filter(|line| line.contains("/apex"))
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    match crate::vfs::resolve(crate::vfs::LINUX_AT_FDCWD, path, true) {
+        Ok(found) => crate::diag!(
+            "[linux-abi] fork child pid={pid} linker64 host=\"{}\" apex={apex}",
+            found.host.to_string_lossy()
+        ),
+        Err(error) => crate::diag!(
+            "[linux-abi] fork child pid={pid} linker64 errno={error} ({}) apex={apex}",
+            crate::sys::names::errno_name(error as i32)
+        ),
+    }
 }
 
 fn confirm_ready(parent: Port, member: u64) -> Result<(), String> {

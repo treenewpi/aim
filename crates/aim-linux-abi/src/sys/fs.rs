@@ -1505,14 +1505,17 @@ pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<
 /// Host path `lookup` would use for an absolute `openat` or `newfstatat`
 /// that returned `ENOENT`. The syscall line names only the guest path.
 pub(super) fn trace_lookup_host(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
-    if returned != -(ENOENT as i64) {
+    if returned != -(ENOENT as i64) && returned != -(crate::errno::EPERM as i64) {
         return None;
     }
-    // openat 56, newfstatat 79. The path is the second argument.
-    if nr != 56 && nr != 79 {
-        return None;
-    }
-    let path = guest_cstr(a[1]).ok()?;
+    // openat 56, newfstatat 79, faccessat 48, readlinkat 78, execveat 281:
+    // the path is the second argument. execve 221 names it first.
+    let index = match nr {
+        48 | 56 | 78 | 79 | 281 => 1,
+        221 => 0,
+        _ => return None,
+    };
+    let path = guest_cstr(a[index]).ok()?;
     if path.first() != Some(&b'/')
         || path.split(|b| *b == b'/').any(|part| part == b"." || part == b"..")
     {
@@ -1540,7 +1543,8 @@ pub(super) fn trace_lookup_host(nr: u64, a: &[u64; 6], returned: i64) -> Option<
         guest.to_string()
     };
     Some(format!(
-        "[linux-trace] lookup \"{guest}\" host=\"{host}\" area={area}"
+        "[linux-trace] nr={nr} errno={} path=\"{guest}\" host=\"{host}\" area={area}",
+        -returned
     ))
 }
 

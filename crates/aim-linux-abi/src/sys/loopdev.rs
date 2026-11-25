@@ -2119,6 +2119,18 @@ mod tests {
         let guest = "/aim-fork-mount";
         mount_ext4(&format!("/dev/block/loop{minor}"), guest, true).unwrap();
         assert_eq!(guest_read(&format!("{guest}/apex_manifest.pb")), manifest);
+        // A child without `CLONE_NEWNS` reloads the mount line. Dropping
+        // the mount and loading that line brings the file back.
+        let text = crate::vfs::own_mounts_text();
+        let line = text
+            .lines()
+            .find(|line| line.contains(guest))
+            .expect("mount line")
+            .to_string();
+        assert!(line.contains("ext4"), "{line}");
+        crate::vfs::remove_mount(guest).unwrap();
+        crate::vfs::load_own_mounts(&line).unwrap();
+        assert_eq!(guest_read(&format!("{guest}/apex_manifest.pb")), manifest);
         super::super::pty_owner::with_owner_down(|| {
             super::super::pty_owner::inherit_child(1).unwrap();
         });

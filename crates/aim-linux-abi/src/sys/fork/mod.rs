@@ -247,6 +247,13 @@ fn fork(ctx: &mut GuestContext, mut r: Request) -> i64 {
                 // SAFETY: our pipe.
                 unsafe { libc::close(fd) };
             }
+            // This is the value the caller's `clone` returns. The child has
+            // not executed a guest instruction yet: its `execve` is a later
+            // syscall in that process, with its own pid.
+            crate::diag!(
+                "[linux-abi] clone: parent errno {e} ({}); the child has not run a guest syscall",
+                crate::sys::names::errno_name((-e) as i32)
+            );
             return e;
         }
     };

@@ -244,7 +244,7 @@ fn trace_arg(nr: u64, index: usize, value: u64) -> String {
 /// Syscalls whose first or second argument is a path, for tracing.
 fn path_arg(nr: u64) -> Option<usize> {
     match nr {
-        34 | 35 | 48 | 56 | 78 | 79 | 439 | 291 | 53 | 54 | 88 => Some(1),
+        34 | 35 | 48 | 56 | 78 | 79 | 439 | 291 | 53 | 54 | 88 | 281 => Some(1),
         17 | 49 | 221 => Some(0),
         _ => None,
     }
@@ -283,7 +283,7 @@ pub fn dispatch(ctx: &mut GuestContext) {
             line.push_str(&trace_arg(nr, i, *v));
         }
         line.push(')');
-        crate::diag!("{line} [pid={pid} tid={tid} call={call} enter]");
+        crate::diag!("{line} [pid={pid} tid={tid} nr={nr} call={call} enter]");
     }
     if private_offset::held() && !private_offset::keeps(nr) {
         private_offset::release();
@@ -307,27 +307,27 @@ pub fn dispatch(ctx: &mut GuestContext) {
         // After the call: a bounded copy of a write to guest fd 0, 1, or 2.
         // `r` is already the syscall result and is not assigned here.
         if let Some(payload) = fs::trace_stdio_write(nr, &a, r) {
-            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
         }
         if let Some(payload) = fs::trace_readlinkat(nr, &a, r) {
-            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
         }
         if let Some(payload) = fs::trace_proc_sys(nr, &a, r) {
-            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
         }
         if let Some(payload) = fs::trace_lookup_host(nr, &a, r) {
-            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
         }
         if (-4095..0).contains(&r) {
             crate::diag!(
-                "{line} = -{} ({}) [pid={pid} tid={tid} call={call} leave]",
+                "{line} = -{} ({}) [pid={pid} tid={tid} nr={nr} call={call} leave]",
                 -r,
                 names::errno_name(-r as i32)
             );
         } else if !(0..=0xffff).contains(&r) {
-            crate::diag!("{line} = {r:#x} [pid={pid} tid={tid} call={call} leave]");
+            crate::diag!("{line} = {r:#x} [pid={pid} tid={tid} nr={nr} call={call} leave]");
         } else {
-            crate::diag!("{line} = {r} [pid={pid} tid={tid} call={call} leave]");
+            crate::diag!("{line} = {r} [pid={pid} tid={tid} nr={nr} call={call} leave]");
         }
     }
     ctx.x[0] = r as u64;

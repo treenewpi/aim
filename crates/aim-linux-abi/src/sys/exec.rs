@@ -278,11 +278,11 @@ fn classify(host: &CStr) -> Result<Kind, i64> {
 }
 
 pub fn execve(ctx: &mut GuestContext, a: [u64; 6]) -> i64 {
-    exec(ctx, LINUX_AT_FDCWD, a[0], a[1], a[2], 0)
+    exec(ctx, 221, LINUX_AT_FDCWD, a[0], a[1], a[2], 0)
 }
 
 pub fn execveat(ctx: &mut GuestContext, a: [u64; 6]) -> i64 {
-    exec(ctx, a[0] as i32, a[1], a[2], a[3], a[4])
+    exec(ctx, 281, a[0] as i32, a[1], a[2], a[3], a[4])
 }
 
 fn trace_stage(stage: &str) {
@@ -296,7 +296,15 @@ fn trace_stage(stage: &str) {
     }
 }
 
-fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, flags: u64) -> i64 {
+fn exec(
+    ctx: &mut GuestContext,
+    nr: u64,
+    dirfd: i32,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> i64 {
     trace_stage("arguments.enter");
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return -(EINVAL as i64);
@@ -344,14 +352,17 @@ fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, fla
     trace_stage("resolve.enter");
     let target = match resolve(dirfd, &path, flags) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => {
+            note_exec(nr, "program", &String::from_utf8_lossy(&path), e);
+            return e;
+        }
     };
     trace_stage("resolve.leave");
     trace_stage("interpret.enter");
     match interpret(target, &filename, argv) {
         Ok((target, argv)) => {
             trace_stage("interpret.leave");
-            in_place(ctx, &target, &argv, &envp, &filename)
+            in_place(ctx, nr, &target, &argv, &envp, &filename)
                 .unwrap_or_else(|| relaunch(&target.guest, &argv, &envp, &filename))
         }
         Err(e) => e,
@@ -362,6 +373,7 @@ fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, fla
 /// cannot, and execs anew.
 fn in_place(
     ctx: &mut GuestContext,
+    nr: u64,
     target: &vfs::Resolved,
     argv: &[CString],
     envp: &[CString],
@@ -380,12 +392,18 @@ fn in_place(
     // What Linux checks before the point of no return: the interpreter.
     let interp = match crate::loader::interpreter_errno(&target.host) {
         Ok(interp) => interp,
-        Err(error) => return Some(-(error as i64)),
+        Err(error) => {
+            note_exec(nr, "interpreter-header", &target.guest, -(error as i64));
+            return Some(-(error as i64));
+        }
     };
     if let Some(i) = interp {
         let r = match vfs::resolve(LINUX_AT_FDCWD, i.as_bytes(), true) {
             Ok(r) => r,
-            Err(e) => return Some(-(e as i64)),
+            Err(e) => {
+                note_exec(nr, "interpreter", &i, -(e as i64));
+                return Some(-(e as i64));
+            }
         };
         if let Err(e) = classify(&r.host) {
             return Some(e);
@@ -468,6 +486,24 @@ pub fn interpret(
             }
         }
     }
+}
+
+/// A failed `execve` in this process. `errno` is the negative Linux value
+/// the syscall returns. The program path and, when the ELF named one, the
+/// interpreter path are both recorded: `clone` has already returned in the
+/// parent, so this line is the child's.
+fn note_exec(nr: u64, what: &str, path: &str, errno: i64) {
+    if !super::tracing() || !(-4095..0).contains(&errno) {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    crate::diag!(
+        "[linux-abi] exec: pid={pid} tid={} nr={nr} {what}=\"{path}\" errno={} ({})",
+        super::host_tid(),
+        -errno,
+        super::names::errno_name((-errno) as i32)
+    );
 }
 
 fn to_cstring(b: &[u8]) -> CString {

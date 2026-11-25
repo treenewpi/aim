@@ -333,12 +333,21 @@ succeeded 35 times. Init then rebooted after 1.8s with
 `clone(0x1200011)` = `ENOENT` at calls 8347 (`prng_seeder`) and 8365
 (`boringssl_self_test64_vendor`). Those are the first forks after the
 APEX mounts; the same clone had succeeded for vendor_init, ueventd and
-apexd. The errno was the host helper `aim-pty-holder` (or Darwin
-`posix_spawn` opening `.`), stored when logwrapper's `openat("/dev/ptmx")`
-failed and then returned from `inherit_child` with no `[linux-abi]`
-line. `clone` now traces that host path and does not return it.
-`/dev/ptmx` returns `ENODEV` when the helper binary is missing. A
-`LOOP_CONFIGURE` whose backing fd is not open in the process is
+apexd. That `-2` is the parent's `clone` result, produced before the
+child runs a guest instruction: the handover returns the pid, and the
+child's `execve` of `boringssl_self_test64` is a later syscall in the
+child. A parent `ENOENT` from `aim-pty-holder` or from Darwin
+`posix_spawn` opening `.` is traced and is not returned as a guest
+path error. `/dev/ptmx` returns `ENODEV` when the helper binary is
+missing. The guest pty (`posix_openpt`, `TIOCGPTN`, `TIOCSPTLCK`,
+`/dev/pts/N`) is that helper. A fork without `CLONE_NEWNS` reloads the
+mount-namespace journal, so an apexd ext4 or bind in that namespace is
+the child's view; `setns` switches the journal and `unshare(CLONE_NEWNS)`
+copies it. The child's `execve` line names the program and, when the
+ELF has one, the interpreter (`/apex/com.android.runtime/bin/linker64`).
+Syscall trace lines carry `nr`, and an `ENOENT` or `EPERM` path lookup
+names the guest path. `LOOP_CONFIGURE` of a backing fd that is not
+open in the process is
 `EBADF`, including the first try on loop0 before that thread had opened
 the apex file; `CLONE_FILES` threads share the one table. `DM_DEV_STATUS`
 in init and ueventd is `ENXIO` because those processes did not see
