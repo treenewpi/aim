@@ -3525,7 +3525,15 @@ fn fanout(
 }
 
 /// Copy the mount just created at `guest` into every peer of its parent.
+///
+/// A FUSE route already reaches peers through the shared route table.
+/// A second plain copy at the same path would hide that route.
 fn propagate_created(guest: &str) -> Result<(), Errno> {
+    if vfs().mounts.read().unwrap().iter().any(|mount| {
+        mount.guest == guest && mount.own && mount.fuse.is_some()
+    }) {
+        return Ok(());
+    }
     let peers = propagation_peers(guest)?;
     if peers.is_empty() {
         return Ok(());
