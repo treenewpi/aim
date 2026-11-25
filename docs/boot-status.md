@@ -30,42 +30,63 @@ when `current->fs->users != 1`, and `unshare(CLONE_NEWNS)` implies
 `CLONE_FS`, so the caller can switch back while the other thread stays in
 the namespace it already had. The fd opened before `unshare` stays the
 namespace it named at open, and `readlink` of that fd keeps that inode.
-vendor_init (host pid 47019, restarted as 47020) then forked and its
-`setns(15, CLONE_NEWNS)` returned `-EINVAL` (child call 7). The child's
-`readlink` of `/proc/self/ns/mnt` was `mnt:[268435457]` (child call 6),
-the bootstrap namespace the parent had switched back to. kmsg:
-`Could not switch to "default" mount namespace`, then abort and
-`exit_group(6)`. That `EINVAL` is `mount_namespace_of` returning none
-(`sys/mount.rs`): the host fd was inherited, and the child's namespace
-table was empty. It is not a leftover thread count and not `fs->users`.
-Fork without `CLONE_FS` already gives the child its own `fs_struct` with
-`users == 1`. The fork image carries each namespace and rebinds the
-inherited fds. On `96f65ff` (archive
-`ba417120f10973655e7c4a47312f4543e245e5f5e0e054e736ae311ae3b5bc50`)
-vendor_init's `setns(15, CLONE_NEWNS)` returned 0, then
-`readlinkat("/proc/self/exe")` returned `-EIO` (child call 8) and
-`execve` of an empty path returned `ENOENT` (call 9). kmsg:
-`Could not execv subcontext init: No such file or directory`. The `EIO`
-is `refresh_fuse_mounts`: the reconstructed journal had no mount
-records, so a fuse line from another namespace made `origin_visible`
-return `EIO` before procfs read the exe link. The parked view now keeps
-those records. `/proc/self/exe` stays the executed file across `setns`.
-A plain `/proc` content fd is in the fork image, and an evdev socket is
-adopted from the inherited fd. A binder file's mach send right is not
-in that socket. This is not remeasured. On `96f65ff` the main init opened `kptr_restrict` read-only (fd 17, call
-6296) and wrote 2 bytes three times on fd 18: `EINVAL`, `EINVAL`,
-`EACCES` (calls 6299, 6307, 6316). kmsg: `Unable to set minimum option
-value 2 in /proc/sys/kernel/kptr_restrict`. Those `EINVAL` results are
-the `proc_dointvec` range check, so fd 18 was open for write and
-`CAP_SYS_ADMIN` was held: a missing cap is `EPERM`, and a write on a
-read-only open is `EBADF`. The `EACCES` was the store refusing a path
-lookup that was not the kernfs area. An in-range write now stores the
-value for that proc file either way, and the already-open read fd sees
-it. `kptr_restrict` stays mode 0644, 0..=2, default 0. `mmap_rnd_bits`
+vendor_init's `setns` `EINVAL` on `9eacf04` was an empty child
+namespace table, and on `96f65ff` `setns` returned 0 then `readlink` of
+`/proc/self/exe` returned `EIO` and `execve` of an empty path returned
+`ENOENT`. Those are not the current stop. The parked journal keeps its
+mount records, a plain `/proc` content fd is in the fork image, and an
+evdev socket is adopted from the inherited fd. A binder file's mach send
+right is not in that socket. On `43f94a33` (archive
+`d2c89ce113b2528f221179295b6609e2a55dfaebbf81f83ae59a85f7fa832742`, lock
+unchanged, `--offline`) main init stays up through the harness bound
+(8.1s). `kptr_restrict` writes of 4 and 3 return `EINVAL` and 2 persists;
+the read-back is `2\n`. Second stage runs, both property sockets exist,
+and `SetupMountNamespaces` completes. The actions that finished are
+`SetupCgroups`, `SetKptrRestrict`, `TestPerfEventSelinux`,
+`ConnectEarlyStageSnapuserd`, and `wait_for_coldboot_done`. This is not
+a boot and there is no `init ok`.
+
+Each vendor_init child (clone `0x1200011`) does `setns(15, CLONE_NEWNS)`
+with result 0 (call 7), `readlink("/proc/self/exe")` returns
+`/system/bin/init`, and `execve` of that path succeeds. The new image's
+linker then gets `ENOENT` for `/linkerconfig/ld.config.txt` (call 126)
+and the other `ld.config` paths, then `ENOENT` for `libc.so` under
+`/system/lib64/bootstrap`, `/system/lib64` (call 307), `/odm/lib64`, and
+`/vendor/lib64`, and exits with `CANNOT LINK EXECUTABLE`. The 479
+restarts are that failure repeating. The syscall trace records the guest
+path and the errno. It does not record the host path, and the archive is
+not in this tree.
+
+The parent resolves those paths at process start, before
+`MountExtraFilesystems`, with no covering mount: `lookup` falls through
+to the image root (`Area::Image`). That is the prepared root's
+`linkerconfig/ld.config.txt`, which is why main init links. The same
+startup lookup is where `/system/lib64/bootstrap/libc.so` is opened when
+the root has that file. `MountExtraFilesystems` then mounts an empty
+tmpfs on `/apex` and, because `/system/bin/recovery` is absent, on
+`/bootstrap-apex` and `/linkerconfig`. `unshare(CLONE_NEWNS)` copies that
+whole table (`duplicate_table`) and clones the journal (`clone_to`:
+base, events, and mount records). It does not create an empty or partial
+table. The copy includes those tmpfs mounts. `/system` is not one of
+them, so it stays the image root. `setns` installs the copied table and
+sets cwd to `/`. An absolute lookup does not use cwd, and the image root
+is unchanged. Exec keeps that namespace: `load_own_mounts` replays the
+cloned journal rather than building a new empty view. The child's
+`ld.config.txt` `ENOENT` is the copied tmpfs directory, which hides the
+image file the parent opened before the mount. `/system/lib64/libc.so`
+in the layer is a symlink into `/apex`, which the same tmpfs hides.
+`/system/lib64/bootstrap/libc.so` stays on the image root in this code;
+call 307's `ENOENT` means that host path has no such file in the root
+that was run. A failed absolute `openat` or `newfstatat` now logs the
+lookup host and area. `unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
+call 1065) returns `EINVAL`. Linux would return 0 with `CAP_SYS_ADMIN`
+(since 4.6). This is the unsupported-namespace gate (ADR 0012). Init has
+the capability and continues. A cgroup namespace is not invented here.
+`kptr_restrict` stays mode 0644, 0..=2, default 0. `mmap_rnd_bits`
 (18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same kind of file.
 Guest mmap does not consult those two values. The trace logs a bounded
 `/proc/sys` read or write payload, including a failed write, and a
-`readlinkat` result on failure. This is not remeasured. `write` of
+`readlinkat` result on failure. `write` of
 fd 3 for 61 bytes returned 61
 on the earlier `11bbedf` run; the raw guest buffer was not captured, and
 the 2200-byte diagnostic marker does not contain that text. Property,

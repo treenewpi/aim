@@ -283,6 +283,9 @@ pub fn dispatch(ctx: &mut GuestContext) {
         if let Some(payload) = fs::trace_proc_sys(nr, &a, r) {
             crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
         }
+        if let Some(payload) = fs::trace_lookup_host(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} call={call}]");
+        }
         if (-4095..0).contains(&r) {
             crate::diag!(
                 "{line} = -{} ({}) [pid={pid} tid={tid} call={call} leave]",

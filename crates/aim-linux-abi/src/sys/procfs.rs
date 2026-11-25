@@ -4036,6 +4036,167 @@ mod tests {
         }
     }
 
+    /// `unshare(CLONE_NEWNS)` copies the caller's mount tree. It does not
+    /// start an empty table. A file with no covering mount stays on the
+    /// image root. A tmpfs mounted before the call, the way init covers
+    /// `/linkerconfig` and `/apex` in `MountExtraFilesystems`, is in the
+    /// copy and still hides the image file. Fork, `setns` into that
+    /// namespace, and the exec replay (`load_own_mounts` of
+    /// `own_mounts_text`) resolve the same hosts. `setns` sets cwd to `/`;
+    /// these paths are absolute.
+    #[test]
+    fn fork_setns_exec_keeps_the_copied_mount_tree() {
+        let (_view, dir) = crate::vfs::test_view();
+        let image = dir.join("root");
+        for rel in [
+            "system/lib64/bootstrap",
+            "system/bin",
+            "linkerconfig",
+            "apex/com.android.runtime/lib64/bionic",
+        ] {
+            std::fs::create_dir_all(image.join(rel)).unwrap();
+        }
+        std::fs::write(image.join("system/lib64/bootstrap/libc.so"), b"image-libc").unwrap();
+        std::fs::write(image.join("system/bin/init"), b"image-init").unwrap();
+        std::fs::write(image.join("linkerconfig/ld.config.txt"), b"image-config").unwrap();
+        std::fs::write(
+            image.join("apex/com.android.runtime/lib64/bionic/libc.so"),
+            b"image-apex",
+        )
+        .unwrap();
+        let paths = [
+            "/linkerconfig/ld.config.txt",
+            "/system/lib64/bootstrap/libc.so",
+            "/system/bin/init",
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+        ];
+        let startup: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(startup[0].1, crate::vfs::Area::Image);
+        assert_eq!(std::fs::read(&startup[0].0).unwrap(), b"image-config");
+        assert_eq!(startup[1].1, crate::vfs::Area::Image);
+        assert_eq!(std::fs::read(&startup[1].0).unwrap(), b"image-libc");
+        assert_eq!(std::fs::read(&startup[3].0).unwrap(), b"image-apex");
+
+        let linker_host = dir.join("tmpfs-linkerconfig");
+        let apex_host = dir.join("tmpfs-apex");
+        std::fs::create_dir_all(&linker_host).unwrap();
+        std::fs::create_dir_all(&apex_host).unwrap();
+        crate::vfs::add_mount(
+            "/linkerconfig",
+            linker_host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        crate::vfs::add_mount(
+            "/apex",
+            apex_host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let covered: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(covered[0].0, linker_host.join("ld.config.txt"));
+        assert_eq!(covered[0].1, crate::vfs::Area::Writable);
+        assert!(!covered[0].0.exists());
+        assert_eq!(covered[1].0, startup[1].0);
+        assert_eq!(std::fs::read(&covered[1].0).unwrap(), b"image-libc");
+        assert_eq!(covered[2].0, startup[2].0);
+        assert_eq!(covered[3].0, apex_host.join("com.android.runtime/lib64/bionic/libc.so"));
+        assert!(!covered[3].0.exists());
+        let listed = mounts_text();
+        assert!(listed.contains(" /linkerconfig "));
+        assert!(listed.contains(" /apex "));
+
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let copied: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(copied, covered);
+        let listed = mounts_text();
+        assert!(
+            listed.contains(" /linkerconfig ") && listed.contains(" /apex "),
+            "unshare left a table without the pre-unshare mounts: {listed}"
+        );
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::vfs::cwd(), "/");
+        let after_setns: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(after_setns, covered);
+        let text = crate::vfs::own_mounts_text();
+        assert!(text.contains("namespace-owner\t"));
+        assert!(text.contains("/linkerconfig\t"));
+        assert!(text.contains("/apex\t"));
+        crate::vfs::load_own_mounts(&text).expect("exec mount replay");
+        let after_exec: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(after_exec, covered);
+        assert_eq!(std::fs::read(&after_exec[1].0).unwrap(), b"image-libc");
+        assert_eq!(std::fs::read(&after_exec[2].0).unwrap(), b"image-init");
+        assert!(!after_exec[0].0.exists());
+        assert!(!after_exec[3].0.exists());
+
+        let _ = crate::vfs::remove_mount("/linkerconfig");
+        let _ = crate::vfs::remove_mount("/apex");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/linkerconfig");
+        let _ = crate::vfs::remove_mount("/apex");
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir.join("root/system"));
+        let _ = std::fs::remove_dir_all(dir.join("root/linkerconfig"));
+        let _ = std::fs::remove_dir_all(dir.join("root/apex"));
+        let _ = std::fs::remove_dir_all(&linker_host);
+        let _ = std::fs::remove_dir_all(&apex_host);
+    }
+
+    /// `unshare(CLONE_NEWCGROUP)` is not Linux's success. The flag is outside
+    /// the mount-namespace mask, which is the unsupported-namespace answer
+    /// (ADR 0012). Init continues after the `EINVAL`.
+    #[test]
+    fn unshare_clone_newcgroup_is_einval() {
+        let _view = crate::vfs::test_view();
+        assert_eq!(
+            crate::sys::mount::unshare([0x200_0000, 0, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+    }
+
     /// Init's sequence with the property-service thread still alive:
     /// `unshare(CLONE_NEWNS)` unshares `fs`, the pre-unshare fd keeps its
     /// inode, and `setns` of that fd succeeds.

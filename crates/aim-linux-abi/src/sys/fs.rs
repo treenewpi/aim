@@ -1488,6 +1488,48 @@ pub(super) fn trace_stdio_write(nr: u64, a: &[u64; 6], returned: i64) -> Option<
 /// written into the guest buffer, so `mnt:[inode]` can be compared across
 /// the two opens in `SetupMountNamespaces`. A failure logs the path and
 /// the errno as well: the result buffer was not written.
+/// Host path `lookup` would use for an absolute `openat` or `newfstatat`
+/// that returned `ENOENT`. The syscall line names only the guest path.
+pub(super) fn trace_lookup_host(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
+    if returned != -(ENOENT as i64) {
+        return None;
+    }
+    // openat 56, newfstatat 79. The path is the second argument.
+    if nr != 56 && nr != 79 {
+        return None;
+    }
+    let path = guest_cstr(a[1]).ok()?;
+    if path.first() != Some(&b'/')
+        || path.split(|b| *b == b'/').any(|part| part == b"." || part == b"..")
+    {
+        return None;
+    }
+    let guest = std::str::from_utf8(&path).ok()?;
+    let (host, area) = crate::vfs::lookup(guest);
+    let area = match area {
+        crate::vfs::Area::Image => "image",
+        crate::vfs::Area::Writable => "writable",
+        crate::vfs::Area::Kernfs => "kernfs",
+        crate::vfs::Area::HostDevice => "host-device",
+        crate::vfs::Area::Input => "input",
+    };
+    const CAP: usize = 160;
+    let host = host.display().to_string();
+    let host = if host.len() > CAP {
+        format!("{} truncated cap={CAP}", &host[..CAP])
+    } else {
+        host
+    };
+    let guest = if guest.len() > CAP {
+        format!("{} truncated cap={CAP}", &guest[..CAP])
+    } else {
+        guest.to_string()
+    };
+    Some(format!(
+        "[linux-trace] lookup \"{guest}\" host=\"{host}\" area={area}"
+    ))
+}
+
 pub(super) fn trace_readlinkat(nr: u64, a: &[u64; 6], returned: i64) -> Option<String> {
     if nr != 78 {
         return None;
