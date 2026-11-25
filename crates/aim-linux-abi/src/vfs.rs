@@ -21,7 +21,7 @@
 //!   directory does (zygote's tmpfs over `/data/user` hides the path map's
 //!   `/data/user/0`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
@@ -704,6 +704,137 @@ fn namespace_id(kind: &str) -> Result<String, Errno> {
 }
 fn namespace_error(error: std::io::Error) -> Errno {
     errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// One mount namespace this process can name with `/proc/self/ns/mnt`.
+/// `saved` is the table while another namespace is live. `None` means this
+/// namespace is the process's current table.
+pub(crate) struct MountNs {
+    ino: u64,
+    saved: Mutex<Option<NsImage>>,
+}
+
+struct NsImage {
+    mounts: Vec<Mount>,
+    generation: u64,
+    propagation: Vec<(String, Propagation)>,
+    private_mounts: bool,
+    owner: Option<aim_storage::mount_namespace::Namespace>,
+    records: Option<std::sync::Arc<Vec<aim_storage::mount_namespace::MountRecord>>>,
+    view_generation: u64,
+}
+
+static NS_SWITCH: Mutex<()> = Mutex::new(());
+static CURRENT_NS: Mutex<Option<std::sync::Arc<MountNs>>> = Mutex::new(None);
+static NAMESPACES: Mutex<BTreeMap<u64, std::sync::Arc<MountNs>>> = Mutex::new(BTreeMap::new());
+static NEXT_NS_INO: AtomicU64 = AtomicU64::new(0x1000_0001);
+
+fn next_ns_ino() -> u64 {
+    NEXT_NS_INO.fetch_add(1, Ordering::Relaxed)
+}
+
+fn current_mount_namespace() -> std::sync::Arc<MountNs> {
+    let mut current = CURRENT_NS.lock().unwrap();
+    if let Some(ns) = current.as_ref() {
+        return std::sync::Arc::clone(ns);
+    }
+    let ns = std::sync::Arc::new(MountNs {
+        ino: next_ns_ino(),
+        saved: Mutex::new(None),
+    });
+    NAMESPACES
+        .lock()
+        .unwrap()
+        .insert(ns.ino, std::sync::Arc::clone(&ns));
+    *current = Some(std::sync::Arc::clone(&ns));
+    ns
+}
+
+/// `readlink` text of the process's current mount namespace.
+pub fn mount_namespace_link() -> String {
+    let _switch = NS_SWITCH.lock().unwrap();
+    format!("mnt:[{}]", current_mount_namespace().ino)
+}
+
+pub(crate) fn mount_namespace(ino: u64) -> Option<std::sync::Arc<MountNs>> {
+    NAMESPACES.lock().unwrap().get(&ino).map(std::sync::Arc::clone)
+}
+
+pub(crate) fn mount_namespace_ino(ns: &MountNs) -> u64 {
+    ns.ino
+}
+
+fn capture_namespace() -> NsImage {
+    let table = vfs().mounts.read().unwrap();
+    let view = NAMESPACE_VIEW.lock().unwrap();
+    NsImage {
+        mounts: table.0.mounts.clone(),
+        generation: table.0.generation,
+        propagation: PROPAGATION_RULES.lock().unwrap().clone(),
+        private_mounts: PRIVATE_MOUNTS.load(Ordering::Acquire),
+        owner: view.as_ref().map(|view| view.owner.clone()),
+        records: view.as_ref().map(|view| std::sync::Arc::clone(&view.records)),
+        view_generation: view.as_ref().map(|view| view.generation).unwrap_or(0),
+    }
+}
+
+fn install_namespace(image: NsImage) -> Result<(), Errno> {
+    {
+        let mut table = vfs().mounts.write().unwrap();
+        table.0.mounts = image.mounts;
+        table.0.generation = image.generation;
+        table.0.visible = OnceLock::new();
+    }
+    *PROPAGATION_RULES.lock().unwrap() = image.propagation;
+    PRIVATE_MOUNTS.store(image.private_mounts, Ordering::Release);
+    if let Some(owner) = image.owner {
+        let page = owner.generation().map_err(namespace_error)?;
+        *NAMESPACE_VIEW.lock().unwrap() = Some(NamespaceView {
+            page,
+            owner,
+            generation: image.view_generation,
+            records: image
+                .records
+                .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
+        });
+        publish_process_namespace()?;
+    }
+    Ok(())
+}
+
+/// `unshare(CLONE_NEWNS)`: keep the current namespace for any fd that
+/// already names it, and make a copy the process's current namespace.
+pub fn split_mount_namespace() -> Result<(), Errno> {
+    let _switch = NS_SWITCH.lock().unwrap();
+    refresh_fuse_mounts()?;
+    let old = current_mount_namespace();
+    *old.saved.lock().unwrap() = Some(capture_namespace());
+    private_mount_namespace()?;
+    let ns = std::sync::Arc::new(MountNs {
+        ino: next_ns_ino(),
+        saved: Mutex::new(None),
+    });
+    NAMESPACES
+        .lock()
+        .unwrap()
+        .insert(ns.ino, std::sync::Arc::clone(&ns));
+    *CURRENT_NS.lock().unwrap() = Some(ns);
+    Ok(())
+}
+
+/// `setns` into `target`. The same namespace is success.
+pub fn switch_mount_namespace(target: &std::sync::Arc<MountNs>) -> Result<(), Errno> {
+    let _switch = NS_SWITCH.lock().unwrap();
+    let current = current_mount_namespace();
+    if std::sync::Arc::ptr_eq(&current, target) {
+        return Ok(());
+    }
+    let incoming = target.saved.lock().unwrap().take();
+    let Some(incoming) = incoming else {
+        return Err(errno::EINVAL);
+    };
+    *current.saved.lock().unwrap() = Some(capture_namespace());
+    install_namespace(incoming)
 }
 fn namespace_event(event: &str) -> Result<(), Errno> {
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {

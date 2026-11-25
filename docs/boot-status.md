@@ -16,13 +16,15 @@ a new `Kind::Path` distinct from the bind socket. `fchmod` on that fd
 returned `-EBADF`, `F_GETFL` returned `0x208000`, and the proc-fd
 `fchmodat` fallback returned 0. `listen` on the bind socket returned 0.
 `openat("/proc/mounts")` returned a fd and `epoll_ctl` ADD of it returned
-0. No epoll wait on that fd ran before exit. The stop is
-`SetupMountNamespaces`: `openat("/proc/self/ns/mnt")` and `readlinkat`
-return ENOENT (calls 6152, 6154, 6158, 6160), `unshare(CLONE_NEWNS)`
-returns 0 (call 6157), then `setns(-1, CLONE_NEWNS)` returns `-ENOSYS`
-(syscall 268, call 6162). kmsg: `Cannot switch back to bootstrap mount
-namespace`, then `SetupMountNamespaces failed: Function not implemented`.
-Then abort and `exit_group(6)`. `write` of fd 3 for 61 bytes returned 61
+0. No epoll wait on that fd ran before exit. `SetupMountNamespaces` then
+stopped that run: `openat("/proc/self/ns/mnt")` and `readlinkat` returned
+ENOENT (calls 6152, 6154, 6158, 6160), `unshare(CLONE_NEWNS)` returned 0
+(call 6157), and `setns(-1, CLONE_NEWNS)` returned `-ENOSYS` (syscall 268,
+call 6162). kmsg: `Cannot switch back to bootstrap mount namespace`, then
+`SetupMountNamespaces failed: Function not implemented`, then abort and
+`exit_group(6)`. `/proc/self/ns/mnt` now opens as `mnt:[inode]` and
+`setns` of that fd switches back to the namespace it names. That path is
+not measured on macmini. `write` of fd 3 for 61 bytes returned 61
 on the earlier `11bbedf` run; the raw guest buffer was not captured, and
 the 2200-byte diagnostic marker does not contain that text. Property,
 integrated 2/2, and independent android/libbinder passed on `11bbedf`;
@@ -145,7 +147,12 @@ polls the file, so a change already pending is consumed there. fork and
 exec keep the cursor with the generation. A blocking wait without a wake
 pipe returns the pipe errno. Another regular file stays EPERM. The
 `31d938f` macmini run measured ADD returning 0; the rest is not measured
-on macmini.
+on macmini. `/proc/<pid>/ns/mnt` is the process's mount namespace:
+`readlink` is `mnt:[inode]`, and `setns` of that fd with `CLONE_NEWNS` or
+0 installs its table. A bad fd is `EBADF`, another kind of fd or `nstype`
+is `EINVAL`, and the caller needs `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT`.
+`unshare(CLONE_NEWNS)` keeps the previous namespace for fds that already
+name it. Not measured on macmini.
 A pidfd's state is its open file's (the fd table's), so a dup, dup3 or
 F_DUPFD copy, and a fork child's copy of either, is the same pidfd for
 pidfd_send_signal, waitid(P_PIDFD) and poll/epoll, sharing one reap watch

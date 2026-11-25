@@ -1,4 +1,4 @@
-//! Mount namespaces: `unshare(CLONE_NEWNS)`, `mount` and `umount2`.
+//! Mount namespaces: `unshare(CLONE_NEWNS)`, `setns`, `mount` and `umount2`.
 //!
 //! zygote unshares its mount namespace and mounts storage views for each
 //! child (`MountEmulatedStorage`, app data isolation): bind mounts and
@@ -56,11 +56,46 @@ pub fn unshare(a: [u64; 6]) -> i64 {
         return -(EPERM as i64);
     }
     if a[0] & CLONE_NEWNS != 0 {
-        if let Err(error) = vfs::private_mount_namespace() {
+        if let Err(error) = vfs::split_mount_namespace() {
             return -(error as i64);
         }
     }
     0
+}
+
+const CAP_SYS_CHROOT: u32 = 18;
+
+/// `setns(2)`. A mount-namespace fd joins that namespace. `nstype` 0 takes
+/// the fd's type. A fd of another kind is `EINVAL`. A closed fd is `EBADF`.
+pub fn setns(a: [u64; 6]) -> i64 {
+    let fd = a[0] as i32;
+    let nstype = a[1];
+    if fd < 0 {
+        return -(crate::errno::EBADF as i64);
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat into a local buffer. A bad fd is EBADF, not EINVAL.
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return -(crate::errno::EBADF as i64);
+    }
+    let Some(ns) = super::procfs::mount_namespace_of(fd) else {
+        return -(EINVAL as i64);
+    };
+    if nstype != 0 && nstype != CLONE_NEWNS {
+        return -(EINVAL as i64);
+    }
+    // setns(2) for a mount namespace: CAP_SYS_ADMIN and CAP_SYS_CHROOT.
+    // More than one thread is EINVAL.
+    if !super::cred::capable(CAP_SYS_ADMIN) || !super::cred::capable(CAP_SYS_CHROOT) {
+        return -(EPERM as i64);
+    }
+    if super::thread::tids().len() > 1 {
+        return -(EINVAL as i64);
+    }
+    match vfs::switch_mount_namespace(&ns) {
+        Ok(()) => 0,
+        Err(error) => -(error as i64),
+    }
 }
 
 fn resolve(path: u64, follow: bool) -> Result<vfs::Resolved, i64> {

@@ -1213,6 +1213,7 @@ pub fn get(fd: i32) -> Option<Kind> {
 pub fn on_close(fd: i32) {
     clear_regular_access(fd);
     super::procfs::close_mount_poll(fd);
+    super::procfs::close_mount_namespace(fd);
     super::fuse_client::close(fd);
     super::fasync::on_close(fd);
     if super::fuse_device::is_device(fd) {
@@ -1240,6 +1241,7 @@ pub fn on_dup(old: i32, new: i32) {
         insert(new, k);
     }
     super::procfs::dup_mount_poll(old, new);
+    super::procfs::dup_mount_namespace(old, new);
 }
 
 /// Recognize an fd that arrived from elsewhere (exec, `SCM_RIGHTS`,

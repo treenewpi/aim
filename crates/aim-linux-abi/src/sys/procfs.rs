@@ -110,6 +110,9 @@ fn pid() -> i32 {
 
 /// Guest path of an open host fd.
 pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
+    if let Some(text) = mount_ns_text(fd) {
+        return Ok(text);
+    }
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Ok(open.path.clone());
     }
@@ -142,6 +145,9 @@ pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
 pub(super) fn fd_link(fd: i32) -> Option<String> {
     if !fdtab::visible(fd) {
         return None;
+    }
+    if let Some(text) = mount_ns_text(fd) {
+        return Some(text);
     }
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Some(open.path.clone());
@@ -1271,11 +1277,18 @@ fn pid_node(p: i32, rest: &str, thread: Option<i32>, listed: bool) -> Option<Nod
     }
     Some(match rest {
         "" => {
-            let e = PID_ENTRIES
+            let mut e: Vec<_> = PID_ENTRIES
                 .iter()
-                .filter(|(n, _)| thread.is_none() || *n != "task");
-            Node::Dir(e.map(|(n, t)| Entry::new(1, *t, n.as_bytes())).collect())
+                .filter(|(n, _)| thread.is_none() || *n != "task")
+                .map(|(n, t)| Entry::new(1, *t, n.as_bytes()))
+                .collect();
+            if me {
+                e.push(Entry::new(1, dir::DT_DIR, b"ns"));
+            }
+            Node::Dir(e)
         }
+        "ns" if me => Node::Dir(entries(&[("mnt", dir::DT_LNK)])),
+        "ns/mnt" if me => Node::Link(vfs::mount_namespace_link()),
         "net" => Node::Dir(
             NET_FILES
                 .iter()
@@ -1764,6 +1777,50 @@ pub(super) fn dup_mount_poll(old: i32, new: i32) {
 
 pub(super) fn close_mount_poll(fd: i32) {
     MOUNT_POLLS.lock().unwrap().remove(&fd);
+}
+
+/// An open `/proc/<pid>/ns/mnt` fd. The Arc is the namespace it named at
+/// open, which stays after `unshare` switches the process away.
+static MOUNT_NS_FDS: Mutex<BTreeMap<i32, Arc<vfs::MountNs>>> = Mutex::new(BTreeMap::new());
+
+fn mount_ns_ino(target: &str) -> Option<u64> {
+    let rest = target.strip_prefix("mnt:[")?.strip_suffix(']')?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn mount_ns_text(fd: i32) -> Option<String> {
+    let ns = MOUNT_NS_FDS.lock().unwrap().get(&fd).cloned()?;
+    Some(format!("mnt:[{}]", vfs::mount_namespace_ino(&ns)))
+}
+
+pub(super) fn mount_namespace_of(fd: i32) -> Option<Arc<vfs::MountNs>> {
+    MOUNT_NS_FDS.lock().unwrap().get(&fd).cloned()
+}
+
+fn open_mount_namespace(ino: u64, cloexec: bool) -> i64 {
+    let Some(ns) = vfs::mount_namespace(ino) else {
+        return -(ENOENT as i64);
+    };
+    let fd = content_fd(&[], cloexec);
+    if fd < 0 {
+        return fd;
+    }
+    MOUNT_NS_FDS.lock().unwrap().insert(fd as i32, ns);
+    fd
+}
+
+pub(super) fn close_mount_namespace(fd: i32) {
+    MOUNT_NS_FDS.lock().unwrap().remove(&fd);
+}
+
+pub(super) fn dup_mount_namespace(old: i32, new: i32) {
+    let mut fds = MOUNT_NS_FDS.lock().unwrap();
+    if let Some(ns) = fds.get(&old).cloned() {
+        fds.insert(new, ns);
+    }
 }
 
 /// Identity of the open file's `mounts_poll` cursor, for a fork that shares
@@ -2392,6 +2449,12 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
         Some(Node::Dir(list)) => dir_fd(&canon, list, cloexec),
         Some(Node::Denied(_)) => -(EACCES as i64),
         Some(Node::Link(t)) => {
+            if let Some(ino) = mount_ns_ino(&t) {
+                if write {
+                    return Some(-(EACCES as i64));
+                }
+                return Some(open_mount_namespace(ino, cloexec));
+            }
             let target = if t.starts_with('/') {
                 t
             } else {
@@ -2570,6 +2633,12 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
         }
         Some(Node::Denied(None)) => return Some(Err(EACCES)),
         Some(Node::Link(t)) if follow => {
+            if let Some(ino) = mount_ns_ino(&t) {
+                st.st_mode = libc::S_IFREG | 0o444;
+                st.st_ino = ino;
+                st.st_nlink = 1;
+                return Some(Ok(st));
+            }
             let fd_n = canon
                 .strip_prefix(&format!("/proc/{me}/fd/"))
                 .and_then(|n| n.parse::<i32>().ok());
@@ -3491,5 +3560,163 @@ mod tests {
         for name in ["mount-wake-a", "mount-wake-b"] {
             let _ = std::fs::remove_dir(root.join(name));
         }
+    }
+
+    fn ns_text(path: &str) -> String {
+        let bytes = super::readlink(path.as_bytes()).unwrap().unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn mounts_text() -> String {
+        let fd = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let mut bytes = vec![0u8; 65536];
+        let n = crate::sys::fs::pread64([
+            fd as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(n > 0);
+        assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        bytes.truncate(n as usize);
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Init's `SetupMountNamespaces`: the bootstrap fd stays the namespace
+    /// from before `unshare`, and `setns` switches back to it. `setns` of a
+    /// bad fd is `EBADF`, of the wrong kind or `nstype` is `EINVAL`, and
+    /// without `CAP_SYS_ADMIN` or `CAP_SYS_CHROOT` is `EPERM`.
+    #[test]
+    fn mount_namespace_setns_switches_the_named_table() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cred(crate::sys::cred::Identity);
+        impl Drop for Cred {
+            fn drop(&mut self) {
+                crate::sys::cred::init(self.0.clone(), None);
+            }
+        }
+        let _cred = Cred(crate::sys::cred::current());
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert!(boot >= 0);
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert!(boot_link.starts_with("mnt:[") && boot_link.ends_with(']'));
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        let pid = super::pid();
+        let by_pid = super::open(&format!("/proc/{pid}/ns/mnt"), 0, libc::O_RDONLY).unwrap();
+        assert!(by_pid >= 0);
+        assert_eq!(ns_text(&format!("/proc/{pid}/ns/mnt")), boot_link);
+        assert_eq!(crate::sys::fs::close([by_pid as u64, 0, 0, 0, 0, 0]), 0);
+
+        assert_eq!(
+            crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]),
+            0
+        );
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+
+        let host = root.join("ns-default");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-default",
+            &host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert!(mounts_text().contains(" /mnt/ns-default "));
+
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(!mounts_text().contains(" /mnt/ns-default "));
+        let host = root.join("ns-boot");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-boot",
+            host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-boot "));
+        assert!(!text.contains(" /mnt/ns-default "));
+
+        let copied = crate::sys::fs::dup([boot as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(crate::sys::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{copied}")), boot_link);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), default_link);
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-default "));
+        assert!(!text.contains(" /mnt/ns-boot "));
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(mounts_text().contains(" /mnt/ns-boot "));
+
+        assert_eq!(
+            crate::sys::mount::setns([(-1i32) as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+        let gone = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::fs::close([gone as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            crate::sys::mount::setns([gone as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([mounts as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x2000_0000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+
+        let mut weak = crate::sys::cred::current();
+        weak.cap_eff &= !(1 << 21);
+        crate::sys::cred::init(weak, None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EPERM as i64)
+        );
+        let mut admin = _cred.0.clone();
+        admin.cap_eff &= !(1 << 18);
+        crate::sys::cred::init(admin, None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0, 0, 0, 0, 0]),
+            -(crate::errno::EPERM as i64)
+        );
+        crate::sys::cred::init(_cred.0.clone(), None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-default");
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-boot");
+        for fd in [default_ns, copied, mounts] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(root.join("ns-default"));
+        let _ = std::fs::remove_dir(root.join("ns-boot"));
     }
 }

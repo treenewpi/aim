@@ -487,6 +487,7 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
         280 => bpf::bpf(a),
         // mount namespaces
         97 => mount::unshare(a),
+        268 => mount::setns(a),
         39 => mount::umount2(a),
         40 => mount::mount(a),
         // userfaultfd: answered "unsupported" (ADR 0012); ART then uses
