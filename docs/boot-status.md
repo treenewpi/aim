@@ -401,18 +401,37 @@ mount namespace`. Every fork child then failed
 `/apex/com.android.runtime/bin/linker64` with errno 19 (the trace printed
 `(E?)`) and `/apex` still the empty tmpfs copied at `unshare`. vdc, logd
 and apexd failed the same way (exit 127) and init rebooted
-`reboot,apexd-failed` at 6.2s. `/` and the `/apex` tmpfs are
-`MS_SHARED|MS_REC` before that `unshare`, so the copy stays in the peer
-group and a later mount or umount under `/apex` in the bootstrap namespace
-is written into the default namespace's journal. A private parent does
-not propagate. `mount` traces a null source, fstype or data pointer as
-`NULL` and decodes the flag word. errno 19 is `ENODEV`. The first logd
-`execve` in that archive returned `-13` `EACCES`. That return is
-`classify`: the file is not a regular file, or the host `access(X_OK)`
-fails on the host mode as the host uid. File capabilities and a security
-label are not checked there. A directory on the walk can also return
-`EACCES` for the guest identity, and logd's service uid is 1036. This
-propagation change is not Mac-remeasured. The pinned layer has 35
+`reboot,apexd-failed` at 6.2s. `a2c2215221e1ebd92c3d0fe72850e6e5cf278961`
+(archive SHA256
+`03d3d380b19bdb417b70fc2113deee74178bc38da909254b692ed80e2d4f0e01`)
+remeasured the shared-subtree fanout. Init still reaches post-fs-data and
+reboots `reboot,apexd-failed` at 6.3s. Call 6799 is
+`mount(NULL, "/apex", NULL, MS_PRIVATE)` in the only namespace, before
+`unshare`. Call 6819 `setns` returns to the bootstrap namespace, and call
+6820 bind-mounts `/bootstrap-apex` onto `/apex` there. The default
+namespace's `/apex` is that private tmpfs and must stay empty. Bootstrap
+APEXes are mounts under the bind, so they belong on `/bootstrap-apex` in
+both namespaces: `/bootstrap-apex` stayed shared when `/` was made
+`MS_SHARED|MS_REC`, and the bind joins that peer group. The fanout wrote
+them onto the default `/apex` instead (`runtime` at `apex-mounts/1`).
+That path is rewritten onto the peer. The ext4 tree is the mount's
+superblock: a namespace copy reads the installed directory and does not
+open the loop or dm device again. The fork-child line stats
+`/apex/com.android.runtime/bin/linker64` and reads its first page, and
+names the superblock path separately, so a later log can tell a walk
+`ENODEV` from a read `ENODEV`. `execve` logs the program's `PT_INTERP`
+the same way. The image on this machine has no `apexd`, `vdc` or `logd`
+binary, so those interpreters were not read here. AOSP's apexd is a
+bootstrap binary (`PT_INTERP` `/system/bin/bootstrap/linker64`); logd is
+not. `mount` traces a null source, fstype or data pointer as `NULL` and
+decodes the flag word. errno 19 is `ENODEV`. The first logd `execve`,
+pid 61672, before the namespace switch, returned `-13` at stage
+`interpret`. That stage classifies the program, before `PT_INTERP` is
+opened. The trace names `reason=host-access` or `reason=not-regular`,
+the host `access(X_OK)` errno, the guest execute bit for the filesystem
+uid (1036) and whether a directory search was recorded. File
+capabilities and a security label are not checked there. This path
+rewrite is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

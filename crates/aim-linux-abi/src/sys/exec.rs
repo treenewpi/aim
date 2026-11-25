@@ -36,8 +36,9 @@
 //! itself. `AT_EXECFN` is the filename as the caller named it; `argv[0]` is
 //! whatever the caller passed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::context::{self, GuestContext};
@@ -365,7 +366,10 @@ fn exec(
             in_place(ctx, nr, &target, &argv, &envp, &filename)
                 .unwrap_or_else(|| relaunch(&target.guest, &argv, &envp, &filename))
         }
-        Err(e) => e,
+        Err(e) => {
+            note_exec(nr, "interpret", &String::from_utf8_lossy(&filename), e);
+            e
+        }
     }
 }
 
@@ -406,6 +410,8 @@ fn in_place(
             }
         };
         if let Err(e) = classify(&r.host) {
+            note_classify(&i, &r.host);
+            note_exec(nr, "interpreter", &i, e);
             return Some(e);
         }
     }
@@ -469,9 +475,16 @@ pub fn interpret(
     let mut interp_of = filename.to_vec();
     let mut depth = 0;
     loop {
-        match classify(&target.host)? {
-            Kind::Elf => return Ok((target, argv)),
-            Kind::Script(interp, arg) => {
+        match classify(&target.host) {
+            Ok(Kind::Elf) => {
+                note_pt_interp(&target);
+                return Ok((target, argv));
+            }
+            Err(error) => {
+                note_classify(&target.guest, &target.host);
+                return Err(error);
+            }
+            Ok(Kind::Script(interp, arg)) => {
                 if depth == MAX_INTERP_DEPTH {
                     return Err(-(ELOOP as i64));
                 }
@@ -491,18 +504,196 @@ pub fn interpret(
 /// A failed `execve` in this process. `errno` is the negative Linux value
 /// the syscall returns. The program path and, when the ELF named one, the
 /// interpreter path are both recorded: `clone` has already returned in the
-/// parent, so this line is the child's.
+/// parent, so this line is the child's. A walk that fails names the first
+/// component whose resolution returns that errno.
 fn note_exec(nr: u64, what: &str, path: &str, errno: i64) {
     if !super::tracing() || !(-4095..0).contains(&errno) {
         return;
     }
     // SAFETY: this process's pid.
     let pid = unsafe { libc::getpid() };
+    let walk = component_trace(path);
+    let page = probe_page(path);
     crate::diag!(
-        "[linux-abi] exec: pid={pid} tid={} nr={nr} {what}=\"{path}\" errno={} ({})",
+        "[linux-abi] exec: pid={pid} tid={} nr={nr} {what}=\"{path}\" errno={} ({}) {walk} {page}",
         super::host_tid(),
         -errno,
         super::names::errno_name((-errno) as i32)
+    );
+}
+
+/// Stat `guest`, then read its first page. The two results stay separate:
+/// a walk can return `ENODEV` while the mount's ext4 tree still reads, or
+/// the walk can succeed and the read can fail. The read uses the mount's
+/// host file, not a new open of the loop or dm device.
+pub(super) fn probe_page(guest: &str) -> String {
+    if !guest.starts_with('/') {
+        return String::new();
+    }
+    let resolved = match vfs::resolve(LINUX_AT_FDCWD, guest.as_bytes(), true) {
+        Ok(found) => format!(
+            "resolve host=\"{}\" {}",
+            found.host.to_string_lossy(),
+            read_page(Path::new(OsStr::from_bytes(found.host.as_bytes())))
+        ),
+        Err(error) => format!(
+            "resolve errno={error} ({})",
+            super::names::errno_name(error)
+        ),
+    };
+    let backend = match vfs::mounted_backend(guest) {
+        Some((path, source, fstype)) => format!(
+            "superblock fstype={fstype} source=\"{source}\" path=\"{}\" {}",
+            path.display(),
+            read_page(&path)
+        ),
+        None => "superblock missing".to_string(),
+    };
+    format!("{resolved} {backend}")
+}
+
+fn read_page(path: &Path) -> String {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            return format!(
+                "stat-read errno={errno} ({})",
+                super::names::errno_name(errno)
+            );
+        }
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    match file.read(&mut buf) {
+        Ok(n) => format!("read={n}"),
+        Err(error) => {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            format!("read errno={errno} ({})", super::names::errno_name(errno))
+        }
+    }
+}
+
+fn note_pt_interp(target: &vfs::Resolved) {
+    if !super::tracing() {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    match crate::loader::interpreter_errno(&target.host) {
+        Ok(Some(interp)) => {
+            let page = probe_page(&interp);
+            crate::diag!(
+                "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP=\"{interp}\" {page}",
+                super::host_tid(),
+                target.guest
+            );
+        }
+        Ok(None) => crate::diag!(
+            "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP=none",
+            super::host_tid(),
+            target.guest
+        ),
+        Err(error) => crate::diag!(
+            "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP errno={error} ({})",
+            super::host_tid(),
+            target.guest,
+            super::names::errno_name(error)
+        ),
+    }
+}
+
+/// The first prefix of `path` that `resolve` rejects, and the host of the
+/// prefix before it. A path that resolves is `resolved`.
+fn component_trace(path: &str) -> String {
+    if !path.starts_with('/') {
+        return String::new();
+    }
+    let mut acc = String::new();
+    let mut previous = "/".to_string();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        acc.push('/');
+        acc.push_str(part);
+        match vfs::resolve(LINUX_AT_FDCWD, acc.as_bytes(), true) {
+            Ok(found) => {
+                previous = format!("{acc} host=\"{}\"", found.host.to_string_lossy());
+            }
+            Err(error) => {
+                return format!(
+                    "component=\"{acc}\" errno={error} ({}) after=\"{previous}\"",
+                    super::names::errno_name(error as i32)
+                );
+            }
+        }
+    }
+    format!("resolved after=\"{previous}\"")
+}
+
+/// Why `classify` rejected `host`. Stage `interpret` is this check of the
+/// program, before its `PT_INTERP` is opened. `access(X_OK)` uses the host
+/// uid. The guest walk and the guest execute bit are named beside it so a
+/// later log can tell them apart. uid 1036 is logd's service uid.
+fn note_classify(guest: &str, host: &CStr) {
+    if !super::tracing() {
+        return;
+    }
+    // SAFETY: host path from the resolver; local buffer.
+    let (mode, reason, access_errno) = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::stat(host.as_ptr(), &mut st) < 0 {
+            let error = errno::last();
+            (
+                0u32,
+                format!("stat errno={error} ({})", super::names::errno_name(error as i32)),
+                None,
+            )
+        } else if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            (
+                st.st_mode as u32,
+                "not-regular".to_string(),
+                None,
+            )
+        } else if libc::access(host.as_ptr(), libc::X_OK) < 0 {
+            let error = errno::last();
+            (st.st_mode as u32, "host-access".to_string(), Some(error))
+        } else {
+            return;
+        }
+    };
+    let id = super::cred::current();
+    let guest_exec = match super::attrs::path_stat(guest) {
+        Ok(st) => {
+            if super::attrs::permits(&st, 1, &id, super::attrs::FS) {
+                "allow".to_string()
+            } else {
+                format!("deny mode={:#o}", st.st_mode)
+            }
+        }
+        Err(error) => format!("errno={error} ({})", super::names::errno_name(error as i32)),
+    };
+    let parent = guest.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("/");
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let guest_search = if !super::attrs::recording() {
+        "not-recorded".to_string()
+    } else {
+        match super::attrs::search(parent, &id, super::attrs::FS, None) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!(
+                "errno={error} ({}) at=\"{parent}\"",
+                super::names::errno_name(error as i32)
+            ),
+        }
+    };
+    let access = access_errno
+        .map(|error| format!(" errno={error} ({})", super::names::errno_name(error as i32)))
+        .unwrap_or_default();
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    crate::diag!(
+        "[linux-abi] exec: pid={pid} tid={} stage=interpret reason={reason}{access} mode={mode:#o} guest=\"{guest}\" host=\"{}\" uid={} guest-exec={guest_exec} guest-search={guest_search}",
+        super::host_tid(),
+        host.to_string_lossy(),
+        id.uid[super::attrs::FS]
     );
 }
 

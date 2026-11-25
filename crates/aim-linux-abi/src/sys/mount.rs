@@ -5,7 +5,10 @@
 //! tmpfs. `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` and `MS_REC` change the
 //! mount they name. `unshare(CLONE_NEWNS)` keeps a shared mount in that
 //! peer group. A later mount or unmount under a shared mount is applied
-//! in the peers and the slaves of that group. A private mount is not.
+//! in the peers and the slaves of that group, at each peer's own path.
+//! A private mount is not. Android's `/apex` is private before the
+//! bootstrap namespace is copied, so a mount under the bootstrap bind of
+//! `/bootstrap-apex` lands on `/bootstrap-apex` in the default namespace.
 //! The other namespaces are answered "unsupported" (ADR 0012 appendix).
 
 use std::ffi::OsStr;
@@ -711,5 +714,192 @@ mod tests {
             0
         );
         assert_eq!(super::super::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    /// Android 16: `/apex` is `MS_PRIVATE` in the only namespace, then
+    /// `/bootstrap-apex` is bound onto `/apex` in the bootstrap namespace.
+    /// A later ext4 mount under that bind is `/bootstrap-apex/...` in the
+    /// default namespace. The default `/apex` stays the private tmpfs.
+    /// Dropping the loop table does not stop a read: the tree belongs to
+    /// the mount.
+    #[test]
+    fn private_apex_reads_the_bootstrap_ext4_superblock() {
+        let (_view, root) = vfs::test_view();
+        std::fs::create_dir_all(root.join("root/apex")).unwrap();
+        std::fs::create_dir_all(root.join("root/bootstrap-apex")).unwrap();
+        let (image, manifest) = super::super::ext4ro::manifest_fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "aim-apex-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = dir.join("payload.img");
+        std::fs::write(&payload, &image).unwrap();
+        let backing = std::ffi::CString::new(payload.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        super::super::loopdev::configure(minor, fd, 4096, &[0; 232]).unwrap();
+        unsafe { libc::close(fd) };
+        let source = format!("/dev/block/loop{minor}");
+
+        let boot = super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let shared = MS_SHARED | 0x4000;
+        let slash = at("/");
+        let apex = at("/apex");
+        let bootstrap = at("/bootstrap-apex");
+        let tmpfs = at("tmpfs");
+        let mode = at("mode=0755");
+        assert_eq!(mount([0, p(&slash), 0, shared, 0, 0]), 0, "MS_SHARED|MS_REC /");
+        assert_eq!(
+            mount([p(&tmpfs), p(&apex), p(&tmpfs), 0, p(&mode), 0]),
+            0,
+            "tmpfs /apex"
+        );
+        assert_eq!(
+            mount([p(&tmpfs), p(&bootstrap), p(&tmpfs), 0, p(&mode), 0]),
+            0,
+            "tmpfs /bootstrap-apex"
+        );
+        assert_eq!(
+            mount([0, p(&apex), 0, MS_PRIVATE, 0, 0]),
+            0,
+            "MS_PRIVATE /apex"
+        );
+        assert_eq!(shared_id("/apex"), 0, "MS_PRIVATE left /apex shared");
+        assert_ne!(
+            shared_id("/bootstrap-apex"),
+            0,
+            "/bootstrap-apex lost its peer group"
+        );
+
+        assert_eq!(unshare([CLONE_NEWNS, 0, 0, 0, 0, 0]), 0);
+        let default_ns =
+            super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            shared_id("/apex"),
+            0,
+            "default /apex is a peer\n{}",
+            vfs::own_mounts_text()
+        );
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+
+        let bind = MS_BIND | 0x4000;
+        assert_eq!(
+            mount([p(&bootstrap), p(&apex), 0, bind, 0, 0]),
+            0,
+            "bind /bootstrap-apex /apex"
+        );
+        let runtime = at("/apex/com.android.runtime");
+        assert_eq!(
+            fsops::mkdirat([LINUX_AT_FDCWD as u64, p(&runtime), 0o755, 0, 0, 0]),
+            0,
+            "mkdir runtime"
+        );
+        super::super::loopdev::mount_ext4(&source, "/apex/com.android.runtime", true)
+            .unwrap_or_else(|error| panic!("mount_ext4 errno={error}"));
+
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert!(
+            mount_line("/apex/com.android.runtime").is_none(),
+            "private /apex received the bootstrap mount\n{}",
+            vfs::own_mounts_text()
+        );
+        assert!(
+            mount_line("/bootstrap-apex/com.android.runtime").is_some(),
+            "default /bootstrap-apex has no ext4\n{}",
+            vfs::own_mounts_text()
+        );
+        let events = journal_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("\t/bootstrap-apex/com.android.runtime\t")),
+            "default journal did not rewrite the path\n{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.contains("\t/apex/com.android.runtime\t")),
+            "default journal still names /apex/com.android.runtime\n{events:?}"
+        );
+
+        super::super::loopdev::detach_all_backings();
+        assert!(
+            super::super::loopdev::superblock_sources()
+                .iter()
+                .any(|held| held == &source),
+            "detaching the device dropped the ext4 superblock"
+        );
+        let reader = super::super::loopdev::source_reader_errno(&source);
+        assert_ne!(reader, 0, "the device table still opens {source}");
+
+        let guest = "/bootstrap-apex/com.android.runtime/apex_manifest.pb";
+        let found = vfs::resolve(LINUX_AT_FDCWD, guest.as_bytes(), true).unwrap_or_else(|error| {
+            panic!(
+                "default stat errno={error} ({})\n{}",
+                super::super::names::errno_name(error),
+                vfs::own_mounts_text()
+            )
+        });
+        let bytes = std::fs::read(OsStr::from_bytes(found.host.as_bytes())).unwrap_or_else(|error| {
+            panic!(
+                "default read errno={} host={}\n{}",
+                error.raw_os_error().unwrap_or(0),
+                found.host.to_string_lossy(),
+                vfs::own_mounts_text()
+            )
+        });
+        assert!(
+            bytes.len() >= manifest.len(),
+            "short read {} bytes",
+            bytes.len()
+        );
+        assert_eq!(&bytes[..manifest.len()], manifest);
+        let page = std::fs::File::open(OsStr::from_bytes(found.host.as_bytes())).unwrap();
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let n = page.take(4096).read(&mut buf).unwrap();
+        assert!(n > 0, "first page was empty");
+        assert_eq!(&buf[..manifest.len().min(n)], &manifest[..manifest.len().min(n)]);
+
+        let hidden = "/apex/com.android.runtime/apex_manifest.pb";
+        let hidden = vfs::resolve(LINUX_AT_FDCWD, hidden.as_bytes(), true).expect("lookup");
+        assert!(
+            std::fs::read(OsStr::from_bytes(hidden.host.as_bytes())).is_err(),
+            "default /apex reads the bootstrap payload at {}\n{}",
+            hidden.host.to_string_lossy(),
+            vfs::own_mounts_text()
+        );
+
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert_eq!(umount2([p(&runtime), 0, 0, 0, 0, 0]), 0, "umount bootstrap ext4");
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert!(
+            mount_line("/bootstrap-apex/com.android.runtime").is_none(),
+            "umount did not leave the default namespace\n{}",
+            vfs::own_mounts_text()
+        );
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        for dir in [
+            "/apex/com.android.runtime",
+            "/bootstrap-apex/com.android.runtime",
+            "/apex",
+            "/bootstrap-apex",
+        ] {
+            let t = at(dir);
+            let _ = umount2([p(&t), MNT_DETACH, 0, 0, 0, 0]);
+        }
+        assert_eq!(
+            super::super::fs::close([default_ns as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(super::super::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

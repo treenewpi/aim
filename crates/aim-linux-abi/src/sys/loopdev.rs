@@ -25,7 +25,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -502,6 +502,28 @@ pub fn lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
     Some(next)
 }
 
+/// One installed ext4 tree. The directory is the superblock: every
+/// namespace that mounts it names this host path. Dropping the loop or
+/// dm device table does not drop the tree, and a namespace copy does not
+/// open the device again.
+struct Superblock {
+    host: PathBuf,
+    source: String,
+}
+
+static SUPERBLOCKS: Mutex<Vec<Superblock>> = Mutex::new(Vec::new());
+
+pub(super) fn remember_superblock(host: &Path, source: &str) {
+    let mut held = SUPERBLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if held.iter().any(|block| block.host == host) {
+        return;
+    }
+    held.push(Superblock {
+        host: host.to_path_buf(),
+        source: source.to_string(),
+    });
+}
+
 /// `mount` of an ext4 loop or dm-verity device.
 ///
 /// The tree is a directory filled from the block reader at this call.
@@ -509,17 +531,53 @@ pub fn lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
 /// under it resolves to that directory. The host backing file is not
 /// opened again, so changing it after the mount cannot change a guest
 /// read. A dm-verity source is checked while the directory is filled;
-/// a bad block fails the mount.
+/// a bad block fails the mount. The directory outlives the device table
+/// and is shared by every namespace that keeps the mount.
 pub fn mount_ext4(source: &str, guest: &str, readonly: bool) -> Result<(), Errno> {
     if !readonly {
         return Err(EROFS);
     }
     let host = materialize(source)?;
+    remember_superblock(&host, source);
     if let Err(error) = vfs::add_mount(guest, host.clone(), Area::Image, source, "ext4") {
         let _ = fs::remove_dir_all(&host);
+        SUPERBLOCKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|block| block.host != host);
         return Err(error);
     }
     Ok(())
+}
+
+/// Sources whose ext4 trees are still installed. Device-table resets do
+/// not remove these.
+pub(super) fn superblock_sources() -> Vec<String> {
+    SUPERBLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|block| block.source.clone())
+        .collect()
+}
+
+/// Forget loop and dm devices. Installed ext4 trees stay.
+pub(super) fn detach_all_backings() {
+    let mut state = lock();
+    for dev in state.loops.values_mut() {
+        dev.backing = None;
+    }
+    state.dms.clear();
+    state.names.clear();
+}
+
+/// `reader_for` after the device table is gone. A mounted tree does not
+/// use this.
+pub(super) fn source_reader_errno(source: &str) -> i32 {
+    match reader_for(source) {
+        Ok(_) => 0,
+        Err(error) => error,
+    }
 }
 
 fn materialize(source: &str) -> Result<PathBuf, Errno> {
@@ -698,7 +756,7 @@ fn ctl_remove(id: u32) -> Result<i64, Errno> {
     Ok(0)
 }
 
-fn ctl_free() -> Result<i64, Errno> {
+pub(super) fn ctl_free() -> Result<i64, Errno> {
     let mut state = lock();
     ensure(&mut state);
     if let Some(minor) = state
@@ -732,7 +790,7 @@ fn configure_checked(minor: u32, fd: i32, block: u32, info: &[u8]) -> Result<(),
     configure(minor, fd, block, info)
 }
 
-fn configure(minor: u32, fd: i32, block: u32, info: &[u8]) -> Result<(), Errno> {
+pub(super) fn configure(minor: u32, fd: i32, block: u32, info: &[u8]) -> Result<(), Errno> {
     if info.len() < 232 {
         return Err(EINVAL);
     }

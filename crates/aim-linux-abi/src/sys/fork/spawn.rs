@@ -1814,32 +1814,24 @@ fn become_child(h: Handover) -> String {
     unsafe { context::resume(ctx) }
 }
 
-/// Whether this new process can see the runtime APEX linker. A fork without
-/// `CLONE_NEWNS` reloaded the namespace journal, so an apexd mount in that
-/// namespace is here. The line is the child's, after `clone` has a pid.
+/// The child's apex mounts, after `clone` has a pid. A fork without
+/// `CLONE_NEWNS` reloaded the namespace journal. The program this child
+/// will exec, and that program's `PT_INTERP`, are not known yet: `execve`
+/// logs the interpreter it actually resolves.
 fn note_child_apex() {
     if !crate::sys::tracing() {
         return;
     }
     // SAFETY: this process's pid.
     let pid = unsafe { libc::getpid() };
-    let path = b"/apex/com.android.runtime/bin/linker64";
     let apex = crate::vfs::own_mounts_text()
         .lines()
         .filter(|line| line.contains("/apex"))
         .take(12)
         .collect::<Vec<_>>()
         .join(" | ");
-    match crate::vfs::resolve(crate::vfs::LINUX_AT_FDCWD, path, true) {
-        Ok(found) => crate::diag!(
-            "[linux-abi] fork child pid={pid} linker64 host=\"{}\" apex={apex}",
-            found.host.to_string_lossy()
-        ),
-        Err(error) => crate::diag!(
-            "[linux-abi] fork child pid={pid} linker64 errno={error} ({}) apex={apex}",
-            crate::sys::names::errno_name(error as i32)
-        ),
-    }
+    let page = super::super::exec::probe_page("/apex/com.android.runtime/bin/linker64");
+    crate::diag!("[linux-abi] fork child pid={pid} linker64 {page} apex={apex}");
 }
 
 fn confirm_ready(parent: Port, member: u64) -> Result<(), String> {
