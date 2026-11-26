@@ -558,41 +558,45 @@ guest mode, and then a read of the host file. A mode without execute
 stays without execute and is `EACCES`. The host execute bit is not
 added, and a directory keeps the inode mode rather than the umask.
 The check is not skipped, and an exec that did not run is not
-reported as success. `c7db726b67de25f70962b00ce2eee02cb10f5a01`
+reported as success.
+`33d159675b16b9c4021317ba3f8861c5fdb91c57` was measured on Mac
 (archive SHA256
-`e150b35377ff9af6696a846e7eff6d91f2f7ddf41482ac7446df0889bc929ba5`,
-SHA256SUMS `463d6e532bf5dd901f99844387cf89068e5275445a4e76d0605b0eb603cb109d`,
-94 members, guest stderr SHA256
-`c74f216810d53c2b39a6c1a1f804f4fece03f30b88e8eb8b45b1faedcd57fb1d`)
-remeasured that image and stopped earlier. It is not a boot. There is
-no `system_server`, and `boot_completed` stays 0. Init ran 3.070s from
-2026-11-26 11:21:16 Asia/Kuala_Lumpur and rebooted
-`reboot,boringssl-self-check-failed`. First-stage `mount("sysfs",
-"/sys")` is 0 and the later remount is 0. Same-size
-`mremap(0x1000, 0x1000, flags=0x3)` ran 173 times, each returning 0.
-The log has no `linker_cfi.cpp`, `ShadowWrite`, or `MAP_FAILED`. The
-4 KiB to 8 KiB grow was not issued. `bpf` mount, bpfloader, formal
-apexd, keystore2, netd, and zygote were not started, so that grow, a
-leftover `apex-mounts/1` after formal apexd, and uid 9999 on the
-conscrypt self-test were not measured again. After apexd-bootstrap
-(pid 68416) activated `/apex/com.android.runtime@1` and exited 0,
-later execs resolved `PT_INTERP` `/system/bin/linker64` to
-`apex-mounts/68416-1/bin/linker64` and read 4096 bytes. The exec check
-stat'd the unresolved interpreter path. That path is a symlink into
-the apex (`/system/bin/linker64`, and `/apex/com.android.runtime` →
-`com.android.runtime@1`). `path_stat` does not follow a guest symlink,
-so the kernel followed the stored target from the host root and the
-check returned `ENOENT` while the walk already had the installed file.
-The probe's mount lookup used the same unresolved path and reported
-the ext4 superblock missing. linkerconfig (pid 68418) returned
-`execve` `-ENOENT`. prng_seeder (pid 68419) and
-`boringssl_self_test64_vendor` (pid 68420, uid 0) exited 127 in
-0.004s; the vendor binary itself was found, and that service's
-`reboot_on_failure` rebooted. The apex boringssl service and the uid
-9999 path were not reached. The exec check and the probe now use the
-guest path the walk resolved, the unique host the payload was
-installed into. A path that is still missing stays `ENOENT`. This is
-not a boot. The pinned layer has 35
+`0dc8a18fc3f12942ea23b855cdba186296e669eccc553d5fc79a09e47192dbd3`,
+SHA256SUMS
+`b35b9b45dfff9e055a4f67bca8f2b7c12b242466ce72afe86e03d0a96b998cf8`,
+93 members, guest stderr SHA256
+`36bdfa2ef6ddeb5e5ad1ab895a278f669b365f89ba6e3ddb7e88d9084f517bc0`).
+It is not a boot. There is no `system_server`, and `boot_completed`
+stays 0. Init started 2026-11-26 11:55:40 Asia/Kuala_Lumpur and ran
+20.770s (guest init pid 69221). The unique-host interpreter
+`ENOENT` is closed: after apexd-bootstrap (pid 69226) activated
+`/apex/com.android.runtime@1`, `PT_INTERP` `/system/bin/linker64`
+used `apex-mounts/69226-1/bin/linker64`, read 4096 bytes, and the
+superblock was `fstype=bind`. linkerconfig, prng_seeder,
+`boringssl_self_test64_vendor` (pid 69230, uid 0) and
+`/system/bin/boringssl_self_test64` (pid 69237, uid 9999) exited 0.
+Same-size `mremap(0x1000, 0x1000, flags=0x3)` ran 1912 times, each
+returning 0. `mremap(0x1000, 0x2000, flags=0x1)` ran 5 times, each
+succeeding, including netd (pid 69278). No leftover
+`apex-mounts/1` `ENOENT`. sysfs and bpf mounts and bpfloader exit 0
+still hold. The stop is
+`boringssl_self_test_apex64` (pid 69315, uid 9999, gid 0) exiting
+127 in 0.033s: `interpret` of
+`/apex/com.android.conscrypt/bin/boringssl_self_test64` is `EACCES`
+at host `apex-mounts/69251-3/bin/boringssl_self_test64` (read 4096,
+`fstype=bind` source `/apex/com.android.conscrypt@360499999`). The
+file is there. Its ext4 inode is mode 0755, uid 0, gid 2000, so
+other execute allows uid 9999 gid 0. The payload install did not
+record that owner, so the guest view was uid 0 gid 0 and the host
+file's mode. `/system/bin/boringssl_self_test64` already has the
+image's inode record, which is why the same uid could exec it. The
+installed tree now records the inode's uid, gid and mode
+(`dev.aim.android-inode`, or `user.aim.android-inode` where the host
+rejects the first name). The host execute bit is not added. A 0750
+or 0644 inode stays `EACCES`. A path that is still missing stays
+`ENOENT`. keystore2 still `SIGABRT` after a successful exec,
+netd still `SIGABRT` after a successful grow, and zygote is still
+killed on netd's `onrestart`. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

@@ -132,9 +132,16 @@ fn guest_attr(host: Host) -> Option<Attr> {
 /// The owner and mode an image file had in the original image
 /// (`tools/android-image-extract/src/inode_metadata.rs`).
 fn original(host: Host) -> Option<Attr> {
-    let mut b = [0u8; 20];
-    let n = get(host, INODE, &mut b)?;
-    decode_original(&b[..n])
+    // The image extractor writes `dev.aim.android-inode`. An ext4 payload
+    // writes the same record, or `user.aim.android-inode` where that name
+    // is the one the host accepts.
+    for name in [INODE, c"user.aim.android-inode"] {
+        let mut b = [0u8; 20];
+        if let Some(n) = get(host, name, &mut b) {
+            return decode_original(&b[..n]);
+        }
+    }
+    None
 }
 
 /// "DARI", version 1, then uid, gid and mode as little-endian words.

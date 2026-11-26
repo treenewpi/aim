@@ -82,6 +82,8 @@ pub struct Image<R> {
 
 struct Inode {
     mode: u16,
+    uid: u32,
+    gid: u32,
     size: u64,
     flags: u32,
     /// `i_block`, 60 bytes.
@@ -172,6 +174,7 @@ impl<R: ReadAt> Image<R> {
         // `mkdir` applies the umask. The inode mode is the one the guest
         // walks, so put it back, the same way a regular file is restored.
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io_err)?;
+        store_owner(path, &inode);
         for (child_ino, name) in self.dir_entries(&inode)? {
             if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
                 continue;
@@ -225,8 +228,12 @@ impl<R: ReadAt> Image<R> {
             file.write_all(&buf[..take]).map_err(io_err)?;
             done += take as u64;
         }
-        fs::set_permissions(path, fs::Permissions::from_mode(mode_bits(inode.mode, 0o644)))
-            .map_err(io_err)?;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(mode_bits(inode.mode, 0o644)),
+        )
+        .map_err(io_err)?;
+        store_owner(path, inode);
         Ok(())
     }
 
@@ -260,6 +267,13 @@ impl<R: ReadAt> Image<R> {
         let mut raw = vec![0u8; self.inode_size as usize];
         self.io.read_exact_at(at, &mut raw)?;
         let mode = ru16(&raw, 0);
+        let mut uid = ru16(&raw, 2) as u32;
+        let mut gid = ru16(&raw, 0x18) as u32;
+        // Linux `osd2`: `i_uid_high` at 0x78 and `i_gid_high` at 0x7a.
+        if raw.len() >= 0x7c {
+            uid |= (ru16(&raw, 0x78) as u32) << 16;
+            gid |= (ru16(&raw, 0x7a) as u32) << 16;
+        }
         let mut size = ru32(&raw, 4) as u64;
         if mode & S_IFMT != S_IFDIR && raw.len() >= 0x70 {
             size |= (ru32(&raw, 0x6c) as u64) << 32;
@@ -268,6 +282,8 @@ impl<R: ReadAt> Image<R> {
         block.copy_from_slice(&raw[0x28..0x64]);
         Ok(Inode {
             mode,
+            uid,
+            gid,
             size,
             flags: ru32(&raw, 0x20),
             raw: block,
@@ -432,6 +448,38 @@ fn mode_bits(mode: u16, default: u32) -> u32 {
     if bits == 0 { default } else { bits }
 }
 
+/// The inode's owner and mode, in the same `dev.aim.android-inode` record
+/// the image extractor writes. The guest check uses that, not the host
+/// file's mode: a host create can leave the other and group execute bits
+/// clear, and this does not add them. `user.aim.android-inode` is the same
+/// record where the host rejects a name outside the `user` namespace.
+fn store_owner(path: &Path, inode: &Inode) {
+    let mut bytes = [0u8; 20];
+    bytes[..8].copy_from_slice(b"DARI\x01\0\0\0");
+    bytes[8..12].copy_from_slice(&inode.uid.to_le_bytes());
+    bytes[12..16].copy_from_slice(&inode.gid.to_le_bytes());
+    bytes[16..20].copy_from_slice(&(inode.mode as u32).to_le_bytes());
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    for name in [c"dev.aim.android-inode", c"user.aim.android-inode"] {
+        // SAFETY: path and name are NUL-terminated; the value is 20 bytes.
+        let wrote = unsafe {
+            aim_storage::host::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        if wrote == 0 {
+            return;
+        }
+    }
+}
+
 fn io_err(error: std::io::Error) -> Errno {
     errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
 }
@@ -439,6 +487,15 @@ fn io_err(error: std::io::Error) -> Errno {
 #[cfg(test)]
 pub(crate) fn manifest_fixture() -> (Vec<u8>, &'static [u8]) {
     (tests::image(tests::MANIFEST, false), tests::MANIFEST)
+}
+
+/// An apex-shaped tree: `bin/boringssl_self_test64` is mode 0755, uid 0,
+/// gid 2000, as in the conscrypt payload. `bin/private` is 0750 and
+/// `bin/data` is 0644, both uid 0 gid 2000. The root is uid 1000 gid 1000
+/// mode 0755, and `bin` is uid 0 gid 2000 mode 0755.
+#[cfg(test)]
+pub(crate) fn permission_payload() -> Vec<u8> {
+    tests::permission_image()
 }
 
 fn ru16(buf: &[u8], at: usize) -> u16 {
@@ -584,13 +641,159 @@ mod tests {
         let previous = unsafe { libc::umask(0o077) };
         parsed.install(&dir).unwrap();
         unsafe { libc::umask(previous) };
-        let mode = |name: &str| {
-            fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o7777
-        };
+        let mode = |name: &str| fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode("tool"), 0o755);
         assert_eq!(mode("apex_manifest.pb"), 0o644);
         assert_eq!(fs::read(dir.join("tool")).unwrap(), b"exec");
+        assert_eq!(recorded(&dir.join("tool")), (0, 0, S_IFREG as u32 | 0o755));
+        assert_eq!(
+            recorded(&dir.join("apex_manifest.pb")),
+            (0, 0, S_IFREG as u32 | 0o644)
+        );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn recorded(path: &Path) -> (u32, u32, u32) {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 20];
+        for name in [c"dev.aim.android-inode", c"user.aim.android-inode"] {
+            // SAFETY: path and name are NUL-terminated; the buffer is 20 bytes.
+            let n = unsafe {
+                aim_storage::host::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    aim_storage::host::XATTR_NOFOLLOW,
+                )
+            };
+            if n == 20 && &buf[..8] == b"DARI\x01\0\0\0" {
+                let word = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+                return (word(8), word(12), word(16));
+            }
+        }
+        panic!("inode owner was not stored");
+    }
+
+    /// `bin/boringssl_self_test64` matches the conscrypt payload's owner.
+    pub(super) fn permission_image() -> Vec<u8> {
+        let bs = 4096usize;
+        let mut img = vec![0u8; bs * 32];
+        let sb = &mut img[1024..];
+        put32(sb, 0, 32);
+        put32(sb, 4, 32);
+        put32(sb, 0x18, 2);
+        put32(sb, 0x20, 32);
+        put32(sb, 0x28, 32);
+        put16(sb, 0x38, SUPER_MAGIC);
+        put32(sb, 0x4c, 1);
+        put32(sb, 0x54, 11);
+        put16(sb, 0x58, 256);
+        put32(sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+        put32(&mut img, bs + 8, 4);
+        let write_inode = |img: &mut [u8],
+                           ino: usize,
+                           mode: u16,
+                           uid: u32,
+                           gid: u32,
+                           size: u64,
+                           blocks: &[u8]| {
+            let at = 4 * bs + (ino - 1) * 256;
+            put16(img, at, mode);
+            put16(img, at + 2, uid as u16);
+            put32(img, at + 4, size as u32);
+            put16(img, at + 0x18, gid as u16);
+            put16(img, at + 0x1a, 2);
+            put32(img, at + 0x20, EXTENTS_FL);
+            put16(img, at + 0x78, (uid >> 16) as u16);
+            put16(img, at + 0x7a, (gid >> 16) as u16);
+            img[at + 0x28..at + 0x28 + blocks.len()].copy_from_slice(blocks);
+        };
+        let extent = |logical_block: u32| {
+            let mut ext = [0u8; 24];
+            put16(&mut ext, 0, EXTENT_MAGIC);
+            put16(&mut ext, 2, 1);
+            put16(&mut ext, 4, 4);
+            put32(&mut ext, 12, 0);
+            put16(&mut ext, 16, 1);
+            put32(&mut ext, 20, logical_block);
+            ext
+        };
+        let root_ext = extent(6);
+        let bin_ext = extent(7);
+        let exec_ext = extent(8);
+        let private_ext = extent(9);
+        let data_ext = extent(10);
+        write_inode(&mut img, 2, S_IFDIR | 0o755, 1000, 1000, 4096, &root_ext);
+        write_inode(&mut img, 11, S_IFDIR | 0o755, 0, 2000, 4096, &bin_ext);
+        let exec_body = b"not an elf";
+        let private_body = b"private";
+        let data_body = b"data";
+        write_inode(
+            &mut img,
+            12,
+            S_IFREG | 0o755,
+            0,
+            2000,
+            exec_body.len() as u64,
+            &exec_ext,
+        );
+        write_inode(
+            &mut img,
+            13,
+            S_IFREG | 0o750,
+            0,
+            2000,
+            private_body.len() as u64,
+            &private_ext,
+        );
+        write_inode(
+            &mut img,
+            14,
+            S_IFREG | 0o644,
+            0,
+            2000,
+            data_body.len() as u64,
+            &data_ext,
+        );
+        img[8 * bs..8 * bs + exec_body.len()].copy_from_slice(exec_body);
+        img[9 * bs..9 * bs + private_body.len()].copy_from_slice(private_body);
+        img[10 * bs..10 * bs + data_body.len()].copy_from_slice(data_body);
+        write_dir(
+            &mut img[6 * bs..7 * bs],
+            &[(2, ".", 2), (2, "..", 2), (11, "bin", 2)],
+        );
+        write_dir(
+            &mut img[7 * bs..8 * bs],
+            &[
+                (11, ".", 2),
+                (2, "..", 2),
+                (12, "boringssl_self_test64", 1),
+                (13, "private", 1),
+                (14, "data", 1),
+            ],
+        );
+        img
+    }
+
+    fn write_dir(dir: &mut [u8], entries: &[(u32, &str, u8)]) {
+        let mut at = 0usize;
+        for (i, (ino, name, kind)) in entries.iter().enumerate() {
+            let name = name.as_bytes();
+            let need = (8 + name.len() + 3) & !3;
+            let rec = if i + 1 == entries.len() {
+                dir.len() - at
+            } else {
+                need
+            };
+            put32(dir, at, *ino);
+            put16(dir, at + 4, rec as u16);
+            dir[at + 6] = name.len() as u8;
+            dir[at + 7] = *kind;
+            dir[at + 8..at + 8 + name.len()].copy_from_slice(name);
+            at += if i + 1 == entries.len() { need } else { rec };
+        }
     }
 
     #[test]
