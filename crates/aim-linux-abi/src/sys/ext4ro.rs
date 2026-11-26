@@ -163,11 +163,15 @@ impl<R: ReadAt> Image<R> {
         if inode.mode & S_IFMT != S_IFDIR {
             return Err(EIO);
         }
+        let mode = mode_bits(inode.mode, 0o755);
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(mode_bits(inode.mode, 0o755))
+            .mode(mode)
             .create(path)
             .map_err(io_err)?;
+        // `mkdir` applies the umask. The inode mode is the one the guest
+        // walks, so put it back, the same way a regular file is restored.
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io_err)?;
         for (child_ino, name) in self.dir_entries(&inode)? {
             if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
                 continue;

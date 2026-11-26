@@ -526,33 +526,39 @@ grew one 4 KiB page to 8 KiB with `MREMAP_MAYMOVE` 115 times, each
 `ENOMEM`, and aborted in `__cxa_atexit`. zygote (pid 67323) was
 killed on netd's `onrestart`. A guest-page-aligned grow that is not a
 whole number of 16 KiB host pages extends in place when the extra
-pages are not a different mapping, and otherwise moves when
-`MREMAP_MAYMOVE` is set. The extra pages are mapped, or the call
-returns the errno. It does not report success for a page it did not
-map, and it does not take a neighbor that is already mapped. Host
-`mmap`, `mprotect` and `mremap` stay 16 KiB and 16 KiB-aligned. After
-formal apexd, bpfloader, netd, zygote, surfaceflinger, credstore and
-gpuservice resolved `PT_INTERP` `/system/bin/linker64` to
+guest pages are free or already the tail of that mapping. When they
+are not, `MREMAP_MAYMOVE` allocates a new mapping of the new length,
+copies the original guest pages, and unmaps the old range. The extra
+pages are mapped, or the call returns the errno. It does not report
+success for a page it did not map, and it does not take a neighbor
+that is already mapped. The old guest page is not mapped after a move.
+Host `mmap`, `mprotect` and `mremap` are given only 16 KiB multiples
+at 16 KiB-aligned addresses. `0x1000` and `0x2000` stay guest lengths.
+After formal apexd, bpfloader, netd, zygote, surfaceflinger, credstore
+and gpuservice resolved `PT_INTERP` `/system/bin/linker64` to
 `apex-mounts/19` and read 4096 bytes. keystore2's later starts (pids
 67315 and 67340) and lmkd still resolved it to
 `apex-mounts/1/bin/linker64` (`ENOENT`, status 127). Each process
 started its `apex-mounts` counter at 1, and installing a payload
-removed the directory already at that path, so a mount that still
-named it saw another tree or a missing file. A new payload takes a
+removed the directory already at that path. A new payload takes a
 directory that does not already exist. The installed directory is
 recorded beside it. A directory that is gone, or that no longer
-contains that record, does not cover the path. A bind of that host
-does not either. The walk reaches the activated tree. A path that is
-still missing stays `ENOENT`. `boringssl_self_test_apex64` (pid 67362,
-uid 9999) exited 127 in 0.023s. `interpret` of
+contains that record, does not cover the path. A fork snapshot whose
+ext4 host is not the one in the namespace journal is replayed before
+the walk, so a pinned generation does not keep `apex-mounts/1` after
+the journal has moved that path. Symlink results under an ext4 host
+are not cached. A path that is still missing stays `ENOENT`.
+`boringssl_self_test_apex64` (pid 67362, uid 9999) exited 127 in
+0.023s. `interpret` of
 `/apex/com.android.conscrypt/bin/boringssl_self_test64` was `EACCES`
-at host `apex-mounts/4/bin/boringssl_self_test64`. That check is the
-host file: it is not a regular file, or the host user cannot execute
-it. The mode written for a regular file is the inode mode. A mode
-without execute is left without execute. `apex-mounts/4` is an early
-host, and a later payload no longer reuses it. A replaced host does
-not stay selected. The check is not skipped, and an exec that did not
-run is not reported as success. This is not Mac-remeasured. The pinned layer has 35
+at host `apex-mounts/4/bin/boringssl_self_test64`. uid 9999 is
+`DecodeUid` of the service's `user nobody`, not a failed name mapped
+to `AID_NOBODY`. The exec check is the guest identity against the
+guest mode, and then a read of the host file. A mode without execute
+stays without execute and is `EACCES`. The host execute bit is not
+added, and a directory keeps the inode mode rather than the umask.
+The check is not skipped, and an exec that did not run is not
+reported as success. This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

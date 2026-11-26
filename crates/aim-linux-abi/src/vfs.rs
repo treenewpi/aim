@@ -1361,7 +1361,9 @@ fn park_saved(saved: &ForkNamespace) -> Option<ParkedJournal> {
     // path walk return EIO when a fuse line names another namespace
     // (`refresh_fuse_mounts`): that was the child's `readlink` of
     // `/proc/self/exe` after `setns`. The generation stays on the page so
-    // the walk does not replay the journal over the restored table.
+    // an unchanged table is not rebuilt. An ext4 host the journal no longer
+    // records is still replayed (`ext4_journal_diverged`): the snapshot
+    // must not keep `apex-mounts/1` after the journal has moved that path.
     let records = owner.read().ok()?.mounts;
     let generation = owner.generation().ok()?.current();
     Some(ParkedJournal {
@@ -1674,42 +1676,92 @@ fn publish_mount_policy(guest: &str) -> Result<(), Errno> {
     ))
 }
 
+/// An ext4 mount this process walks. A bind is one when it still carries
+/// the ext4 stamp, the same set [`ext4_host_gone`] skips.
+fn tracked_ext4(fstype: Option<&str>, host: &Path) -> bool {
+    match fstype {
+        Some("ext4") => true,
+        Some("bind") => ext4_stamp_path(host).is_file(),
+        _ => false,
+    }
+}
+
+/// The walking table's ext4 hosts are not the journal's. A fork snapshot
+/// can name `apex-mounts/1` while the journal has already moved that guest
+/// path to the activated host. The generation is then pinned to the
+/// journal's current value, so a generation check alone keeps the snapshot.
+fn ext4_journal_diverged(records: &[aim_storage::mount_namespace::MountRecord]) -> bool {
+    let mounts = vfs().mounts.read().unwrap();
+    let table = mounts
+        .iter()
+        .filter(|mount| mount.own && tracked_ext4(mount.fstype.as_deref(), &mount.host))
+        .map(|mount| (mount.guest.as_str(), mount.host.as_path()))
+        .collect::<Vec<_>>();
+    let journal = records
+        .iter()
+        .filter(|record| {
+            record.own && tracked_ext4(Some(record.fstype.as_str()), Path::new(&record.host))
+        })
+        .map(|record| (record.guest.as_str(), record.host.as_str()))
+        .collect::<Vec<_>>();
+    if table.len() != journal.len() {
+        return true;
+    }
+    table.iter().any(|(guest, host)| {
+        !journal
+            .iter()
+            .any(|(recorded, recorded_host)| recorded == guest && Path::new(recorded_host) == *host)
+    })
+}
+
 fn refresh_namespace() -> Result<(), Errno> {
     let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
         return Ok(());
     }
     let _refresh = NAMESPACE_REFRESH.lock().unwrap();
-    let owner = NAMESPACE_VIEW.lock().unwrap().as_ref().and_then(|view| {
-        (view.page.current() != view.generation).then(|| (view.owner.clone(), view.generation))
-    });
-    if let Some((owner, generation)) = owner {
-        let state = owner.read().map_err(namespace_error)?;
-        if state.generation != generation {
-            let next = state.generation;
-            let mounts = vfs().mounts.read().unwrap().clone();
-            let rules = PROPAGATION_RULES.lock().unwrap().clone();
-            let private = PRIVATE_MOUNTS.load(Ordering::Acquire);
-            let previous = {
-                let mut view = NAMESPACE_VIEW.lock().unwrap();
-                let view = view.as_mut().ok_or(errno::ENODEV)?;
-                std::mem::replace(&mut view.records, std::sync::Arc::new(state.mounts.clone()))
-            };
-            // Replay can import shared routes while applying propagation flags.
-            // Authenticate them against this same complete owner generation.
-            if let Err(error) = apply_namespace_state(state) {
-                *vfs().mounts.write().unwrap() = mounts;
-                *PROPAGATION_RULES.lock().unwrap() = rules;
-                PRIVATE_MOUNTS.store(private, Ordering::Release);
-                if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
-                    view.records = previous;
-                }
-                return Err(error);
-            }
+    let pending = {
+        let view = NAMESPACE_VIEW.lock().unwrap();
+        view.as_ref().map(|view| {
+            (
+                view.owner.clone(),
+                view.generation,
+                view.page.current() != view.generation,
+                std::sync::Arc::clone(&view.records),
+            )
+        })
+    };
+    let Some((owner, generation, generation_moved, records)) = pending else {
+        return Ok(());
+    };
+    if !generation_moved && !ext4_journal_diverged(&records) {
+        return Ok(());
+    }
+    let state = owner.read().map_err(namespace_error)?;
+    if state.generation != generation || ext4_journal_diverged(&state.mounts) {
+        let next = state.generation;
+        let mounts = vfs().mounts.read().unwrap().clone();
+        let rules = PROPAGATION_RULES.lock().unwrap().clone();
+        let private = PRIVATE_MOUNTS.load(Ordering::Acquire);
+        let previous = {
+            let mut view = NAMESPACE_VIEW.lock().unwrap();
+            let view = view.as_mut().ok_or(errno::ENODEV)?;
+            std::mem::replace(&mut view.records, std::sync::Arc::new(state.mounts.clone()))
+        };
+        // Replay can import shared routes while applying propagation flags.
+        // Authenticate them against this same complete owner generation.
+        if let Err(error) = apply_namespace_state(state) {
+            *vfs().mounts.write().unwrap() = mounts;
+            *PROPAGATION_RULES.lock().unwrap() = rules;
+            PRIVATE_MOUNTS.store(private, Ordering::Release);
             if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
-                if view.owner.id() == owner.id() {
-                    view.generation = next;
-                }
+                view.records = previous;
+            }
+            return Err(error);
+        }
+        if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
+            if view.owner.id() == owner.id() {
+                view.generation = next;
             }
         }
     }
@@ -4425,6 +4477,19 @@ const IMAGE_LINKS_MAX: usize = 1 << 14;
 /// The target of `host` if it is a symlink, else (where an lstat found it)
 /// its stat: a walk's check of the directory it is then needs no stat of
 /// its own.
+/// `host` is inside an ext4 payload directory. That tree is replaced when
+/// a later payload is mounted; the immutable image root is not.
+fn under_ext4_host(host: &Path) -> bool {
+    let mut cursor = Some(host);
+    while let Some(path) = cursor {
+        if ext4_stamp_path(path).is_file() {
+            return true;
+        }
+        cursor = path.parent().filter(|parent| *parent != path);
+    }
+    false
+}
+
 fn link_target(host: PathBuf, area: Area) -> ImageNode {
     let node = |host: &PathBuf| {
         let Ok(name) = host_cstring(host.clone()) else {
@@ -4439,7 +4504,7 @@ fn link_target(host: PathBuf, area: Area) -> ImageNode {
         }
         (std::fs::read_link(host).ok(), None)
     };
-    if area != Area::Image || !vfs().mapped {
+    if area != Area::Image || !vfs().mapped || under_ext4_host(&host) {
         return node(&host);
     }
     if let Some(known) = IMAGE_LINKS
@@ -6014,6 +6079,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&old_host);
         let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
         let _ = std::fs::remove_file(&image);
+    }
+
+    /// A fork snapshot still names the bootstrap ext4 host, and its journal
+    /// generation is already current, which is how `park_saved` leaves a
+    /// namespace. The journal itself has the activated host. The next walk
+    /// follows the journal, not the snapshot.
+    #[test]
+    fn a_pinned_ext4_snapshot_follows_the_journal() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::Ordering;
+        let (_view, dir) = test_view();
+        let runtime = runtime_dir().unwrap().to_path_buf();
+        let id = format!("ext4-pin-{}", std::process::id());
+        let owner = aim_storage::mount_namespace::Namespace::open(&runtime, &id).unwrap();
+        owner
+            .initialize(&format!(
+                "root\t/\t{}\npropagation\t/\tshared\n{}",
+                vfs().root.display(),
+                std::fs::read_to_string(runtime.join("path-map")).unwrap()
+            ))
+            .unwrap();
+        struct Restore {
+            rules: Vec<(String, Propagation)>,
+            private: bool,
+            view: Option<NamespaceView>,
+            mounts: Vec<Mount>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                *NAMESPACE_VIEW.lock().unwrap() = self.view.take();
+                *PROPAGATION_RULES.lock().unwrap() = std::mem::take(&mut self.rules);
+                PRIVATE_MOUNTS.store(self.private, Ordering::Release);
+                *vfs().mounts.write().unwrap() = std::mem::take(&mut self.mounts);
+            }
+        }
+        let restore = Restore {
+            rules: PROPAGATION_RULES.lock().unwrap().clone(),
+            private: PRIVATE_MOUNTS.load(Ordering::Acquire),
+            view: NAMESPACE_VIEW.lock().unwrap().take(),
+            mounts: vfs().mounts.read().unwrap().clone(),
+        };
+        *NAMESPACE_VIEW.lock().unwrap() = Some(NamespaceView {
+            page: owner.generation().unwrap(),
+            owner: owner.clone(),
+            generation: 0,
+            records: Default::default(),
+        });
+        refresh_namespace().unwrap();
+        let old_host = dir.join("pin-old-linker");
+        let new_host = dir.join("pin-new-linker");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        note_ext4_host(&old_host).unwrap();
+        note_ext4_host(&new_host).unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-pin-old",
+            "ext4",
+        )
+        .unwrap();
+        let snapshot = vfs().mounts.read().unwrap().clone();
+        owner
+            .append("remove\t/apex/com.android.runtime")
+            .unwrap();
+        owner
+            .append(&format!(
+                "ro\t/apex/com.android.runtime\t{}\t/dev/block/loop-pin-new\text4\n",
+                new_host.display()
+            ))
+            .unwrap();
+        *vfs().mounts.write().unwrap() = snapshot;
+        {
+            let state = owner.read().unwrap();
+            let mut slot = NAMESPACE_VIEW.lock().unwrap();
+            let view = slot.as_mut().unwrap();
+            view.generation = view.page.current();
+            view.records = std::sync::Arc::new(state.mounts);
+        }
+        let found = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap_or_else(|error| panic!("resolve errno={error}"));
+        let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(found.host.as_bytes()));
+        assert!(
+            host.starts_with(&new_host),
+            "pinned snapshot kept {}",
+            host.display()
+        );
+        assert_eq!(std::fs::read(&host).unwrap(), b"activated-linker");
+        let again = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap();
+        let again = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(again.host.as_bytes()));
+        assert_eq!(again, host);
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
+        let _ = std::fs::remove_file(ext4_stamp_path(&new_host));
     }
 }
 

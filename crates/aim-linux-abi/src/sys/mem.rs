@@ -3013,9 +3013,10 @@ fn grow_slice(old: u64, page: u64) -> GrowSlice {
 /// Anonymous host pages for a grow that cannot extend in place.
 ///
 /// The length and the address passed to `mmap` are multiples of the 16 KiB
-/// host page. A 4 KiB kernel may hand back a 4 KiB-aligned address; that
-/// mapping is released and the call fails, rather than protecting a
-/// sub-page.
+/// host page. `0x1000` and `0x2000` are guest lengths and are never passed
+/// through. A 4 KiB kernel may hand back a 4 KiB-aligned address; that
+/// mapping is released with the pointer `mmap` returned and the call fails,
+/// rather than protecting or remapping a sub-page.
 fn map_grow_destination(len: u64) -> Result<u64, i64> {
     let bytes = page_up(len);
     let span = bytes + PAGE;
@@ -4497,6 +4498,7 @@ mod tests {
         assert!(moved > 0, "grow returned {moved}");
         assert_ne!(moved as u64, src);
         let dest = moved as u64;
+        assert_eq!(dest & (PAGE - 1), 0, "moved address {dest:#x} is not 16 KiB-aligned");
         unsafe {
             assert_eq!(*(dest as *const u8), 0x5a);
             assert_eq!(*((dest + 0x1000) as *const u8), 0);
@@ -4504,7 +4506,36 @@ mod tests {
             assert_eq!(*((dest + 0x1000) as *const u8), 0x3c);
             assert_eq!(*(neighbor as *const u8), 0x11);
         }
+        assert!(
+            guest_slice_prot(src).is_err(),
+            "the old 4 KiB mapping is still a guest page"
+        );
         unsafe { libc::munmap(ptr, len) };
         unsafe { libc::munmap(dest as *mut _, PAGE as usize) };
+
+        // The mapping bionic actually grows: `mmap` of one guest page,
+        // which this layer accounts as a 16 KiB host page, then
+        // `mremap` to two guest pages. The extra page is the free tail,
+        // so the grow stays in place and the new page is writable.
+        let mapped = mmap([
+            0,
+            0x1000,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            0,
+            0,
+        ]);
+        assert!(mapped > 0, "mmap returned {mapped}");
+        let src = mapped as u64;
+        assert_eq!(src & (PAGE - 1), 0);
+        unsafe { std::ptr::write_bytes(src as *mut u8, 0x5a, 0x1000) };
+        let grown = mremap([src, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0]);
+        assert_eq!(grown, src as i64);
+        unsafe {
+            assert_eq!(*(src as *const u8), 0x5a);
+            *((src + 0x1000) as *mut u8) = 0x77;
+            assert_eq!(*((src + 0x1000) as *const u8), 0x77);
+        }
+        unsafe { libc::munmap(src as *mut _, PAGE as usize) };
     }
 }

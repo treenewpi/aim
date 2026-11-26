@@ -243,17 +243,42 @@ fn parse_shebang(buf: &[u8; BINPRM_BUF_SIZE]) -> Option<(Vec<u8>, Option<Vec<u8>
     Some((buf[name..sep].to_vec(), arg))
 }
 
-/// Classify the file at `host` as `execve` would, after the permission
-/// checks.
-fn classify(host: &CStr) -> Result<Kind, i64> {
+/// Classify `guest` (the file `host` resolves) as `execve` would, after
+/// the permission checks.
+///
+/// The guest identity is what Linux checks. uid 9999 is init's `nobody`
+/// (`DecodeUid`), not a failed lookup rewritten to `AID_NOBODY`. The host
+/// file stays as the inode wrote it: a mode without execute is `EACCES`,
+/// and this does not add the bit. When the guest may execute, the host
+/// user's `access(X_OK)` is not the decision. Opening the file still has
+/// to succeed, so a file that cannot be read is that errno.
+fn classify(guest: &str, host: &CStr) -> Result<Kind, i64> {
     // SAFETY: host path from the resolver; local buffers.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
         if libc::stat(host.as_ptr(), &mut st) < 0 {
             return Err(-(errno::last() as i64));
         }
-        if st.st_mode & libc::S_IFMT != libc::S_IFREG || libc::access(host.as_ptr(), libc::X_OK) < 0
-        {
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(-(EACCES as i64));
+        }
+        if super::attrs::recording() {
+            let guest_st = super::attrs::path_stat(guest).map_err(|error| -(error as i64))?;
+            let id = super::cred::current();
+            if !super::attrs::permits(&guest_st, 1, &id, super::attrs::FS) {
+                return Err(-(EACCES as i64));
+            }
+            if super::tracing() && libc::access(host.as_ptr(), libc::X_OK) < 0 {
+                let error = errno::last();
+                crate::diag!(
+                    "[linux-abi] exec: guest-exec allow host-access errno={error} ({}) mode={:#o} uid={} guest=\"{guest}\" host=\"{}\"",
+                    super::names::errno_name(error as i32),
+                    st.st_mode,
+                    id.uid[super::attrs::FS],
+                    host.to_string_lossy()
+                );
+            }
+        } else if libc::access(host.as_ptr(), libc::X_OK) < 0 {
             return Err(-(EACCES as i64));
         }
         let source = super::verified_source::VerifiedSource::open(host, true)
@@ -409,7 +434,7 @@ fn in_place(
                 return Some(-(e as i64));
             }
         };
-        if let Err(e) = classify(&r.host) {
+        if let Err(e) = classify(&i, &r.host) {
             note_classify(&i, &r.host);
             note_exec(nr, "interpreter", &i, e);
             return Some(e);
@@ -475,7 +500,7 @@ pub fn interpret(
     let mut interp_of = filename.to_vec();
     let mut depth = 0;
     loop {
-        match classify(&target.host) {
+        match classify(&target.guest, &target.host) {
             Ok(Kind::Elf) => {
                 note_pt_interp(&target);
                 return Ok((target, argv));
@@ -889,5 +914,95 @@ mod tests {
         let mut long = b"#!/".to_vec();
         long.extend(std::iter::repeat_n(b'a', 300));
         assert_eq!(shebang(&long), None);
+    }
+
+    /// uid 9999 is the service user `nobody`. A file the guest may not
+    /// execute stays `EACCES` and keeps its mode. A guest mode with execute
+    /// is allowed when the host file is only readable: the host execute bit
+    /// is not added, and the call does not report success for a non-ELF.
+    #[test]
+    fn nobody_executes_only_when_the_guest_mode_allows() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::nobody_executes_only_when_the_guest_mode_allows",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, root) = crate::vfs::test_view();
+        let file = root.join("data").join("self-test-mode");
+        std::fs::write(&file, b"not an elf").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [9999; 4];
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_amb = 0;
+        super::super::cred::init(nobody, None);
+        let guest = "/data/self-test-mode";
+        let host = CString::new(file.as_os_str().as_bytes()).unwrap();
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(EACCES as i64)));
+        assert_eq!(mode(&file), 0o644);
+        super::super::cred::init(super::super::cred::Identity::default(), None);
+        let path = CString::new(guest).unwrap();
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o755,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::super::cred::init(
+            {
+                let mut id = super::super::cred::Identity::default();
+                id.uid = [9999; 4];
+                id.gid = [9999; 4];
+                id.cap_eff = 0;
+                id.cap_perm = 0;
+                id.cap_amb = 0;
+                id
+            },
+            None,
+        );
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(ENOEXEC as i64)));
+        assert_eq!(mode(&file), 0o644);
+        super::super::cred::init(super::super::cred::Identity::default(), None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o750,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(mode(&file), 0o750);
+        super::super::cred::init(
+            {
+                let mut id = super::super::cred::Identity::default();
+                id.uid = [9999; 4];
+                id.gid = [9999; 4];
+                id.cap_eff = 0;
+                id.cap_perm = 0;
+                id.cap_amb = 0;
+                id
+            },
+            None,
+        );
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(EACCES as i64)));
+        assert_eq!(mode(&file), 0o750);
+        super::super::cred::init(saved, None);
+        let _ = std::fs::remove_file(&file);
     }
 }
