@@ -120,7 +120,7 @@ pub fn setns(a: [u64; 6]) -> i64 {
 /// `sysfs_create_mount_point(fs_kobj, "bpf")`. `/sys/fs/pstore` and
 /// `/sys/fs/selinux` stay absent until those filesystems exist.
 fn sysfs_dir() -> Result<PathBuf, i64> {
-    let dir = tmpfs_dir(&[])?;
+    let (dir, _, _, _) = tmpfs_dir(&[])?;
     for name in [
         "block",
         "bus",
@@ -163,7 +163,7 @@ fn is_dir(r: &vfs::Resolved) -> Result<bool, i64> {
 
 /// A fresh host directory for a tmpfs mount, under the runtime directory
 /// (per boot) or the host's temporary directory.
-fn tmpfs_dir(data: &[u8]) -> Result<PathBuf, i64> {
+fn tmpfs_dir(data: &[u8]) -> Result<(PathBuf, u32, u32, u32), i64> {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let base = vfs::runtime_dir()
         .map(|r| r.join("tmpfs"))
@@ -172,14 +172,39 @@ fn tmpfs_dir(data: &[u8]) -> Result<PathBuf, i64> {
     let pid = unsafe { libc::getpid() };
     let dir = base.join(format!("{pid}.{}", SEQ.fetch_add(1, Relaxed)));
     std::fs::create_dir_all(&dir).map_err(|_| -(ENOENT as i64))?;
-    let mode = String::from_utf8_lossy(data)
-        .split(',')
-        .find_map(|o| o.strip_prefix("mode="))
-        .and_then(|m| u32::from_str_radix(m, 8).ok())
-        .unwrap_or(0o1777);
+    let text = String::from_utf8_lossy(data);
+    let field = |key: &str, radix: u32| {
+        text.split(',')
+            .find_map(|o| o.strip_prefix(key))
+            .and_then(|m| u32::from_str_radix(m, radix).ok())
+    };
+    // Linux tmpfs applies `mode=` to the root inode. `mkdir` has already
+    // applied the umask, and a failed chmod must not leave that mode as
+    // the guest's: uid 9999 cannot search a 0700 directory owned by root.
+    let mode = field("mode=", 8).unwrap_or(0o1777) & 0o7777;
+    let uid = field("uid=", 10).unwrap_or(0);
+    let gid = field("gid=", 10).unwrap_or(0);
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode & 0o7777));
-    Ok(dir)
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+    Ok((dir, uid, gid, mode))
+}
+
+/// The mount is visible, so the record is stored under the key a later
+/// stat of `guest` looks up. Recording before `add_mount` names the
+/// covered directory instead.
+fn record_tmpfs(guest: &str, dir: &std::path::Path, uid: u32, gid: u32, mode: u32) {
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    super::attrs::record(
+        super::attrs::Host::Path(&path),
+        || guest.to_string(),
+        super::attrs::Attr {
+            uid: Some(uid),
+            gid: Some(gid),
+            mode: Some(mode),
+        },
+    );
 }
 
 pub fn mount(a: [u64; 6]) -> i64 {
@@ -296,14 +321,15 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
             } else {
                 super::user_memory::read_cstr(a[4], 16384).map_err(|error| -(error as i64))?
             };
-            let dir = tmpfs_dir(&data)?;
+            let (dir, uid, gid, mode) = tmpfs_dir(&data)?;
             let area = if flags & MS_RDONLY != 0 {
                 Area::Image
             } else {
                 Area::Writable
             };
-            vfs::add_mount(&target.guest, dir, area, "tmpfs", "tmpfs")
+            vfs::add_mount(&target.guest, dir.clone(), area, "tmpfs", "tmpfs")
                 .map_err(|error| -(error as i64))?;
+            record_tmpfs(&target.guest, &dir, uid, gid, mode);
             Ok(())
         }
         b"binder" => {
@@ -325,7 +351,7 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
             // `bpf_fill_super`: a new bpffs root is mode 01777. The
             // directory is the superblock. Pins are files in it. The
             // mount point already exists; this does not create it.
-            let dir = tmpfs_dir(&[])?;
+            let (dir, _, _, _) = tmpfs_dir(&[])?;
             vfs::add_mount(&target.guest, dir, Area::Writable, "bpf", "bpf")
                 .map_err(|error| -(error as i64))?;
             Ok(())

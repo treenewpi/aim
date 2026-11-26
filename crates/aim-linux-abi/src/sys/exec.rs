@@ -284,7 +284,7 @@ fn classify(guest: &str, host: &CStr) -> Result<Kind, i64> {
         } else if libc::access(host.as_ptr(), libc::X_OK) < 0 {
             return Err(-(EACCES as i64));
         }
-        let source = super::verified_source::VerifiedSource::open(host, true)
+        let source = super::verified_source::VerifiedSource::open_guest(host, Some(guest), true)
             .map_err(|error| -(error as i64))?;
         let mut buf = [0u8; BINPRM_BUF_SIZE];
         let n = source
@@ -701,19 +701,22 @@ fn note_classify(guest: &str, host: &CStr) {
             let error = errno::last();
             (st.st_mode as u32, "host-access".to_string(), Some(error))
         } else {
-            // The host user can execute a file it owns. The guest mode is
-            // a separate check and is what `classify` already rejected.
+            // Host execute succeeded. The guest mode is a separate check.
             (st.st_mode as u32, "guest-mode".to_string(), None)
         }
     };
     let id = super::cred::current();
     let guest_exec = match super::attrs::path_stat(guest) {
         Ok(st) => {
-            if super::attrs::permits(&st, 1, &id, super::attrs::FS) {
-                "allow".to_string()
+            let verdict = if super::attrs::permits(&st, 1, &id, super::attrs::FS) {
+                "allow"
             } else {
-                format!("deny mode={:#o}", st.st_mode)
-            }
+                "deny"
+            };
+            format!(
+                "{verdict} mode={:#o} st_uid={} st_gid={}",
+                st.st_mode, st.st_uid, st.st_gid
+            )
         }
         Err(error) => format!("errno={error} ({})", super::names::errno_name(error as i32)),
     };
@@ -730,9 +733,6 @@ fn note_classify(guest: &str, host: &CStr) {
             ),
         }
     };
-    if reason == "guest-mode" && guest_exec == "allow" {
-        return;
-    }
     let access = access_errno
         .map(|error| {
             format!(
@@ -1248,5 +1248,147 @@ mod tests {
             );
         }
         super::super::cred::init(saved, None);
+    }
+
+    /// `/apex` is tmpfs `mode=0755,uid=0,gid=0`. The host directory can be
+    /// left at the umask (0700); that is not the guest mode. The payload
+    /// inode is 0755 uid 0 gid 2000, so uid 9999 executes it through the
+    /// other bits. The host file stays 0644. A 0750 or 0644 inode stays
+    /// `EACCES`.
+    #[test]
+    fn nobody_searches_apex_tmpfs_and_executes_the_payload() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::nobody_searches_apex_tmpfs_and_executes_the_payload",
+        ) {
+            return;
+        }
+        let (_guard, root) = crate::vfs::test_view();
+        let previous = unsafe { libc::umask(0o077) };
+        let mkdir = |path: &CStr| {
+            assert_eq!(
+                super::super::fsops::mkdirat([
+                    LINUX_AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    0o755,
+                    0,
+                    0,
+                    0,
+                ]),
+                0,
+                "mkdir {}",
+                path.to_string_lossy()
+            );
+        };
+        // The image already has `/apex`. Guest mkdir there is EROFS; init
+        // mounts the tmpfs on that directory.
+        std::fs::create_dir_all(root.join("root/apex")).unwrap();
+        let apex = CString::new("/apex").unwrap();
+        let tmpfs = CString::new("tmpfs").unwrap();
+        let opts = CString::new("mode=0755,uid=0,gid=0").unwrap();
+        assert_eq!(
+            super::super::mount::mount([
+                tmpfs.as_ptr() as u64,
+                apex.as_ptr() as u64,
+                tmpfs.as_ptr() as u64,
+                0,
+                opts.as_ptr() as u64,
+                0,
+            ]),
+            0,
+            "tmpfs /apex"
+        );
+        let versioned = CString::new("/apex/com.android.conscrypt@360499999").unwrap();
+        mkdir(&versioned);
+        let active = CString::new("/apex/com.android.conscrypt").unwrap();
+        mkdir(&active);
+        let payload = super::super::ext4ro::permission_payload();
+        let image_path = root.join("conscrypt-payload.img");
+        std::fs::write(&image_path, &payload).unwrap();
+        let backing = CString::new(image_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        let mut info = [0u8; 232];
+        info[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        super::super::loopdev::configure(minor, fd, 4096, &info).unwrap();
+        unsafe { libc::close(fd) };
+        super::super::loopdev::mount_ext4(
+            &format!("/dev/block/loop{minor}"),
+            "/apex/com.android.conscrypt@360499999",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::mount::mount([
+                versioned.as_ptr() as u64,
+                active.as_ptr() as u64,
+                0,
+                4096,
+                0,
+                0,
+            ]),
+            0,
+            "bind the versioned conscrypt tree"
+        );
+        let found = vfs::resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.conscrypt/bin/boringssl_self_test64",
+            true,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let apex_dir = vfs::resolve(LINUX_AT_FDCWD, b"/apex", true).unwrap();
+        std::fs::set_permissions(
+            std::path::Path::new(apex_dir.host.to_str().unwrap()),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            std::path::Path::new(found.host.to_str().unwrap()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let file_st = super::super::attrs::path_stat(&found.guest).unwrap();
+        assert_eq!(file_st.st_uid, 0);
+        assert_eq!(file_st.st_gid, 2000);
+        assert_eq!(file_st.st_mode & 0o7777, 0o755);
+        let apex_st = super::super::attrs::path_stat("/apex").unwrap();
+        assert_eq!(apex_st.st_uid, 0);
+        assert_eq!(apex_st.st_gid, 0);
+        assert_eq!(apex_st.st_mode & 0o7777, 0o755);
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.groups.clear();
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        let error = match classify(&found.guest, &found.host) {
+            Ok(_) => 0,
+            Err(error) => error,
+        };
+        assert_eq!(error, -(ENOEXEC as i64), "classify errno {}", -error);
+        assert_eq!(
+            std::fs::metadata(std::path::Path::new(found.host.to_str().unwrap()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        for (name, errno) in [("private", EACCES), ("data", EACCES)] {
+            let path = format!("/apex/com.android.conscrypt/bin/{name}");
+            let found = vfs::resolve(LINUX_AT_FDCWD, path.as_bytes(), true).unwrap();
+            assert!(
+                matches!(classify(&found.guest, &found.host), Err(error) if error == -(errno as i64)),
+                "{name}"
+            );
+        }
+        super::super::cred::init(saved, None);
+        unsafe { libc::umask(previous) };
     }
 }

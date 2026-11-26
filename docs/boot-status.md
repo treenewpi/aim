@@ -579,27 +579,41 @@ Same-size `mremap(0x1000, 0x1000, flags=0x3)` ran 1912 times, each
 returning 0. `mremap(0x1000, 0x2000, flags=0x1)` ran 5 times, each
 succeeding, including netd (pid 69278). No leftover
 `apex-mounts/1` `ENOENT`. sysfs and bpf mounts and bpfloader exit 0
-still hold. The stop is
-`boringssl_self_test_apex64` (pid 69315, uid 9999, gid 0) exiting
-127 in 0.033s: `interpret` of
+still hold.
+`b284ec7efdcc3e935ded0acb093374261842a082` was measured on Mac
+(archive SHA256
+`73c67ad8a195ccb7ca9caa6d94dc9907798093a66c3547a3cdd7403c74cedc62`,
+SHA256SUMS
+`894bf6b89415352417ac6907ed90cfce1ede4f6bca7a39be8dc52c3932916cba`,
+94 members, guest stderr SHA256
+`3853a9d0734b075ff7c5dcfaef45701e7c97726cb9622cd8af8e06911741d875`).
+It is not a boot. There is no `system_server`, and `boot_completed`
+stays 0. Init started 2026-11-26 12:44:51 Asia/Kuala_Lumpur and ran
+52.662s. The payload inode record is on the conscrypt file: host
+mode 0755, `dev.aim.android-inode` DARI v1 uid 0 gid 2000 mode
+0100755. `user.aim.android-inode` is absent. Both views grant other
+execute to uid 9999, so the file check is not what returned
+`EACCES` and it was not logged. The stop is
+`boringssl_self_test_apex64` (pid 70308, uid 9999, gid 0) exiting
+127: `interpret` of
 `/apex/com.android.conscrypt/bin/boringssl_self_test64` is `EACCES`
-at host `apex-mounts/69251-3/bin/boringssl_self_test64` (read 4096,
-`fstype=bind` source `/apex/com.android.conscrypt@360499999`). The
-file is there. Its ext4 inode is mode 0755, uid 0, gid 2000, so
-other execute allows uid 9999 gid 0. The payload install did not
-record that owner, so the guest view was uid 0 gid 0 and the host
-file's mode. Both gids are 0, so the group class is what is checked.
-A host mode whose group class has no execute is `EACCES` for uid
-9999; the host owner could still execute the file and the read was
-4096 bytes. The inode's gid is 2000, so that 0755 is the other
-class, and other execute allows uid 9999.
-`/system/bin/boringssl_self_test64` already has the
-image's inode record, which is why the same uid could exec it. The
-installed tree now records the inode's uid, gid and mode
-(`dev.aim.android-inode`, or `user.aim.android-inode` where the host
-rejects the first name). The host execute bit is not added. A 0750
-or 0644 inode stays `EACCES`. A path that is still missing stays
-`ENOENT`. keystore2 still `SIGABRT` after a successful exec,
+at host `apex-mounts/70214-3/bin/boringssl_self_test64` (read 4096,
+`fstype=bind` source `/apex/com.android.conscrypt@360499999`).
+Search continues after that file check. `/apex` is tmpfs
+`mode=0755,uid=0,gid=0`, and that mode was not recorded, so the
+guest mode was the host directory's. `mkdir` applies the umask
+first; a directory left at 0700 is owner-executable only. uid 0 can
+search it and uid 9999 (gid 0, no group execute) cannot. That is
+why `boringssl_self_test64_vendor` (pid 70193, uid 0) and
+`/system/bin/boringssl_self_test64` (pid 70200, uid 9999) exited 0
+while this path did not. The tmpfs root now records the mode the
+mount asked for, after the mount is visible. The exec open uses
+that same guest stat, and a denial logs the uid, gid and mode that
+produced it. The host execute bit is not added. A 0750 or 0644
+inode stays `EACCES`. A path that is still missing stays `ENOENT`.
+Same-size `mremap` flags=0x3 ran 2336 times, each returning 0.
+Eight grows (flags=0x1) succeeded in place; the 4K-to-8K move was
+not exercised. keystore2 still `SIGABRT` after a successful exec,
 netd still `SIGABRT` after a successful grow, and zygote is still
 killed on netd's `onrestart`. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
