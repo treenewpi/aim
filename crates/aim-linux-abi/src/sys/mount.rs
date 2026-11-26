@@ -1236,6 +1236,190 @@ mod tests {
         }
     }
 
+    fn slash_view() -> String {
+        let (host, area) = vfs::lookup("/");
+        let stat = attrs::path_stat("/").map(|st| {
+            format!(
+                "uid={} gid={} mode={:#o}",
+                st.st_uid,
+                st.st_gid,
+                st.st_mode & 0o7777
+            )
+        });
+        let mounts = vfs::own_mounts_text()
+            .lines()
+            .filter(|line| {
+                let mut fields = line.split('\t');
+                let _kind = fields.next();
+                matches!(fields.next(), Some("/") | Some(""))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let journal = vfs::mount_namespace_id()
+            .and_then(|id| vfs::runtime_dir().map(|runtime| (id, runtime.to_path_buf())))
+            .and_then(|(id, runtime)| {
+                aim_storage::mount_namespace::Namespace::open(&runtime, &id)
+                    .ok()
+                    .and_then(|ns| ns.read().ok())
+            })
+            .map(|state| {
+                state
+                    .mounts
+                    .iter()
+                    .filter(|mount| mount.guest == "/" || mount.guest.is_empty())
+                    .map(|mount| {
+                        format!(
+                            "{} host={} root={} kind={} own={} shared={}",
+                            mount.guest, mount.host, mount.root, mount.kind, mount.own, mount.shared
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_default();
+        format!(
+            "host={} area={area:?} stat={stat:?} covering={mounts} journal_root={journal}",
+            host.display()
+        )
+    }
+
+    fn current_ns() -> std::sync::Arc<vfs::MountNs> {
+        let link = vfs::mount_namespace_link();
+        let ino = link
+            .trim_start_matches("mnt:[")
+            .trim_end_matches(']')
+            .parse()
+            .unwrap_or_else(|_| panic!("namespace link {link}"));
+        vfs::mount_namespace(ino).unwrap_or_else(|| panic!("namespace {link} is not registered"))
+    }
+
+    /// The unshare'd default namespace still names the image root at `/`.
+    /// A mount stacked on a bind of a root subdirectory must not replace
+    /// that root in the peer namespace. The image directory is host 0700
+    /// with a 0755 android-inode; uid 9999 can search it. A 0700 directory
+    /// with no record cannot.
+    #[test]
+    fn default_namespace_root_is_the_image_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_view, root) = vfs::test_view();
+        let image_root = root.join("root");
+        std::fs::create_dir_all(image_root.join("apex")).unwrap();
+        std::fs::create_dir_all(image_root.join("bootstrap-apex")).unwrap();
+        let previous = std::fs::metadata(&image_root).unwrap().permissions();
+        std::fs::set_permissions(&image_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dari = {
+            let mut bytes = b"DARI\x01\0\0\0".to_vec();
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0o755u32.to_le_bytes());
+            bytes
+        };
+        let path = std::ffi::CString::new(image_root.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new("user.aim.android-inode").unwrap();
+        let set = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                dari.as_ptr().cast(),
+                dari.len(),
+                0,
+            )
+        };
+        assert_eq!(set, 0, "DARI: {}", std::io::Error::last_os_error());
+        struct Restore<'a> {
+            image: &'a std::path::Path,
+            mode: std::fs::Permissions,
+            path: &'a std::ffi::CString,
+            name: &'a std::ffi::CString,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = unsafe { libc::removexattr(self.path.as_ptr(), self.name.as_ptr()) };
+                let _ = std::fs::set_permissions(self.image, self.mode.clone());
+            }
+        }
+        let _restore = Restore {
+            image: &image_root,
+            mode: previous.clone(),
+            path: &path,
+            name: &name,
+        };
+        let boot = current_ns();
+        let shared = MS_SHARED | 0x4000;
+        let slash = at("/");
+        let apex = at("/apex");
+        let bootstrap = at("/bootstrap-apex");
+        let tmpfs = at("tmpfs");
+        let mode = at("mode=0755,uid=0,gid=0");
+        let expect_image = |step: &str| {
+            let (host, _) = vfs::lookup("/");
+            let stat = attrs::path_stat("/").unwrap_or_else(|error| panic!("{step}: stat errno={error} {}", slash_view()));
+            assert_eq!(
+                host.canonicalize().ok().as_deref(),
+                image_root.canonicalize().ok().as_deref(),
+                "{step}: / left the image root {}",
+                slash_view()
+            );
+            assert_eq!(stat.st_mode & 0o7777, 0o755, "{step}: {}", slash_view());
+        };
+        expect_image("before namespace setup");
+        assert_eq!(mount([0, p(&slash), 0, shared, 0, 0]), 0, "MS_SHARED|MS_REC /");
+        expect_image("after MS_SHARED /");
+        // `/bootstrap-apex` stays a directory of the shared root, so the
+        // bind joins that root's peer group. A later mount on `/apex`
+        // must follow the bind's root (`/bootstrap-apex`), not replace `/`.
+        assert_eq!(mount([p(&tmpfs), p(&apex), p(&tmpfs), 0, p(&mode), 0]), 0);
+        assert_eq!(mount([0, p(&apex), 0, MS_PRIVATE, 0, 0]), 0);
+        expect_image("after private /apex");
+        assert_eq!(unshare([CLONE_NEWNS, 0, 0, 0, 0, 0]), 0);
+        let default_ns = current_ns();
+        expect_image("inside the new namespace");
+        vfs::switch_mount_namespace(&boot).expect("setns back");
+        expect_image("back in bootstrap");
+        assert_eq!(
+            mount([p(&bootstrap), p(&apex), 0, MS_BIND | 0x4000, 0, 0]),
+            0,
+            "bind /bootstrap-apex /apex"
+        );
+        expect_image("after bootstrap apex bind");
+        assert_eq!(
+            mount([p(&tmpfs), p(&apex), p(&tmpfs), 0, p(&mode), 0]),
+            0,
+            "tmpfs stacked on /apex"
+        );
+        expect_image("after stacked /apex tmpfs");
+        vfs::switch_mount_namespace(&default_ns).expect("setns default");
+        expect_image("default namespace");
+        let text = vfs::own_mounts_text();
+        vfs::load_own_mounts(&text).expect("replay");
+        expect_image("replayed default journal");
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.groups.clear();
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        assert_eq!(
+            attrs::search("/", &super::super::cred::current(), attrs::FS, None),
+            Ok(()),
+            "uid 9999 {}",
+            slash_view()
+        );
+        super::super::cred::init(saved, None);
+        vfs::switch_mount_namespace(&boot).expect("setns boot");
+        for dir in ["/apex", "/bootstrap-apex"] {
+            let t = at(dir);
+            let _ = umount2([p(&t), MNT_DETACH, 0, 0, 0, 0]);
+        }
+        let _ = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+        std::fs::set_permissions(&image_root, previous).unwrap();
+    }
+
     /// Android 16's namespace switch, then a plain fork. The child is a new
     /// process: it reloads the default journal and installs the inherited
     /// namespaces, whose bootstrap inode collides with the child's first

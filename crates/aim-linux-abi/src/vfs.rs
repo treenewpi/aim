@@ -3684,27 +3684,66 @@ pub fn remount_fuse(guest: &str, read_only: bool) -> Result<bool, Errno> {
     Ok(true)
 }
 
+/// Path of `child` below the mount point `parent`.
+fn mount_relative<'a>(parent: &str, child: &'a str) -> Option<&'a str> {
+    if parent == "/" {
+        child.strip_prefix('/')
+    } else if child == parent {
+        Some("")
+    } else {
+        child.strip_prefix(parent)?.strip_prefix('/')
+    }
+}
+
 /// Where a mount event at `child` lands on one peer of its parent.
 ///
 /// The peer keeps its own path. A bind of `/bootstrap-apex` onto a private
-/// `/apex` joins `/bootstrap-apex`'s peer group, so a later mount under
-/// `/apex` is `/bootstrap-apex/...` in the default namespace, not another
-/// `/apex`.
-fn peer_path(parent: &str, child: &str, receiver: &str) -> Option<String> {
-    let relative = if parent == "/" {
-        child.strip_prefix('/')?
-    } else if child == parent {
-        ""
-    } else {
-        child.strip_prefix(parent)?.strip_prefix('/')?
-    };
-    if relative.is_empty() {
-        return Some(receiver.to_string());
+/// `/apex` joins that mount's peer group. The bind's root is the source
+/// path inside the shared tree, so a later mount on `/apex` is
+/// `/bootstrap-apex` in a peer whose root is `/`, not the peer's own
+/// mountpoint. Using the mountpoint alone makes that copy `/` and hides
+/// the image root.
+fn propagated_guest(
+    parent_guest: &str,
+    parent_root: &str,
+    child: &str,
+    receiver_guest: &str,
+    receiver_root: &str,
+) -> Option<String> {
+    let relative = mount_relative(parent_guest, child)?;
+    let parent_root = if parent_root.is_empty() { "/" } else { parent_root };
+    let receiver_root = if receiver_root.is_empty() { "/" } else { receiver_root };
+    let mut within = parent_root.trim_end_matches('/').to_string();
+    if !relative.is_empty() {
+        if within.is_empty() {
+            within = format!("/{relative}");
+        } else {
+            within = format!("{within}/{relative}");
+        }
     }
-    if receiver == "/" {
-        Some(format!("/{relative}"))
+    if within.is_empty() {
+        within = "/".into();
+    }
+    let below = if receiver_root == "/" {
+        within.trim_start_matches('/').to_string()
+    } else if within == receiver_root {
+        String::new()
     } else {
-        Some(format!("{}/{relative}", receiver.trim_end_matches('/')))
+        within
+            .strip_prefix(receiver_root)?
+            .trim_start_matches('/')
+            .to_string()
+    };
+    if below.is_empty() {
+        return Some(receiver_guest.to_string());
+    }
+    if receiver_guest == "/" {
+        Some(format!("/{below}"))
+    } else {
+        Some(format!(
+            "{}/{below}",
+            receiver_guest.trim_end_matches('/')
+        ))
     }
 }
 
@@ -3794,7 +3833,13 @@ fn propagation_copies(guest: &str) -> Result<Vec<PropCopy>, Errno> {
             }
         }
         for mount in newest {
-            let Some(dest) = peer_path(&parent.guest, guest, &mount.guest) else {
+            let Some(dest) = propagated_guest(
+                &parent.guest,
+                &parent.root,
+                guest,
+                &mount.guest,
+                &mount.root,
+            ) else {
                 continue;
             };
             if same && dest == guest {
@@ -4017,7 +4062,8 @@ pub fn move_mount(from: &str, to: &str) -> Result<bool, Errno> {
             } else if let Some(rest) = to.strip_prefix(from) {
                 format!("{}{rest}", copy.guest.trim_end_matches('/'))
             } else {
-                peer_path(&copy.receiver, to, &copy.receiver).unwrap_or_else(|| to.to_string())
+                propagated_guest(&copy.receiver, "/", to, &copy.receiver, "/")
+                    .unwrap_or_else(|| to.to_string())
             };
             write_propagation(copy, &format!("move\t{}\t{dest}", copy.guest))?;
         }

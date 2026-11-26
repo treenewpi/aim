@@ -680,7 +680,13 @@ oneshot is not reported as success. `service 'servicemanager'
 requested start, but it is already running` is `Service::Start`
 seeing the process still running. After apexd was already dead, some
 execs logged `guest-search path="/" errno=13 st_mode=0o40700`. That
-view is later than the abort. logd `EACCES`, `crash_dump64`
+view is later than the abort. It is not the sealed image root. A
+bind of a directory on the shared root joins that root's peer group,
+and a mount stacked on the bind was propagated to the peer's
+mountpoint, so lookup of `/` in the unshared namespace was that
+mount's host (mode 0700, no android-inode) instead of the image
+directory. The copy now follows the bind's root inside the shared
+tree, and `/` stays the image directory. A denial logs the host path. logd `EACCES`, `crash_dump64`
 `ENOENT`, missing libraries, keystore2 and netd `SIGABRT`, and
 zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and

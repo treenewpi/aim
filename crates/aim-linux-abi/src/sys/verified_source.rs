@@ -28,6 +28,7 @@ fn note_denied(kind: &str, path: &str, error: Errno) {
         return;
     }
     let id = cred::current();
+    let (host, _) = crate::vfs::lookup(path);
     let view = match attrs::path_stat(path) {
         Ok(st) => format!(
             "st_uid={} st_gid={} st_mode={:#o}",
@@ -36,7 +37,8 @@ fn note_denied(kind: &str, path: &str, error: Errno) {
         Err(stat_error) => format!("stat errno={stat_error}"),
     };
     crate::diag!(
-        "[linux-abi] exec: stage=interpret reason={kind} path=\"{path}\" errno={error} uid={} gid={} {view}",
+        "[linux-abi] exec: stage=interpret reason={kind} path=\"{path}\" host=\"{}\" errno={error} uid={} gid={} {view}",
+        host.display(),
         id.uid[attrs::FS],
         id.gid[attrs::FS]
     );
