@@ -509,7 +509,9 @@ shadow update. `mremap` of one 4 KiB page with
 `linker_cfi.cpp`'s check aborted. A same-size move of one guest page
 now moves that slice on the 16 KiB host page. The host page stays
 write-wins and is never writable and executable together. The call
-returns the new address, or the errno of a move it refuses. After
+returns the new address, or the errno of a move it refuses. A
+read-only page is read-only again after the moved bytes are written.
+After
 formal apexd mounted the runtime APEX at
 `/apex/com.android.runtime@1` and activated 35 packages, the next two
 execs still resolved `PT_INTERP` `/system/bin/linker64` through the

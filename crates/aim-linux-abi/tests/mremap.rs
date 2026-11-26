@@ -144,6 +144,31 @@ fn fixed_mremap_moves_one_guest_page() {
         mremap(src + 0x1000, 0x1000, 0x1000, FIXED, dst + 0x2000),
         -(libc::EINVAL as i64)
     );
+    // The published slice and the shadow page are both read-only. The
+    // temporary write of the moved bytes must be put back.
+    let ro_src = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let ro_base = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let ro = ro_base + 0x1000;
+    fill(ro_src, 0x1000, 0xab);
+    fill(ro_src + 0x1000, 0x1000, 0xcd);
+    fill(ro_base, 0x1000, 0x21);
+    fill(ro + 0x1000, 0x1000, 0x43);
+    assert_eq!(mprotect(ro_src, PAGE, libc::PROT_READ as u64), 0);
+    assert_eq!(mprotect(ro_base, PAGE, libc::PROT_READ as u64), 0);
+    assert_eq!(
+        mremap(ro_src, 0x1000, 0x1000, MAYMOVE | FIXED, ro),
+        ro as i64
+    );
+    assert_eq!(byte(ro), 0xab);
+    assert_eq!(byte(ro_base), 0x21);
+    assert_eq!(byte(ro + 0x1000), 0x43);
+    assert_eq!(byte(ro_src + 0x1000), 0xcd);
+    let (_start, _end, prot, _shared) = patch::vm::region(ro).expect("read-only dest host page");
+    assert_eq!(
+        prot & (libc::PROT_WRITE | libc::PROT_EXEC),
+        0,
+        "read-only shadow stayed writable: host prot {prot:#x}"
+    );
 }
 
 #[test]

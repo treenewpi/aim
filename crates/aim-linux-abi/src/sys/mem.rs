@@ -2887,16 +2887,22 @@ fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
             prot: [0; 4],
         }
     };
-    if existed.is_none() {
+    // The bytes are written through a writable host page. That widening is
+    // undone below: `opened` is the protection the page has while the bytes
+    // are copied. Passing the protection from before the copy would leave a
+    // read-only CFI shadow writable, because the write-wins result equals
+    // that earlier protection.
+    let writable = (libc::PROT_READ | libc::PROT_WRITE) as u32;
+    let opened = if existed.is_none() {
         match host_mmap(
             host,
             PAGE,
-            libc::PROT_READ | libc::PROT_WRITE,
+            writable as i32,
             libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
             0,
         ) {
-            Ok(mapped) if mapped == host => {}
+            Ok(mapped) if mapped == host => true,
             Ok(mapped) => {
                 unsafe { libc::munmap(mapped as *mut _, PAGE as usize) };
                 return -(ENOMEM as i64);
@@ -2904,13 +2910,16 @@ fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
             Err(error) => return error,
         }
     } else if existed.unwrap() & libc::PROT_WRITE as u32 == 0 {
-        let result = host_mprotect(host, PAGE, libc::PROT_READ | libc::PROT_WRITE);
+        let result = host_mprotect(host, PAGE, writable as i32);
         if result < 0 {
             return result;
         }
-    }
+        true
+    } else {
+        false
+    };
     // SAFETY: the host page was just created writable, or mprotect'd
-    // writable. The write covers one guest page.
+    // writable, or it was already writable. The write covers one guest page.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, 4096);
     }
@@ -2936,7 +2945,8 @@ fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
             recorded.insert(addr, prot);
         }
     }
-    apply_host_prot(host, &pieces, old_host, new_host, true)
+    let from = if opened { writable } else { old_host };
+    apply_host_prot(host, &pieces, from, new_host, true)
 }
 
 /// `mremap` of a range that is not a whole number of 16 KiB host pages.
@@ -4133,6 +4143,42 @@ mod tests {
         unsafe {
             libc::munmap(src_raw as *mut _, 2 * PAGE as usize);
             libc::munmap(dst_raw as *mut _, 2 * PAGE as usize);
+        }
+
+        // The shadow page is read-only, and the slice being published is
+        // read-only. Writing the bytes must not leave that host page
+        // writable.
+        let (ro_src_raw, ro_src) = map();
+        let (ro_dst_raw, ro_base) = map();
+        let ro = ro_base + 0x1000;
+        unsafe {
+            std::ptr::write_bytes(ro_src as *mut u8, 0xab, 0x1000);
+            std::ptr::write_bytes((ro_src + 0x1000) as *mut u8, 0xcd, 0x1000);
+            std::ptr::write_bytes(ro_base as *mut u8, 0x21, 0x1000);
+            std::ptr::write_bytes((ro + 0x1000) as *mut u8, 0x43, 0x1000);
+        }
+        let read = libc::PROT_READ as u64;
+        assert_eq!(mprotect([ro_src, PAGE, read, 0, 0, 0]), 0);
+        assert_eq!(mprotect([ro_base, PAGE, read, 0, 0, 0]), 0);
+        assert_eq!(
+            mremap([ro_src, 0x1000, 0x1000, flags, ro, 0]),
+            ro as i64
+        );
+        unsafe {
+            assert_eq!(*(ro as *const u8), 0xab);
+            assert_eq!(*(ro_base as *const u8), 0x21);
+            assert_eq!(*((ro + 0x1000) as *const u8), 0x43);
+            assert_eq!(*((ro_src + 0x1000) as *const u8), 0xcd);
+        }
+        let prot = super::page_prot(ro).expect("read-only dest host page");
+        assert_eq!(
+            prot & (libc::PROT_WRITE | libc::PROT_EXEC) as u32,
+            0,
+            "read-only shadow stayed writable: host prot {prot:#x}"
+        );
+        unsafe {
+            libc::munmap(ro_src_raw as *mut _, 2 * PAGE as usize);
+            libc::munmap(ro_dst_raw as *mut _, 2 * PAGE as usize);
         }
     }
 }
