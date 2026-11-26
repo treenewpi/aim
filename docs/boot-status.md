@@ -588,7 +588,12 @@ at host `apex-mounts/69251-3/bin/boringssl_self_test64` (read 4096,
 file is there. Its ext4 inode is mode 0755, uid 0, gid 2000, so
 other execute allows uid 9999 gid 0. The payload install did not
 record that owner, so the guest view was uid 0 gid 0 and the host
-file's mode. `/system/bin/boringssl_self_test64` already has the
+file's mode. Both gids are 0, so the group class is what is checked.
+A host mode whose group class has no execute is `EACCES` for uid
+9999; the host owner could still execute the file and the read was
+4096 bytes. The inode's gid is 2000, so that 0755 is the other
+class, and other execute allows uid 9999.
+`/system/bin/boringssl_self_test64` already has the
 image's inode record, which is why the same uid could exec it. The
 installed tree now records the inode's uid, gid and mode
 (`dev.aim.android-inode`, or `user.aim.android-inode` where the host
