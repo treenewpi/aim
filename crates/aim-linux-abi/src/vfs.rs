@@ -1324,10 +1324,18 @@ fn retarget_namespace(old: Arc<MountNs>, ino: u64) {
         parked: Mutex::new(old.parked.lock().unwrap().take()),
         journal_id: Mutex::new(old.journal_id.lock().unwrap().clone()),
     });
+    let journal_owner = JOURNAL_OWNER.load(Ordering::Acquire) == old.ino;
     {
         let mut map = NAMESPACES.lock().unwrap();
         map.remove(&old.ino);
         map.insert(ino, Arc::clone(&ns));
+    }
+    // A fork child starts its inode counter where the parent did. The inode
+    // just removed is the one an inherited namespace is materialized under.
+    // Leaving the journal owner on it parks the live view onto that
+    // namespace at the next lookup, and every walk returns ENODEV.
+    if journal_owner {
+        JOURNAL_OWNER.store(ino, Ordering::Release);
     }
     if BOOT_NS
         .lock()
@@ -4011,6 +4019,7 @@ pub fn load_own_mounts(text: &str) -> Result<(), Errno> {
                     page,
                     records: Default::default(),
                 });
+                *current_mount_namespace().journal_id.lock().unwrap() = Some(id.to_owned());
                 refresh_namespace()?;
                 publish_process_namespace()?;
                 return Ok(());

@@ -10,6 +10,9 @@
 //! bootstrap namespace is copied, so a mount under the bootstrap bind of
 //! `/bootstrap-apex` lands on `/bootstrap-apex` in the default namespace.
 //! The other namespaces are answered "unsupported" (ADR 0012 appendix).
+//! A plain fork after `setns` into the default namespace keeps that
+//! journal. The child walks the shared root; `/apex` there stays the
+//! private tmpfs.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -901,5 +904,385 @@ mod tests {
         );
         assert_eq!(super::super::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The inode a process hands out first. A fork child starts there too,
+    /// which is the parent's bootstrap namespace.
+    const FIRST_NS: u64 = 0x1000_0001;
+
+    fn open_guest(path: &str) -> i64 {
+        let path = at(path);
+        super::super::fs::openat([LINUX_AT_FDCWD as u64, p(&path), 0, 0, 0, 0])
+    }
+
+    fn assert_default_namespace_walks() {
+        let fd = open_guest("/system/bin/vdc");
+        assert!(
+            fd >= 0,
+            "open /system/bin/vdc errno {} ({})\n{}",
+            -fd,
+            super::super::names::errno_name((-fd) as i32),
+            vfs::own_mounts_text()
+        );
+        assert_eq!(super::super::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        let found = vfs::resolve(LINUX_AT_FDCWD, b"/system/bin/vdc", true).unwrap_or_else(|error| {
+            panic!(
+                "resolve /system/bin/vdc errno={error} ({})\n{}",
+                super::super::names::errno_name(error),
+                vfs::own_mounts_text()
+            )
+        });
+        let bytes = std::fs::read(OsStr::from_bytes(found.host.as_bytes())).unwrap_or_else(|error| {
+            panic!(
+                "read /system/bin/vdc errno={} host={}\n{}",
+                error.raw_os_error().unwrap_or(0),
+                found.host.to_string_lossy(),
+                vfs::own_mounts_text()
+            )
+        });
+        assert_eq!(bytes, b"vdc-stand-in");
+
+        let fd = open_guest("/dev/null");
+        assert!(
+            fd >= 0,
+            "open /dev/null errno {} ({})\n{}",
+            -fd,
+            super::super::names::errno_name((-fd) as i32),
+            vfs::own_mounts_text()
+        );
+        assert_eq!(super::super::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+
+        let fd = open_guest("/proc/self/ns/mnt");
+        assert!(
+            fd >= 0,
+            "open /proc/self/ns/mnt errno {} ({})\n{}",
+            -fd,
+            super::super::names::errno_name((-fd) as i32),
+            vfs::own_mounts_text()
+        );
+        assert_eq!(super::super::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+
+        let apex = vfs::resolve(LINUX_AT_FDCWD, b"/apex/marker", true).unwrap_or_else(|error| {
+            panic!(
+                "resolve /apex/marker errno={error}\n{}",
+                vfs::own_mounts_text()
+            )
+        });
+        assert!(
+            std::fs::read(OsStr::from_bytes(apex.host.as_bytes())).is_err(),
+            "default /apex has the bootstrap marker at {}\n{}",
+            apex.host.to_string_lossy(),
+            vfs::own_mounts_text()
+        );
+        let peer = std::fs::read(host("/bootstrap-apex/marker")).unwrap_or_else(|error| {
+            panic!(
+                "read /bootstrap-apex/marker errno={} host={}\n{}",
+                error.raw_os_error().unwrap_or(0),
+                host("/bootstrap-apex/marker").display(),
+                vfs::own_mounts_text()
+            )
+        });
+        assert_eq!(peer, b"bootstrap");
+        let text = vfs::own_mounts_text();
+        assert!(
+            text.lines().any(|line| line.contains("\t/apex\t") && line.contains("tmpfs")),
+            "default /apex is not the private tmpfs\n{text}"
+        );
+        assert!(
+            text.lines().any(|line| line == "propagation\t/apex\tprivate"),
+            "default /apex is not private\n{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.contains("\t/apex/marker\t")),
+            "default /apex received the bootstrap marker mount\n{text}"
+        );
+    }
+
+    fn area_name(area: vfs::Area) -> &'static str {
+        match area {
+            vfs::Area::Image => "ro",
+            vfs::Area::Writable => "rw",
+            vfs::Area::Kernfs => "kernfs",
+            vfs::Area::HostDevice => "host-device",
+            vfs::Area::Input => "input",
+        }
+    }
+
+    fn write_namespace_image(path: &std::path::Path, image: &vfs::ForkNamespaces) {
+        let mut out = format!(
+            "current\t{}\t{}\n",
+            image.current,
+            u8::from(image.new_namespace)
+        );
+        for ns in &image.namespaces {
+            out.push_str(&format!(
+                "ns\t{}\t{}\t{}\t{}\n",
+                ns.ino,
+                ns.event,
+                ns.journal_id.as_deref().unwrap_or("-"),
+                u8::from(ns.private_mounts)
+            ));
+            for (root, code) in &ns.propagation {
+                out.push_str(&format!("prop\t{}\t{}\t{}\n", ns.ino, root, code));
+            }
+            for mount in &ns.mounts {
+                let (session, relative, uid, gid, allow, perm, read_only) = match &mount.fuse {
+                    Some(route) => (
+                        route.session.display().to_string(),
+                        route.relative.clone(),
+                        route.uid.to_string(),
+                        route.gid.to_string(),
+                        u8::from(route.allow_other).to_string(),
+                        u8::from(route.default_permissions).to_string(),
+                        u8::from(route.read_only).to_string(),
+                    ),
+                    None => (
+                        "-".into(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
+                out.push_str(&format!(
+                    "mount\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    ns.ino,
+                    area_name(mount.area),
+                    mount.guest,
+                    mount.host.display(),
+                    mount.source.as_deref().unwrap_or(""),
+                    mount.fstype.as_deref().unwrap_or(""),
+                    u8::from(mount.own),
+                    mount.seq,
+                    u8::from(mount.shared_fuse),
+                    u8::from(mount.projected_fuse),
+                    mount.bind_source.as_deref().unwrap_or(""),
+                    session,
+                    relative,
+                    uid,
+                    gid,
+                    allow,
+                    perm,
+                    read_only
+                ));
+            }
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    fn read_namespace_image(text: &str) -> vfs::ForkNamespaces {
+        let mut current = 0;
+        let mut new_namespace = false;
+        let mut namespaces: Vec<vfs::ForkNamespace> = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["current", ino, flag] => {
+                    current = ino.parse().unwrap();
+                    new_namespace = *flag == "1";
+                }
+                ["ns", ino, event, journal, private] => namespaces.push(vfs::ForkNamespace {
+                    ino: ino.parse().unwrap(),
+                    event: event.parse().unwrap(),
+                    journal_id: (*journal != "-").then(|| (*journal).to_owned()),
+                    private_mounts: *private == "1",
+                    propagation: Vec::new(),
+                    mounts: Vec::new(),
+                }),
+                ["prop", ino, root, code] => {
+                    let ino: u64 = ino.parse().unwrap();
+                    namespaces
+                        .iter_mut()
+                        .find(|ns| ns.ino == ino)
+                        .unwrap()
+                        .propagation
+                        .push(((*root).to_owned(), code.parse().unwrap()));
+                }
+                ["mount", ino, area, guest, host, source, fstype, own, seq, shared, projected, bind, session, relative, uid, gid, allow, perm, read_only] =>
+                {
+                    let ino: u64 = ino.parse().unwrap();
+                    let area = match *area {
+                        "ro" => vfs::Area::Image,
+                        "rw" => vfs::Area::Writable,
+                        "kernfs" => vfs::Area::Kernfs,
+                        "host-device" => vfs::Area::HostDevice,
+                        "input" => vfs::Area::Input,
+                        other => panic!("area {other}"),
+                    };
+                    let fuse = (*session != "-").then(|| vfs::FuseRoute {
+                        session: PathBuf::from(*session),
+                        relative: (*relative).to_owned(),
+                        uid: uid.parse().unwrap(),
+                        gid: gid.parse().unwrap(),
+                        allow_other: *allow == "1",
+                        default_permissions: *perm == "1",
+                        read_only: *read_only == "1",
+                    });
+                    namespaces
+                        .iter_mut()
+                        .find(|ns| ns.ino == ino)
+                        .unwrap()
+                        .mounts
+                        .push(vfs::ForkMount {
+                            guest: (*guest).to_owned(),
+                            host: PathBuf::from(*host),
+                            area,
+                            source: (!source.is_empty()).then(|| (*source).to_owned()),
+                            fstype: (!fstype.is_empty()).then(|| (*fstype).to_owned()),
+                            own: *own == "1",
+                            seq: seq.parse().unwrap(),
+                            shared_fuse: *shared == "1",
+                            projected_fuse: *projected == "1",
+                            bind_source: (!bind.is_empty()).then(|| (*bind).to_owned()),
+                            fuse,
+                        });
+                }
+                _ => panic!("namespace image line {line}"),
+            }
+        }
+        vfs::ForkNamespaces {
+            new_namespace,
+            current,
+            namespaces,
+        }
+    }
+
+    /// Android 16's namespace switch, then a plain fork. The child is a new
+    /// process: it reloads the default journal and installs the inherited
+    /// namespaces, whose bootstrap inode collides with the child's first
+    /// inode. It must still open the image root, `/dev/null` and `/proc`,
+    /// and `/apex` must still be the empty private tmpfs.
+    #[test]
+    fn default_namespace_fork_walks_shared_root() {
+        let (_view, root) = vfs::test_view();
+        let image_root = root.join("root");
+        std::fs::create_dir_all(image_root.join("system/bin")).unwrap();
+        std::fs::write(image_root.join("system/bin/vdc"), b"vdc-stand-in").unwrap();
+        std::fs::create_dir_all(image_root.join("apex")).unwrap();
+        std::fs::create_dir_all(image_root.join("bootstrap-apex")).unwrap();
+
+        let boot = super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let shared = MS_SHARED | 0x4000;
+        let slash = at("/");
+        let apex = at("/apex");
+        let bootstrap = at("/bootstrap-apex");
+        let tmpfs = at("tmpfs");
+        let mode = at("mode=0755");
+        assert_eq!(mount([0, p(&slash), 0, shared, 0, 0]), 0, "MS_SHARED|MS_REC /");
+        assert_eq!(mount([p(&tmpfs), p(&apex), p(&tmpfs), 0, p(&mode), 0]), 0);
+        assert_eq!(
+            mount([p(&tmpfs), p(&bootstrap), p(&tmpfs), 0, p(&mode), 0]),
+            0
+        );
+        assert_eq!(mount([0, p(&apex), 0, MS_PRIVATE, 0, 0]), 0, "MS_PRIVATE /apex");
+        assert_eq!(unshare([CLONE_NEWNS, 0, 0, 0, 0, 0]), 0);
+        let default_ns =
+            super::super::procfs::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        let bind = MS_BIND | 0x4000;
+        assert_eq!(mount([p(&bootstrap), p(&apex), 0, bind, 0, 0]), 0);
+        std::fs::write(host("/apex").join("marker"), b"bootstrap").unwrap();
+        assert_eq!(setns([default_ns as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        assert_default_namespace_walks();
+
+        let text = vfs::fork_mounts_text(false).unwrap();
+        let image = vfs::capture_fork_namespaces(false);
+        assert!(
+            image
+                .namespaces
+                .iter()
+                .any(|ns| ns.ino == FIRST_NS && ns.ino != image.current),
+            "the inherited bootstrap inode is not the child's first inode; current={} inos={:?}",
+            image.current,
+            image.namespaces.iter().map(|ns| ns.ino).collect::<Vec<_>>()
+        );
+        let scratch = std::env::temp_dir().join(format!(
+            "aim-ns-fork-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mounts_path = scratch.join("mounts");
+        let image_path = scratch.join("namespaces");
+        std::fs::write(&mounts_path, &text).unwrap();
+        write_namespace_image(&image_path, &image);
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+        use std::io::Write;
+        // The mount syscalls install the guest signal forwarder. A child
+        // exit must not be delivered through that Darwin frame on Linux.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sys::mount::tests::default_namespace_child_walks",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        writeln!(
+            child.0.stdin.take().unwrap(),
+            "{}\n{}\n{}\n{}",
+            image_root.display(),
+            root.join("run/path-map").display(),
+            mounts_path.display(),
+            image_path.display()
+        )
+        .unwrap();
+        let status = child.0.wait().unwrap();
+        assert!(status.success(), "fork child walk failed: {status}");
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(setns([boot as u64, CLONE_NEWNS, 0, 0, 0, 0]), 0);
+        for dir in ["/apex", "/bootstrap-apex"] {
+            let t = at(dir);
+            let _ = umount2([p(&t), MNT_DETACH, 0, 0, 0, 0]);
+        }
+        assert_eq!(
+            super::super::fs::close([default_ns as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(super::super::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    /// Subprocess of [`default_namespace_fork_walks_shared_root`].
+    #[test]
+    #[ignore = "subprocess of default_namespace_fork_walks_shared_root"]
+    fn default_namespace_child_walks() {
+        use std::io::BufRead;
+        let mut input = std::io::BufReader::new(std::io::stdin());
+        let mut lines = Vec::new();
+        for _ in 0..4 {
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            lines.push(line.trim_end().to_owned());
+        }
+        vfs::init(std::path::Path::new(&lines[0]), Some(std::path::Path::new(&lines[1]))).unwrap();
+        let text = std::fs::read_to_string(&lines[2]).unwrap();
+        vfs::load_own_mounts(&text).unwrap();
+        let image = read_namespace_image(&std::fs::read_to_string(&lines[3]).unwrap());
+        assert!(
+            vfs::install_fork_namespaces(&image),
+            "fork namespaces did not install\n{}",
+            vfs::own_mounts_text()
+        );
+        assert_default_namespace_walks();
     }
 }

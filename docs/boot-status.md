@@ -430,8 +430,25 @@ pid 61672, before the namespace switch, returned `-13` at stage
 opened. The trace names `reason=host-access` or `reason=not-regular`,
 the host `access(X_OK)` errno, the guest execute bit for the filesystem
 uid (1036) and whether a directory search was recorded. File
-capabilities and a security label are not checked there. This path
-rewrite is not Mac-remeasured. The pinned layer has 35
+capabilities and a security label are not checked there.
+`6a3aa4beba30f31f9a15ec1fe84936d7eccfab00` (archive SHA256
+`b555775f0f294f0dfcefd0522ed743724d8357ea2d493e86a51b5a3c2900ad07`)
+remeasured the private `/apex` layout. Init still exits
+`reboot,apexd-failed` at 6.303s. It is not a boot. After `setns` the
+default `/apex` is the empty private tmpfs and `/bootstrap-apex` holds
+the bootstrap binds and ext4. The parent still walks `/system` and
+`/data`. A plain fork (`clone` flags `0x1200011`, not `CLONE_NEWNS`)
+then fails `/system`, `/dev/null`, `/proc/self/ns/mnt` and
+`/etc/cgroups.json` with errno 19, and vdc, logd and apexd execve fail
+the same way (exit 127). The child's first inode is the parent's
+bootstrap inode. Retargeting the child onto the default namespace
+removed that inode while the journal owner still named it, and
+materializing the inherited bootstrap namespace reused it. The next
+lookup parked the live journal onto the bootstrap namespace and left
+the view empty, so `refresh_fuse_mounts` returned `ENODEV` before the
+walk. The mount table itself still held the empty `/apex` tmpfs.
+`retarget_namespace` moves the journal owner with the namespace. That
+fix is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
