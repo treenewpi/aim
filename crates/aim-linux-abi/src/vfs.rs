@@ -22,7 +22,7 @@
 //!   tmpfs over `/data/user` hides the path map's `/data/user/0`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -3255,24 +3255,79 @@ fn hidden(mounts: &[Mount], m: &Mount) -> bool {
         .any(|n| n.seq > m.seq && below(&n.guest, &m.guest).is_some())
 }
 
-/// Sidecar beside an ext4 host directory. The same bytes are written inside
-/// the directory. Removing and creating the directory again drops the inner
-/// copy; an inode number can be reused, so the bytes are the record.
+/// Sidecar beside an ext4 host directory. The same bytes are an attribute
+/// of the directory. Removing and creating the directory again drops that
+/// attribute; an inode number can be reused, so the bytes are the record.
+/// The attribute is not a directory entry, so a mounted APEX payload does
+/// not contain it.
 pub(crate) fn ext4_stamp_path(host: &Path) -> PathBuf {
     let mut name = host.file_name().unwrap_or_default().to_os_string();
     name.push(".stamp");
     host.with_file_name(name)
 }
 
-fn ext4_stamp_file(host: &Path) -> PathBuf {
-    host.join(".aim-ext4-stamp")
+/// `dev.aim.ext4-stamp` where the host accepts that name, otherwise
+/// `user.aim.ext4-stamp`. A guest attribute is `dev.aim.xattr.*`, so this
+/// name is not one.
+const EXT4_STAMP_ATTRS: [&CStr; 2] = [c"dev.aim.ext4-stamp", c"user.aim.ext4-stamp"];
+
+fn write_ext4_stamp_attr(host: &Path, text: &[u8]) -> Result<(), Errno> {
+    let path = host_cstring(host.to_path_buf())?;
+    let mut error = errno::EIO;
+    for name in EXT4_STAMP_ATTRS {
+        // SAFETY: path and name are NUL-terminated; `text` is the value.
+        let wrote = unsafe {
+            aim_storage::host::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                text.as_ptr().cast(),
+                text.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        if wrote == 0 {
+            return Ok(());
+        }
+        error = errno::last();
+    }
+    Err(error)
+}
+
+/// The identity bytes on `host`, or `None` when the directory does not
+/// carry them. A read that fails for another reason is `Err`, and the
+/// mount stays.
+fn read_ext4_stamp_attr(host: &Path) -> Result<Option<Vec<u8>>, ()> {
+    let path = host_cstring(host.to_path_buf()).map_err(|_| ())?;
+    let mut buf = [0u8; 64];
+    for (i, name) in EXT4_STAMP_ATTRS.iter().enumerate() {
+        // SAFETY: path and name are NUL-terminated; the buffer is 64 bytes.
+        let n = unsafe {
+            aim_storage::host::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        if n >= 0 {
+            return Ok(Some(buf[..n as usize].to_vec()));
+        }
+        let missing = errno::last() == errno::ENODATA;
+        if i + 1 == EXT4_STAMP_ATTRS.len() {
+            return if missing { Ok(None) } else { Err(()) };
+        }
+    }
+    Ok(None)
 }
 
 /// Remember the directory `host` that an ext4 mount just installed.
 ///
 /// A later install must not reuse this path. If something replaces the
-/// directory anyway, the copy of this record inside it is gone and the
-/// mount stops covering the guest path.
+/// directory anyway, the attribute on it is gone and the mount stops
+/// covering the guest path. The record is not a file in that directory.
 pub(crate) fn note_ext4_host(host: &Path) -> Result<(), Errno> {
     let meta = std::fs::metadata(host).map_err(|error| {
         errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
@@ -3281,18 +3336,15 @@ pub(crate) fn note_ext4_host(host: &Path) -> Result<(), Errno> {
         return Err(errno::ENOTDIR);
     }
     let text = format!("{}\n", std::process::id());
-    let write = |path: &Path| {
-        std::fs::write(path, &text).map_err(|error| {
-            errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
-        })
-    };
-    write(&ext4_stamp_file(host))?;
-    write(&ext4_stamp_path(host))
+    write_ext4_stamp_attr(host, text.as_bytes())?;
+    std::fs::write(ext4_stamp_path(host), &text).map_err(|error| {
+        errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+    })
 }
 
 /// The recorded directory was removed and created again. The path exists,
 /// but it is not the tree this mount installed. A failed read other than
-/// a missing file keeps the mount.
+/// a missing attribute keeps the mount.
 fn ext4_identity_replaced(host: &Path) -> bool {
     let expected = match std::fs::read(ext4_stamp_path(host)) {
         Ok(text) => text,
@@ -3301,9 +3353,10 @@ fn ext4_identity_replaced(host: &Path) -> bool {
     if expected.is_empty() {
         return false;
     }
-    match std::fs::read(ext4_stamp_file(host)) {
-        Ok(found) => found != expected,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    match read_ext4_stamp_attr(host) {
+        Ok(Some(found)) => found != expected,
+        Ok(None) => true,
+        Err(()) => false,
     }
 }
 
@@ -5905,6 +5958,91 @@ mod tests {
         assert!(remove_mount("/data/user/0").unwrap());
         assert!(remove_mount("/data/user").unwrap());
         assert_eq!(lookup("/data/user/0/p").0, data.join("data/p"));
+    }
+
+    /// The ext4 identity is an attribute of the payload directory and a
+    /// sidecar beside it. `/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp`
+    /// is not an entry of that directory. Replacing the directory drops
+    /// the attribute, so the mount stops covering the guest path.
+    #[test]
+    fn an_ext4_payload_does_not_expose_the_identity_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _mount = Unmount("/apex/com.android.apex.cts.shim@1");
+        let host = dir.join("cts-shim-payload");
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&host));
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("payload"), b"shim-payload").unwrap();
+        note_ext4_host(&host).unwrap();
+        let names = std::fs::read_dir(&host)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.iter().any(|name| name == ".aim-ext4-stamp"),
+            "payload directory contains {names:?}"
+        );
+        let sidecar = ext4_stamp_path(&host);
+        assert!(!sidecar.starts_with(&host));
+        let expected = std::fs::read(&sidecar).unwrap();
+        assert_eq!(
+            read_ext4_stamp_attr(&host).unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
+        add_mount(
+            "/apex/com.android.apex.cts.shim@1",
+            host.clone(),
+            Area::Image,
+            "/system/apex/com.android.apex.cts.shim.apex",
+            "ext4",
+        )
+        .unwrap();
+        let stamp = std::ffi::CString::new(
+            "/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp",
+        )
+        .unwrap();
+        let mut stat = [0u8; 256];
+        let mut context: crate::context::GuestContext = unsafe { std::mem::zeroed() };
+        context.x[8] = 79;
+        context.x[0] = LINUX_AT_FDCWD as u64;
+        context.x[1] = stamp.as_ptr() as u64;
+        context.x[2] = stat.as_mut_ptr() as u64;
+        crate::sys::dispatch(&mut context);
+        assert_eq!(context.x[0] as i64, -(errno::ENOENT as i64));
+        let live = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.apex.cts.shim@1/payload",
+            true,
+        )
+        .unwrap();
+        let live_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"shim-payload");
+        std::fs::remove_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("payload"), b"replaced").unwrap();
+        let after = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.apex.cts.shim@1/payload",
+            true,
+        )
+        .unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            !after_host.starts_with(&host),
+            "replaced directory still covered {}",
+            after_host.display()
+        );
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     /// Bootstrap ext4 at `/apex/com.android.runtime`, then the official

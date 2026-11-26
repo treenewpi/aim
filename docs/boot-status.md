@@ -633,12 +633,28 @@ v1 uid 0 gid 2000 mode 0100755. `boringssl_self_test64_vendor` (pid
 `reboot,boringssl-self-check-failed` did not occur. The self-test is
 still in the image; this run did not reach it. linker64 still
 resolved (bootstrap `apex-mounts/71472-1`, formal `71497-16`).
-`mremap` grow flags=0x1 was 5 in place and 0 realloc. Same-size
-flags=0x3 was 2031, each returning the `MREMAP_FIXED` address. No
-linker_cfi, ShadowWrite, or `MAP_FAILED`.
-The stop is `reboot,apexd-failed`. Formal apexd (pid 71497) started,
-mounted conscrypt and ART, logged `Activated 0 packages`, and
-finished OnStart (duration 828). servicemanager (pid 71481) then
+`mremap` grow flags=0x1 succeeded 11 times in place (4K to 8K five,
+8K to 16K three, 16K to 32K three) and did not realloc. Same-size
+flags=0x3 succeeded 2031 times, each returning the address the call
+specified. No linker_cfi, ShadowWrite, or `MAP_FAILED`.
+`boringssl_self_test64_vendor` and `/system/bin/boringssl_self_test64`
+exiting 0 is not acceptance of this run. The apex self-test was not
+reached.
+The activation failure on that run is the ext4 identity file.
+`newfstatat` of
+`/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp` returned 0 (pid
+71497). kmsg: failed to activate
+`/system/apex/com.android.apex.cts.shim.apex`
+(`com.android.apex.cts.shim`) because that path is an unexpected file
+inside the shim apex, then failed to activate packages (1 APEX).
+OnStart still finished with `Activated 0 packages`. That file was the
+identity record written inside the mounted directory. The same bytes
+stay on the directory as a host attribute and in the sidecar beside
+it, so the payload directory has no such entry. This has not been
+remeasured on Mac, and it is not a boot.
+The later stop on that run is `reboot,apexd-failed`. Formal apexd
+(pid 71497) had started, mounted conscrypt and ART, and finished
+OnStart (duration 828). servicemanager (pid 71481) then
 aborted, signal 6: `Check failed: gSehandle != nullptr`. That is
 `Access::getSehandle` after
 `selinux_android_service_context_handle()` returns null. The
