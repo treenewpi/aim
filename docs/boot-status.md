@@ -593,29 +593,80 @@ stays 0. Init started 2026-11-26 12:44:51 Asia/Kuala_Lumpur and ran
 mode 0755, `dev.aim.android-inode` DARI v1 uid 0 gid 2000 mode
 0100755. `user.aim.android-inode` is absent. Both views grant other
 execute to uid 9999, so the file check is not what returned
-`EACCES` and it was not logged. The stop is
-`boringssl_self_test_apex64` (pid 70308, uid 9999, gid 0) exiting
-127: `interpret` of
-`/apex/com.android.conscrypt/bin/boringssl_self_test64` is `EACCES`
-at host `apex-mounts/70214-3/bin/boringssl_self_test64` (read 4096,
-`fstype=bind` source `/apex/com.android.conscrypt@360499999`).
-Search continues after that file check. `/apex` is tmpfs
+`EACCES` and it was not logged. `/apex` is tmpfs
 `mode=0755,uid=0,gid=0`, and that mode was not recorded, so the
 guest mode was the host directory's. `mkdir` applies the umask
 first; a directory left at 0700 is owner-executable only. uid 0 can
 search it and uid 9999 (gid 0, no group execute) cannot. That is
 why `boringssl_self_test64_vendor` (pid 70193, uid 0) and
 `/system/bin/boringssl_self_test64` (pid 70200, uid 9999) exited 0
-while this path did not. The tmpfs root now records the mode the
-mount asked for, after the mount is visible. The exec open uses
-that same guest stat, and a denial logs the uid, gid and mode that
-produced it. The host execute bit is not added. A 0750 or 0644
-inode stays `EACCES`. A path that is still missing stays `ENOENT`.
-Same-size `mremap` flags=0x3 ran 2336 times, each returning 0.
-Eight grows (flags=0x1) succeeded in place; the 4K-to-8K move was
-not exercised. keystore2 still `SIGABRT` after a successful exec,
-netd still `SIGABRT` after a successful grow, and zygote is still
-killed on netd's `onrestart`. This is not a boot. The pinned layer has 35
+while `boringssl_self_test_apex64` (pid 70308) did not. The tmpfs
+root records the mode the mount asked for, after the mount is
+visible. The exec open uses that same guest stat, and a denial logs
+the uid, gid and mode that produced it. The host execute bit is not
+added. A 0750 or 0644 inode stays `EACCES`. A path that is still
+missing stays `ENOENT`. Same-size `mremap` flags=0x3 ran 2336 times,
+each returning 0. Eight grows (flags=0x1) succeeded in place; the
+4K-to-8K move was not exercised.
+`7400b9fce2fe4f9b597d7ccefbc197ded88bf7b2` was measured on Mac
+(archive SHA256
+`1ab5b92400aaecff125baab907325fadd4e03ab5643acdda58e50582522372dc`,
+SHA256SUMS
+`bb99b71d4008b3a973e026a2620d437550faa3190a776dde040d99b8a0c64d15`,
+96 members, guest stderr SHA256
+`00cce33a2183e2ba5950617d7b5aecc31c04b2b6d4f71465669bff4bdc895f88`,
+`09-final.txt` SHA256
+`a6a156509c90fb83d699b713b3d967ec782ac00e371ae69dd396b5c83f0996b6`).
+It is not a boot. There is no `system_server` process or exec, and
+`boot_completed` stays unset. Init started 2026-11-26 13:53:39
+Asia/Kuala_Lumpur and ran 21.353s. `Cargo.lock` is unchanged
+(SHA256
+`7c5398c25903c8b014fdb094b5113fc2b4195ccff481b01f48678bf12cde1ac5`).
+The apex directory denial did not recur. `/apex`
+(`tmpfs/71467.4`) is host 0755 with `dev.aim.guest-inode` uid 0 gid 0
+mode 0755. The conscrypt mountpoints are host 0755 with guest uid 0
+gid 1000 mode 0755. The payload
+`apex-mounts/71497-3/bin/boringssl_self_test64` stays host 0755, DARI
+v1 uid 0 gid 2000 mode 0100755. `boringssl_self_test64_vendor` (pid
+71476, uid 0) and `/system/bin/boringssl_self_test64` (pid 71483, uid
+9999) exited 0. `boringssl_self_test_apex64` and
+`reboot,boringssl-self-check-failed` did not occur. The self-test is
+still in the image; this run did not reach it. linker64 still
+resolved (bootstrap `apex-mounts/71472-1`, formal `71497-16`).
+`mremap` grow flags=0x1 was 5 in place and 0 realloc. Same-size
+flags=0x3 was 2031, each returning the `MREMAP_FIXED` address. No
+linker_cfi, ShadowWrite, or `MAP_FAILED`.
+The stop is `reboot,apexd-failed`. Formal apexd (pid 71497) started,
+mounted conscrypt and ART, logged `Activated 0 packages`, and
+finished OnStart (duration 828). servicemanager (pid 71481) then
+aborted, signal 6: `Check failed: gSehandle != nullptr`. That is
+`Access::getSehandle` after
+`selinux_android_service_context_handle()` returns null. The
+exact-match backend returns a null handle when every service-context
+path fails `access(R_OK)`, or when a path that passes then fails
+`fopen`, is not a regular file, fails to parse, or repeats a key
+with a different context. An empty file does not abort, and context
+validation is off. The constructor checks (`selinux_status_open`,
+`getcon`) had already passed, so this is a service lookup, not
+process start. `getcon` searches `/`, and uid 9999 had already
+executed `/system/bin/boringssl_self_test64`, so `/` was searchable
+at those earlier points. Image `fs_config` gives `/`, `/system/etc`,
+`/system/etc/selinux` mode 0755 root:root and
+`plat_service_contexts` mode 0644 root:root. uid 1000 can read that.
+A recorded image inode of those modes is what the walk uses; a
+directory with no record that is really 0700 root:root stays
+`EACCES`. The handle is not invented. init then sent signal 9 to
+servicemanager and, from `servicemanager.rc`'s `onrestart restart
+--only-if-running apexd`, signal 9 to apexd. apexd is oneshot with
+`reboot_on_failure reboot,apexd-failed`. A signal death is not a zero
+exit, so original init shuts down. That option stays. A killed
+oneshot is not reported as success. `service 'servicemanager'
+requested start, but it is already running` is `Service::Start`
+seeing the process still running. After apexd was already dead, some
+execs logged `guest-search path="/" errno=13 st_mode=0o40700`. That
+view is later than the abort. logd `EACCES`, `crash_dump64`
+`ENOENT`, missing libraries, keystore2 and netd `SIGABRT`, and
+zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
