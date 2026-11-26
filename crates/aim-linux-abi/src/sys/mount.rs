@@ -12,7 +12,10 @@
 //! The other namespaces are answered "unsupported" (ADR 0012 appendix).
 //! A plain fork after `setns` into the default namespace keeps that
 //! journal. The child walks the shared root; `/apex` there stays the
-//! private tmpfs.
+//! private tmpfs. `mount` of fstype `bpf` installs an empty bpffs.
+//! The kernel's sysfs mount point `/sys/fs/bpf` is that directory when
+//! the host path is not there yet. A path that is not a directory is
+//! `ENOTDIR`, and any other missing path is `ENOENT`.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -110,6 +113,36 @@ pub fn setns(a: [u64; 6]) -> i64 {
     }
 }
 
+/// The kernel creates `/sys/fs/bpf` (`sysfs_create_mount_point`) before
+/// userspace mounts bpffs there. A resolved path whose host directory is
+/// missing is that mount point when it is `/sys/fs/bpf` on sysfs or on the
+/// path map's bpffs. Any other missing path stays missing.
+fn ensure_bpf_mount_point(target: &vfs::Resolved) -> Result<(), i64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(target.host.as_ptr(), &mut st) } == 0 {
+        return Ok(());
+    }
+    if target.guest != "/sys/fs/bpf" {
+        return Err(-(ENOENT as i64));
+    }
+    if target.area != Area::Kernfs && target.area != Area::Writable {
+        return Err(-(ENOENT as i64));
+    }
+    let host = PathBuf::from(OsStr::from_bytes(target.host.as_bytes()));
+    if let Some(parent) = host.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            -(crate::errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64)
+        })?;
+    }
+    match std::fs::create_dir(&host) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(-(crate::errno::from_darwin(
+            error.raw_os_error().unwrap_or(libc::EIO),
+        ) as i64)),
+    }
+}
+
 fn resolve(path: u64, follow: bool) -> Result<vfs::Resolved, i64> {
     // SAFETY: guest string.
     let owned_path = super::guest_cstr(path).map_err(|error| -(error as i64))?;
@@ -164,6 +197,11 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
         return Err(-(EPERM as i64));
     }
     let target = resolve(a[1], true)?;
+    if flags & (MS_REMOUNT | PROPAGATION | MS_BIND | MS_MOVE) == 0
+        && super::guest_cstr(a[2]).ok().as_deref() == Some(b"bpf".as_slice())
+    {
+        ensure_bpf_mount_point(&target)?;
+    }
     if !is_dir(&target)? && flags & (MS_BIND | MS_MOVE) == 0 {
         return Err(-(ENOTDIR as i64));
     }
@@ -267,6 +305,14 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
                 super::user_memory::read_cstr(a[4], 4096).map_err(|error| -(error as i64))?
             };
             super::binder::mount_fs(&target.guest, &data)?;
+            Ok(())
+        }
+        b"bpf" => {
+            // `bpf_fill_super`: a new bpffs root is mode 01777. The
+            // directory is the superblock. Pins are files in it.
+            let dir = tmpfs_dir(&[])?;
+            vfs::add_mount(&target.guest, dir, Area::Writable, "bpf", "bpf")
+                .map_err(|error| -(error as i64))?;
             Ok(())
         }
         b"ext4" => {
@@ -1284,5 +1330,64 @@ mod tests {
             vfs::own_mounts_text()
         );
         assert_default_namespace_walks();
+    }
+
+    /// Init's `mount("bpf", "/sys/fs/bpf", "bpf", MS_NOSUID|MS_NODEV|MS_NOEXEC)`.
+    /// The sysfs mount point has no host directory yet. The mount installs
+    /// an empty bpffs, and a mount on a path the kernel did not create
+    /// stays `ENOENT`.
+    #[test]
+    fn bpf_mount_creates_the_sysfs_mount_point() {
+        let (_view, root) = vfs::test_view();
+        let sys = root.join("kernfs-sys");
+        std::fs::create_dir_all(&sys).unwrap();
+        vfs::add_mount(
+            "/sys",
+            sys,
+            Area::Kernfs,
+            "sysfs",
+            "sysfs",
+        )
+        .unwrap();
+        let (source, target, fstype) = (at("bpf"), at("/sys/fs/bpf"), at("bpf"));
+        let flags = 2 | 4 | 8;
+        assert_eq!(
+            mount([p(&source), p(&target), p(&fstype), flags, 0, 0]),
+            0
+        );
+        assert_eq!(vfs::fstype("/sys/fs/bpf").as_deref(), Some("bpf"));
+        let (host, area) = vfs::lookup("/sys/fs/bpf");
+        assert_eq!(area, Area::Writable);
+        assert!(std::fs::read_dir(&host).unwrap().next().is_none());
+        mkdir("/sys/fs/bpf/netd_shared", 0o755, 0);
+        assert!(host.join("netd_shared").is_dir());
+        let pstore = at("/sys/fs/pstore");
+        assert_eq!(
+            mount([p(&source), p(&pstore), p(&fstype), flags, 0, 0]),
+            -(ENOENT as i64)
+        );
+        let elsewhere = root.join("bpf-elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        vfs::add_mount(
+            "/data/bpf-host",
+            elsewhere.clone(),
+            Area::Writable,
+            "bpf",
+            "bpf",
+        )
+        .unwrap();
+        std::fs::write(elsewhere.join("marker"), b"old").unwrap();
+        let again = at("/data/bpf-host");
+        assert_eq!(
+            mount([p(&source), p(&again), p(&fstype), flags, 0, 0]),
+            0
+        );
+        let (now, _) = vfs::lookup("/data/bpf-host");
+        assert_ne!(now, elsewhere);
+        assert!(!now.join("marker").exists());
+        assert_eq!(vfs::fstype("/data/bpf-host").as_deref(), Some("bpf"));
+        assert_eq!(vfs::remove_mount("/sys/fs/bpf"), Ok(true));
+        assert_eq!(vfs::remove_mount("/data/bpf-host"), Ok(true));
+        assert_eq!(vfs::remove_mount("/sys"), Ok(true));
     }
 }

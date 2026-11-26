@@ -1482,7 +1482,7 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
                 .into_bytes(),
             ),
             "filesystems" => {
-                Node::File(b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\n\text4\n".to_vec())
+                Node::File(b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tbpf\n\text4\n".to_vec())
             }
             "sys" => return sys_node(tail),
             n => {
@@ -1526,7 +1526,10 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
             ("fs", dir::DT_DIR),
             ("kernel", dir::DT_DIR),
         ])),
-        "fs" => Node::Dir(entries(&[("selinux", dir::DT_DIR)])),
+        "fs" => Node::Dir(entries(&[("bpf", dir::DT_DIR), ("selinux", dir::DT_DIR)])),
+        // `sysfs_create_mount_point(fs_kobj, "bpf")`: the directory bpffs
+        // is mounted on. Empty until that mount.
+        "fs/bpf" => Node::Dir(entries(&[])),
         "kernel" => Node::Dir(entries(&[
             ("debug", dir::DT_DIR),
             ("tracing", dir::DT_DIR),
@@ -1571,9 +1574,31 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
     })
 }
 
+/// `/proc/sys/net/core`: the two JIT knobs NetBpfLoad writes. `None`
+/// leaves the rest of `/proc/sys/net` to the IPv6 configuration.
+fn net_core_node(rest: &str) -> Option<Node> {
+    Some(match rest {
+        "core" => Node::Dir(entries(&[
+            ("bpf_jit_enable", dir::DT_REG),
+            ("bpf_jit_kallsyms", dir::DT_REG),
+        ])),
+        "core/bpf_jit_enable" => {
+            Node::File(super::sysctl::text("/proc/sys/net/core/bpf_jit_enable").ok()?)
+        }
+        "core/bpf_jit_kallsyms" => {
+            Node::File(super::sysctl::text("/proc/sys/net/core/bpf_jit_kallsyms").ok()?)
+        }
+        _ => return None,
+    })
+}
+
 fn sys_node(tail: &str) -> Option<Node> {
     if tail == "net" || tail.starts_with("net/") {
-        return super::ipv6conf::node(tail.strip_prefix("net").unwrap().trim_start_matches('/'));
+        let rest = tail.strip_prefix("net").unwrap().trim_start_matches('/');
+        if let Some(node) = net_core_node(rest) {
+            return Some(node);
+        }
+        return super::ipv6conf::node(rest);
     }
     Some(match tail {
         "" => Node::Dir(entries(&[
@@ -1608,9 +1633,13 @@ fn sys_node(tail: &str) -> Option<Node> {
             ("ostype", dir::DT_REG),
             ("pid_max", dir::DT_REG),
             ("random", dir::DT_DIR),
+            ("unprivileged_bpf_disabled", dir::DT_REG),
         ])),
         "kernel/kptr_restrict" => {
             Node::File(super::sysctl::text("/proc/sys/kernel/kptr_restrict").ok()?)
+        }
+        "kernel/unprivileged_bpf_disabled" => {
+            Node::File(super::sysctl::text("/proc/sys/kernel/unprivileged_bpf_disabled").ok()?)
         }
         "kernel/random" => Node::Dir(entries(&[("boot_id", dir::DT_REG), ("uuid", dir::DT_REG)])),
         "kernel/random/boot_id" => {

@@ -447,8 +447,25 @@ materializing the inherited bootstrap namespace reused it. The next
 lookup parked the live journal onto the bootstrap namespace and left
 the view empty, so `refresh_fuse_mounts` returned `ENODEV` before the
 walk. The mount table itself still held the empty `/apex` tmpfs.
-`retarget_namespace` moves the journal owner with the namespace. That
-fix is not Mac-remeasured. The pinned layer has 35
+`retarget_namespace` moves the journal owner with the namespace.
+`d4b119c9a8d609be09d777becacc37324f3d0d97` (archive SHA256
+`9cc018345ca4016e7e8e646c1a733e5390db14ed13d5c5412b403bd27373938a`)
+remeasured that. It is not a boot. Init ran 11.994s and rebooted
+`reboot,bpfloader-failed`. After `setns`, a plain fork walks
+`/system`, opens `/dev/null` and reads `/proc/self/ns/mnt`. vdc and
+formal apexd exec, apexd activates 35 packages, and art_boot exits 0.
+bpfloader (`/apex/com.android.tethering/bin/netbpfload`) then opens
+`/proc/sys/kernel/unprivileged_bpf_disabled` `O_WRONLY|O_CLOEXEC` and
+gets `EACCES`. That file is mode 0644, values 0, 1 and 2, default 2,
+and 1 locks until the boot ends. A write needs `CAP_SYS_ADMIN`; an
+unprivileged open for write is `EACCES`. NetBpfLoad next writes
+`/proc/sys/net/core/bpf_jit_enable` (1 only, the 6.12
+`CONFIG_BPF_JIT_ALWAYS_ON` value) and `bpf_jit_kallsyms`. Init's
+`mount` of fstype `bpf` on `/sys/fs/bpf` was `ENOENT`: the sysfs mount
+point was not a directory. The mount now installs an empty bpffs
+there. A missing path stays `ENOENT`. `/sys/fs/pstore` is still
+`ENOENT`. A later `bpf` operation that is not implemented returns its
+own errno. This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
