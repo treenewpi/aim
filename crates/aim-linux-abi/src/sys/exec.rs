@@ -434,8 +434,14 @@ fn in_place(
                 return Some(-(e as i64));
             }
         };
-        if let Err(e) = classify(&i, &r.host) {
-            note_classify(&i, &r.host);
+        // `i` is the PT_INTERP string. It is usually a symlink into an
+        // apex (`/system/bin/linker64`, or `/apex/<name>` → `<name>@ver`).
+        // `path_stat` does not follow a guest symlink: the kernel would
+        // follow the stored target from the host root and return ENOENT
+        // while this walk already has the installed file. The check is
+        // the resolved inode.
+        if let Err(e) = classify(&r.guest, &r.host) {
+            note_classify(&r.guest, &r.host);
             note_exec(nr, "interpreter", &i, e);
             return Some(e);
         }
@@ -555,18 +561,29 @@ pub(super) fn probe_page(guest: &str) -> String {
     if !guest.starts_with('/') {
         return String::new();
     }
-    let resolved = match vfs::resolve(LINUX_AT_FDCWD, guest.as_bytes(), true) {
-        Ok(found) => format!(
-            "resolve host=\"{}\" {}",
-            found.host.to_string_lossy(),
-            read_page(Path::new(OsStr::from_bytes(found.host.as_bytes())))
-        ),
-        Err(error) => format!(
-            "resolve errno={error} ({})",
-            super::names::errno_name(error)
+    // The mount lookup uses the path the walk resolved. The caller's
+    // string is often a symlink; the ext4 tree is on the target.
+    let (resolved, backend_guest) = match vfs::resolve(LINUX_AT_FDCWD, guest.as_bytes(), true) {
+        Ok(found) => {
+            let backend = found.guest;
+            (
+                format!(
+                    "resolve host=\"{}\" {}",
+                    found.host.to_string_lossy(),
+                    read_page(Path::new(OsStr::from_bytes(found.host.as_bytes())))
+                ),
+                backend,
+            )
+        }
+        Err(error) => (
+            format!(
+                "resolve errno={error} ({})",
+                super::names::errno_name(error)
+            ),
+            guest.to_string(),
         ),
     };
-    let backend = match vfs::mounted_backend(guest) {
+    let backend = match vfs::mounted_backend(&backend_guest) {
         Some((path, source, fstype)) => format!(
             "superblock fstype={fstype} source=\"{source}\" path=\"{}\" {}",
             path.display(),
@@ -1004,5 +1021,120 @@ mod tests {
         assert_eq!(mode(&file), 0o750);
         super::super::cred::init(saved, None);
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Bootstrap mounts the runtime ext4 on a unique host and points
+    /// `/apex/com.android.runtime` at `<name>@<ver>`. `PT_INTERP` is the
+    /// `/system/bin/linker64` symlink into that tree. `path_stat` of either
+    /// symlink is `ENOENT`: it does not follow a guest symlink, and the
+    /// kernel follows the stored target from the host root. The exec check
+    /// uses the resolved path, whose host is the directory the payload was
+    /// installed into. A planted `apex-mounts/1` is not that directory.
+    #[test]
+    fn bootstrap_interpreter_uses_the_unique_ext4_host() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::bootstrap_interpreter_uses_the_unique_ext4_host",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, root) = crate::vfs::test_view();
+        let runtime = crate::vfs::runtime_dir().unwrap();
+        let decoy = runtime.join("apex-mounts/1/bin/linker64");
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let image = root.join("root");
+        std::fs::create_dir_all(image.join("apex/com.android.runtime@1")).unwrap();
+        std::fs::create_dir_all(image.join("system/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "com.android.runtime@1",
+            image.join("apex/com.android.runtime"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "/apex/com.android.runtime/bin/linker64",
+            image.join("system/bin/linker64"),
+        )
+        .unwrap();
+        let (payload, _manifest) = super::super::ext4ro::manifest_fixture();
+        let image_path = root.join("runtime-payload.img");
+        std::fs::write(&image_path, &payload).unwrap();
+        let backing = CString::new(image_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        let mut info = [0u8; 232];
+        info[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        super::super::loopdev::configure(minor, fd, 4096, &info).unwrap();
+        unsafe { libc::close(fd) };
+        super::super::loopdev::mount_ext4(
+            &format!("/dev/block/loop{minor}"),
+            "/apex/com.android.runtime@1",
+            true,
+        )
+        .unwrap();
+        let mounted = vfs::resolve(LINUX_AT_FDCWD, b"/apex/com.android.runtime@1", true).unwrap();
+        let host_root = Path::new(OsStr::from_bytes(mounted.host.as_bytes()));
+        let installed = host_root.join("bin/linker64");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, b"not an elf").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let found = vfs::resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let host = Path::new(OsStr::from_bytes(found.host.as_bytes()));
+        let pid = std::process::id().to_string();
+        assert!(
+            host.components().any(|component| component.as_os_str() == "apex-mounts"),
+            "host {}",
+            host.display()
+        );
+        assert!(
+            host.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&format!("{pid}-")))
+            }),
+            "host {}",
+            host.display()
+        );
+        assert_eq!(std::fs::read(host).unwrap(), b"not an elf");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
+        assert_eq!(
+            super::super::attrs::path_stat("/system/bin/linker64").unwrap_err(),
+            ENOENT
+        );
+        assert_eq!(
+            super::super::attrs::path_stat("/apex/com.android.runtime/bin/linker64").unwrap_err(),
+            ENOENT
+        );
+        assert!(matches!(
+            classify("/system/bin/linker64", &found.host),
+            Err(error) if error == -(ENOENT as i64)
+        ));
+        assert!(matches!(
+            classify(&found.guest, &found.host),
+            Err(error) if error == -(ENOEXEC as i64)
+        ));
+        assert!(found.guest.contains("/apex/com.android.runtime@1/"));
+        assert!(crate::vfs::mounted_backend("/system/bin/linker64").is_none());
+        let (backend, _source, fstype) = crate::vfs::mounted_backend(&found.guest).unwrap();
+        assert_eq!(fstype, "ext4");
+        assert_eq!(std::fs::read(backend).unwrap(), b"not an elf");
+        let page = probe_page("/system/bin/linker64");
+        assert!(page.contains("fstype=ext4"), "{page}");
+        assert!(page.contains(&format!("{pid}-")), "{page}");
+        assert!(!page.contains("superblock missing"), "{page}");
+        let via = vfs::resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap();
+        assert_eq!(via.host.as_bytes(), found.host.as_bytes());
+        assert!(matches!(
+            classify(&via.guest, &via.host),
+            Err(error) if error == -(ENOEXEC as i64)
+        ));
     }
 }
