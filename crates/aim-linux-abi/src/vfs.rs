@@ -3203,14 +3203,47 @@ fn hidden(mounts: &[Mount], m: &Mount) -> bool {
         .any(|n| n.seq > m.seq && below(&n.guest, &m.guest).is_some())
 }
 
+/// An ext4 mount whose host directory is gone. The directory is the
+/// superblock filled when the mount was created. Apexd's activation of the
+/// official payload leaves that bootstrap directory removed while the mount
+/// entry can still be the one a walk selects. The entry then names a path
+/// that `stat` cannot open. It does not cover the guest path, and it does
+/// not hide the mount underneath, so the walk sees the symlink to the
+/// activated tree. A directory that is still there keeps covering the path.
+fn ext4_host_gone(mount: &Mount) -> bool {
+    if mount.fstype.as_deref() != Some("ext4") {
+        return false;
+    }
+    match std::fs::metadata(&mount.host) {
+        Ok(meta) => !meta.is_dir(),
+        // A missing directory does not cover the path. Any other error,
+        // including EACCES, leaves the mount in place so the caller's
+        // open returns that errno.
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether a later mount whose host is still there covers `m`.
+fn covered_by_live(mounts: &[Mount], m: &Mount) -> bool {
+    mounts.iter().any(|n| {
+        n.seq > m.seq && below(&n.guest, &m.guest).is_some() && !ext4_host_gone(n)
+    })
+}
+
 /// The mount that holds the normalized guest path, and the path below it:
-/// the deepest one not hidden. `mounts` is ordered longest mount point
-/// first, the latest first among equal ones.
+/// the deepest one that is not hidden by a mount whose host is still there.
+/// `mounts` is ordered longest mount point first, the latest first among
+/// equal ones. The visible-bit cache is not enough: removing a host
+/// directory does not change the mount generation.
 fn holder<'a, 'p>(mounts: &'a MountsRead<'_>, guest: &'p str) -> Option<(&'a Mount, &'p str)> {
-    mounts
-        .iter()
-        .enumerate()
-        .find_map(|(index, m)| Some((m, below(&m.guest, guest)?)).filter(|_| mounts.visible(index)))
+    mounts.iter().find_map(|m| {
+        let rest = below(&m.guest, guest)?;
+        if ext4_host_gone(m) || covered_by_live(mounts, m) {
+            None
+        } else {
+            Some((m, rest))
+        }
+    })
 }
 
 /// Host path and area of a normalized absolute guest path, without
@@ -3412,7 +3445,9 @@ pub(crate) fn mounted_backend(guest: &str) -> Option<(PathBuf, String, String)> 
     let mount = mounts
         .iter()
         .filter(|mount| {
-            mount.own && (mount.guest == guest || below(&mount.guest, guest).is_some())
+            mount.own
+                && (mount.guest == guest || below(&mount.guest, guest).is_some())
+                && !ext4_host_gone(mount)
         })
         .max_by_key(|mount| (mount.guest.len(), mount.seq))?;
     let relative = if guest == mount.guest {
@@ -5750,6 +5785,87 @@ mod tests {
         assert!(remove_mount("/data/user/0").unwrap());
         assert!(remove_mount("/data/user").unwrap());
         assert_eq!(lookup("/data/user/0/p").0, data.join("data/p"));
+    }
+
+    /// Bootstrap ext4 at `/apex/com.android.runtime`, then the official
+    /// tree at `/apex/com.android.runtime@1`. `/system/bin/linker64` is the
+    /// image symlink bionic names as `PT_INTERP`. While the bootstrap
+    /// directory is there, the walk reads it. Once that directory is gone,
+    /// the walk follows the tmpfs symlink onto the activated tree. It does
+    /// not keep the removed host path, and it does not invent a directory
+    /// when the activated tree is gone too.
+    #[test]
+    fn a_gone_ext4_host_yields_the_activated_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _apex = Unmount("/apex");
+        let _old = Unmount("/apex/com.android.runtime");
+        let _new = Unmount("/apex/com.android.runtime@1");
+        let image = vfs().root.join("system/bin/linker64");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&image);
+        std::os::unix::fs::symlink("/apex/com.android.runtime/bin/linker64", &image).unwrap();
+        let old_host = dir.join("runtime-old-linker");
+        let new_host = dir.join("runtime-new-linker");
+        let tmp = dir.join("runtime-apex-tmp");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink("com.android.runtime@1", tmp.join("com.android.runtime"))
+            .unwrap();
+        add_mount("/apex", tmp, Area::Writable, "tmpfs", "tmpfs").unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "ext4",
+        )
+        .unwrap();
+        add_mount(
+            "/apex/com.android.runtime@1",
+            new_host.clone(),
+            Area::Image,
+            "/system/apex/com.android.runtime.apex",
+            "ext4",
+        )
+        .unwrap();
+        let live = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let live_host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"bootstrap-linker");
+        std::fs::remove_dir_all(&old_host).unwrap();
+        let after = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            after_host.starts_with(&new_host),
+            "resolve kept {}",
+            after_host.display()
+        );
+        assert_eq!(std::fs::read(&after_host).unwrap(), b"activated-linker");
+        std::fs::remove_dir_all(&new_host).unwrap();
+        let missed = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let missed_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(missed.host.as_bytes()));
+        assert!(
+            std::fs::read(&missed_host).is_err(),
+            "missing interpreter opened {}",
+            missed_host.display()
+        );
+        assert!(!old_host.exists());
+        assert!(!new_host.exists());
+        let _ = std::fs::remove_file(&image);
     }
 }
 

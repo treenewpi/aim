@@ -1381,9 +1381,52 @@ static HOST_PROT_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 static EXEC_WINDOW_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 fn page_prot(host: u64) -> Option<u32> {
-    vmmap::info_at(host).and_then(|info| {
-        (host >= info.start && host < info.end).then_some(aim_guest_page::prot_bits(info.prot))
-    })
+    match vmmap::info_at(host) {
+        Some(info) if host >= info.start && host < info.end => {
+            Some(aim_guest_page::prot_bits(info.prot))
+        }
+        // The next entry means this address is a hole. `None` is the
+        // Linux test host, where `proc_pidinfo` is not implemented.
+        Some(_) => None,
+        None => maps_prot(host),
+    }
+}
+
+/// Protection of `addr` from `/proc/self/maps`. Darwin answers `page_prot`
+/// from `proc_pidinfo`, so this file is not opened there.
+fn maps_prot(addr: u64) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            u64::from_str_radix(start, 16),
+            u64::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if addr < start || addr >= end {
+            continue;
+        }
+        let bytes = perms.as_bytes();
+        let mut prot = 0u32;
+        if bytes.first() == Some(&b'r') {
+            prot |= libc::PROT_READ as u32;
+        }
+        if bytes.get(1) == Some(&b'w') {
+            prot |= libc::PROT_WRITE as u32;
+        }
+        if bytes.get(2) == Some(&b'x') {
+            prot |= libc::PROT_EXEC as u32;
+        }
+        return Some(prot);
+    }
+    None
 }
 
 fn slice_module_name(anon: bool, fd: i32) -> String {
@@ -1811,7 +1854,11 @@ fn slice_prot(page: u64) -> Result<u32, i64> {
         Some(info) if page >= info.start && page < info.end => {
             Ok(aim_guest_page::prot_bits(info.prot))
         }
-        _ => Err(-(ENOMEM as i64)),
+        Some(_) => Err(-(ENOMEM as i64)),
+        None => match maps_prot(page) {
+            Some(prot) => Ok(prot),
+            None => Err(-(ENOMEM as i64)),
+        },
     }
 }
 
@@ -2742,6 +2789,320 @@ const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
 const MREMAP_DONTUNMAP: u64 = 4;
 
+/// Protection of one mapped guest page. An absent slice, or a host page
+/// that is not mapped, is `EFAULT`. `GUEST_SLICES` wins over the host page
+/// when the slice is present, which is the protection a later move keeps.
+fn guest_slice_prot(page: u64) -> Result<u32, i64> {
+    let host = page & !(PAGE - 1);
+    let slot = ((page - host) / GUEST_PAGE) as usize;
+    if let Some(pieces) = PAGE_PIECES.lock().unwrap().get(&host).copied() {
+        if pieces.present & (1 << slot) == 0 {
+            return Err(-(libc::EFAULT as i64));
+        }
+        if let Some(prot) = GUEST_SLICES.lock().unwrap().get(&page).copied() {
+            return Ok(prot);
+        }
+        return Ok(pieces.prot[slot]);
+    }
+    match page_prot(host) {
+        Some(prot) => {
+            if let Some(found) = GUEST_SLICES.lock().unwrap().get(&page).copied() {
+                return Ok(found);
+            }
+            Ok(prot)
+        }
+        None => Err(-(libc::EFAULT as i64)),
+    }
+}
+
+/// Bytes of one guest page. A host page that is not readable is made
+/// readable for the copy and put back before the page is punched, so a
+/// `PROT_NONE` neighbor is not left readable and the page is never
+/// writable and executable together.
+fn copy_slice(addr: u64) -> Result<[u8; 4096], i64> {
+    let host = addr & !(PAGE - 1);
+    let old = page_prot(host).ok_or(-(libc::EFAULT as i64))?;
+    let opened = old & libc::PROT_READ as u32 == 0;
+    if opened {
+        let result = host_mprotect(host, PAGE, libc::PROT_READ);
+        if result < 0 {
+            return Err(result);
+        }
+    }
+    let mut buf = [0u8; 4096];
+    // SAFETY: `addr` is a mapped guest page. The host page was readable
+    // already, or this call just made the whole host page readable.
+    unsafe {
+        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), 4096);
+    }
+    if opened {
+        let result = host_mprotect(host, PAGE, old as i32);
+        if result < 0 {
+            return Err(result);
+        }
+    }
+    Ok(buf)
+}
+
+/// Install `bytes` as the guest page at `addr` with `prot`. Neighbors of
+/// the host page stay. The host protection is write-wins, so the page is
+/// never writable and executable together. A slice that itself asks for
+/// both is refused.
+fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
+    let prot = aim_guest_page::prot_bits(prot);
+    if aim_guest_page::private_copy_is_wx(prot) {
+        return -(EINVAL as i64);
+    }
+    let host = addr & !(PAGE - 1);
+    let slot = ((addr - host) / GUEST_PAGE) as usize;
+    let cover = 1u8 << slot;
+    let existed = page_prot(host);
+    let existing = { PAGE_PIECES.lock().unwrap().get(&host).copied() };
+    let seeded = if let Some(mut entry) = existing {
+        for s in 0..4usize {
+            if entry.present & (1 << s) == 0 {
+                continue;
+            }
+            let at = host + s as u64 * GUEST_PAGE;
+            if let Ok(found) = guest_slice_prot(at) {
+                entry.prot[s] = found;
+            }
+        }
+        entry
+    } else if let Some(bits) = existed {
+        let mut prior = [bits; 4];
+        for s in 0..4usize {
+            let at = host + s as u64 * GUEST_PAGE;
+            if let Ok(found) = guest_slice_prot(at) {
+                prior[s] = found;
+            }
+        }
+        PagePieces {
+            present: 0b1111,
+            prot: prior,
+        }
+    } else {
+        PagePieces {
+            present: 0,
+            prot: [0; 4],
+        }
+    };
+    if existed.is_none() {
+        match host_mmap(
+            host,
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        ) {
+            Ok(mapped) if mapped == host => {}
+            Ok(mapped) => {
+                unsafe { libc::munmap(mapped as *mut _, PAGE as usize) };
+                return -(ENOMEM as i64);
+            }
+            Err(error) => return error,
+        }
+    } else if existed.unwrap() & libc::PROT_WRITE as u32 == 0 {
+        let result = host_mprotect(host, PAGE, libc::PROT_READ | libc::PROT_WRITE);
+        if result < 0 {
+            return result;
+        }
+    }
+    // SAFETY: the host page was just created writable, or mprotect'd
+    // writable. The write covers one guest page.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, 4096);
+    }
+    remember_slice(addr, "anonymous", prot);
+    let (row, present) = aim_guest_page::overlay_fixed(seeded.prot, seeded.present, cover, prot);
+    let pieces = PagePieces {
+        present,
+        prot: row,
+    };
+    let old_host = aim_guest_page::host_protection(present_prots(&seeded));
+    let new_host = aim_guest_page::host_protection(present_prots(&pieces));
+    {
+        let mut pages = PAGE_PIECES.lock().unwrap();
+        if present == 0 || (present == 0b1111 && row.iter().all(|item| *item == row[0])) {
+            pages.remove(&host);
+        } else {
+            pages.insert(host, pieces);
+        }
+        let mut recorded = GUEST_SLICES.lock().unwrap();
+        if prot == new_host {
+            recorded.remove(&addr);
+        } else {
+            recorded.insert(addr, prot);
+        }
+    }
+    apply_host_prot(host, &pieces, old_host, new_host, true)
+}
+
+/// `mremap` of a range that is not a whole number of 16 KiB host pages.
+///
+/// Bionic's CFI shadow update moves one 4 KiB page with
+/// `MREMAP_MAYMOVE|MREMAP_FIXED`. Rounding that length up to the host page
+/// would take the next three slices with it, and a destination that is only
+/// 4 KiB-aligned is `EINVAL` on the host-page path. The slice moves, or the
+/// call returns the errno of a move Linux would refuse. A successful return
+/// is the new address. Shrinking in place punches the tail. A grow, or a
+/// move whose size changes, would have to be rounded onto a neighbor, so
+/// that call is `ENOMEM`.
+fn mremap_subpage(a: [u64; 6]) -> i64 {
+    let _epoch = super::verity_pager::mutation();
+    let _mapping = super::memfd::mapping_change();
+    let old = a[0];
+    let old_len = match aim_guest_page::guest_page_len(a[1]) {
+        Ok(len) => len,
+        Err(error) => return -(error as i64),
+    };
+    let new_len = match aim_guest_page::guest_page_len(a[2]) {
+        Ok(len) => len,
+        Err(error) => return -(error as i64),
+    };
+    let flags = a[3];
+    let new_addr = a[4];
+    if old & (GUEST_PAGE - 1) != 0
+        || old_len == 0
+        || new_len == 0
+        || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+        || flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 && flags & MREMAP_MAYMOVE == 0
+        || flags & MREMAP_DONTUNMAP != 0 && old_len != new_len
+    {
+        return -(EINVAL as i64);
+    }
+    let end = match old.checked_add(old_len) {
+        Some(end) => end,
+        None => return -(ENOMEM as i64),
+    };
+    if !super::verity_pager::covered(old, old_len).is_empty() {
+        return -(EINVAL as i64);
+    }
+    let mut page = old;
+    while page < end {
+        if guest_slice_prot(page).is_err() {
+            return -(libc::EFAULT as i64);
+        }
+        if vmmap::region_at(page).is_some_and(|region| {
+            page >= region.start && page < region.end && (region.file.is_some() || region.shared)
+        }) {
+            return -(EINVAL as i64);
+        }
+        page += GUEST_PAGE;
+    }
+    let fixed = flags & MREMAP_FIXED != 0;
+    let keep = flags & MREMAP_DONTUNMAP != 0;
+    if fixed {
+        if new_addr & (GUEST_PAGE - 1) != 0 {
+            return -(EINVAL as i64);
+        }
+        let new_end = match new_addr.checked_add(new_len) {
+            Some(end) => end,
+            None => return -(ENOMEM as i64),
+        };
+        if new_addr < end && old < new_end {
+            return -(EINVAL as i64);
+        }
+        if new_len != old_len {
+            return -(ENOMEM as i64);
+        }
+        if window::touches_reserved(new_addr, new_end) {
+            return -(ENOMEM as i64);
+        }
+        let mut moved = Vec::with_capacity((old_len / GUEST_PAGE) as usize);
+        let mut page = old;
+        while page < end {
+            let prot = match guest_slice_prot(page) {
+                Ok(prot) => prot,
+                Err(error) => return error,
+            };
+            let bytes = match copy_slice(page) {
+                Ok(bytes) => bytes,
+                Err(error) => return error,
+            };
+            moved.push((prot, bytes));
+            page += GUEST_PAGE;
+        }
+        for (index, (prot, bytes)) in moved.iter().enumerate() {
+            let at = new_addr + index as u64 * GUEST_PAGE;
+            let result = place_slice(at, *prot, bytes);
+            if result < 0 {
+                return result;
+            }
+        }
+        if keep {
+            // The source mapping stays. Drop a file-copy record of the
+            // range this move replaced. A shared or file source was refused
+            // above, so the source record stays where it is.
+            copies::forget(new_addr, new_addr + new_len);
+        } else {
+            let punched = punch_guest_range(old, end);
+            if punched < 0 {
+                return punched;
+            }
+            forget_guest_slices(old, end);
+            copies::moved(old, new_addr, old_len);
+        }
+        let kind = vm_account::with(|space| space.kind_at(old));
+        if let Some(kind) = kind {
+            vm_account::with(|space| {
+                if !keep {
+                    space.unmap(old, end);
+                }
+                space.map(new_addr, new_addr + new_len, kind);
+            });
+        }
+        super::vma_names::remap(old, old_len, new_addr, new_len, keep);
+        if let Err(error) = super::verity_pager::reconcile_memberships() {
+            return -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64);
+        }
+        return new_addr as i64;
+    }
+    if new_len > old_len {
+        return -(ENOMEM as i64);
+    }
+    if new_len < old_len {
+        let tail = old + new_len;
+        let punched = punch_guest_range(tail, end);
+        if punched < 0 {
+            return punched;
+        }
+        forget_guest_slices(tail, end);
+        copies::forget(tail, end);
+        let kind = vm_account::with(|space| space.kind_at(old));
+        if kind.is_some() {
+            vm_account::with(|space| space.unmap(tail, end));
+        }
+        super::vma_names::remap(old, old_len, old, new_len, false);
+    }
+    old as i64
+}
+
+/// Unmap each guest page of `[lo, hi)`. A host page whose slices are all
+/// covered is released. A page that still has a neighbor stays, with that
+/// neighbor's protection.
+fn punch_guest_range(lo: u64, hi: u64) -> i64 {
+    let mut host = lo & !(PAGE - 1);
+    while host < hi {
+        let mut cover = 0u8;
+        for slot in 0..4 {
+            let at = host + slot * GUEST_PAGE;
+            if at >= lo && at + GUEST_PAGE <= hi {
+                cover |= 1 << slot;
+            }
+        }
+        if cover != 0 {
+            let result = punch_page(host, cover);
+            if result < 0 {
+                return result;
+            }
+        }
+        host += PAGE;
+    }
+    0
+}
+
 /// Map `[addr, addr+len)` as the continuation of the mapping whose last
 /// page is `like`, as mremap(2) grows it: the file's following pages with
 /// the same sharing and protection for a file mapping, fresh anonymous
@@ -2840,6 +3201,11 @@ fn move_to(old: u64, old_len: u64, new: u64, new_len: u64, keep_old: bool) -> Re
 }
 
 pub fn mremap(a: [u64; 6]) -> i64 {
+    match aim_guest_page::whole_host_pages(a[0], a[1]) {
+        Ok(false) => return mremap_subpage(a),
+        Ok(true) => {}
+        Err(error) => return -(error as i64),
+    }
     let _epoch = super::verity_pager::mutation();
     let _mapping = super::memfd::mapping_change();
     let (old, old_len, new_len, flags) = (a[0], page_up(a[1]), page_up(a[2]), a[3]);
@@ -3678,5 +4044,95 @@ mod tests {
                 .all(|b| *b == 0x5a)
         );
         unsafe { libc::munmap(ptr, bytes) };
+    }
+
+    /// Bionic's CFI shadow update. One 4 KiB page, flags
+    /// `MREMAP_MAYMOVE|MREMAP_FIXED`, destination 4 KiB-aligned and not
+    /// 16 KiB-aligned. The slice moves. The other slices of both host pages
+    /// stay. The host page is writable because a neighbor is, and it is not
+    /// executable.
+    #[test]
+    fn fixed_mremap_moves_one_guest_page() {
+        let map = || -> (u64, u64) {
+            // Two host pages, so one of them starts on a 16 KiB boundary
+            // when the kernel's own page is 4 KiB.
+            let len = 2 * PAGE as usize;
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let raw = ptr as u64;
+            let start = (raw + PAGE - 1) & !(PAGE - 1);
+            assert!(start + PAGE <= raw + len as u64);
+            (raw, start)
+        };
+        let (src_raw, src) = map();
+        let (dst_raw, dst_base) = map();
+        let dst = dst_base + 0x1000;
+        assert_eq!(src & (PAGE - 1), 0);
+        assert_eq!(dst & (GUEST_PAGE - 1), 0);
+        assert_ne!(dst & (PAGE - 1), 0);
+        unsafe {
+            std::ptr::write_bytes(src as *mut u8, 0x5a, 0x1000);
+            std::ptr::write_bytes((src + 0x1000) as *mut u8, 0x11, 0x1000);
+            std::ptr::write_bytes(dst_base as *mut u8, 0x22, 0x1000);
+            std::ptr::write_bytes(dst as *mut u8, 0x33, 0x1000);
+            std::ptr::write_bytes((dst + 0x1000) as *mut u8, 0x44, 0x1000);
+        }
+        let rx = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+        assert_eq!(mprotect([src, 0x1000, rx, 0, 0, 0]), 0);
+        let flags = super::MREMAP_MAYMOVE | super::MREMAP_FIXED;
+        let moved = mremap([src, 0x1000, 0x1000, flags, dst, 0]);
+        assert_eq!(moved, dst as i64);
+        unsafe {
+            assert_eq!(*(dst as *const u8), 0x5a);
+            assert_eq!(*((dst + 16) as *const u8), 0x5a);
+            assert_eq!(*((src + 0x1000) as *const u8), 0x11);
+            assert_eq!(*(dst_base as *const u8), 0x22);
+            assert_eq!(*((dst + 0x1000) as *const u8), 0x44);
+        }
+        let prot = super::page_prot(dst).expect("dest host page");
+        assert_eq!(
+            prot & (libc::PROT_WRITE | libc::PROT_EXEC) as u32,
+            libc::PROT_WRITE as u32,
+            "host prot {prot:#x}"
+        );
+        assert_eq!(
+            mremap([src, 0x1000, 0x1000, flags, dst + 0x2000, 0]),
+            -(libc::EFAULT as i64)
+        );
+        assert_eq!(
+            mremap([
+                dst_base,
+                0x2000,
+                0x2000,
+                flags,
+                dst_base + 0x1000,
+                0
+            ]),
+            -(libc::EINVAL as i64)
+        );
+        assert_eq!(
+            mremap([
+                src + 0x1000,
+                0x1000,
+                0x1000,
+                super::MREMAP_FIXED,
+                dst + 0x2000,
+                0
+            ]),
+            -(libc::EINVAL as i64)
+        );
+        unsafe {
+            libc::munmap(src_raw as *mut _, 2 * PAGE as usize);
+            libc::munmap(dst_raw as *mut _, 2 * PAGE as usize);
+        }
     }
 }

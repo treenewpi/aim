@@ -495,7 +495,31 @@ installs an empty bpffs, and `mkdir` of `tethering` is on the bpffs.
 A missing path stays `ENOENT`, including `/sys/fs/pstore` and
 `/sys/fs/selinux`. A remount whose path is not a mount root, or whose
 fstype is not the one mounted there, is `EINVAL`. `bpf()` is
-unchanged. This is not Mac-remeasured. The pinned layer has 35
+unchanged. `4b8480784181700568e656691d5db75b1701e51b` (archive SHA256
+`2a487ef2945aeee8bee0887053c5144211828af7c06a186770327a5dd106e8bb`,
+guest stderr SHA256
+`cd60f41fa1128d37bf33efe0617731e0cfbd1b932c22c3458fbd4d5cc1df437c`)
+remeasured that. It is not a boot. Init exited 6. There is no
+`system_server`, and `boot_completed` stays 0. First-stage
+`mount("sysfs", "/sys")` is 0, `mount("bpf", "/sys/fs/bpf")` is 0,
+`mkdir` of `tethering` is 0, and bpfloader exited 0. keystore2 was
+started five times. The first two execs reached the linker's CFI
+shadow update. `mremap` of one 4 KiB page with
+`MREMAP_MAYMOVE|MREMAP_FIXED` returned `EINVAL`, and
+`linker_cfi.cpp`'s check aborted. A same-size move of one guest page
+now moves that slice on the 16 KiB host page. The host page stays
+write-wins and is never writable and executable together. The call
+returns the new address, or the errno of a move it refuses. After
+formal apexd mounted the runtime APEX at
+`/apex/com.android.runtime@1` and activated 35 packages, the next two
+execs still resolved `PT_INTERP` `/system/bin/linker64` through the
+bootstrap `apex-mounts/1` host, which was already gone (`ENOENT`,
+status 127). An ext4 mount whose host directory is gone does not
+cover the path and does not hide the mount under it, so the walk
+reaches the activated tree. A path that is still missing stays
+`ENOENT`. The third start aborted after that `mremap` had returned an
+address. Its text was written to the log socket while logd was down.
+This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
