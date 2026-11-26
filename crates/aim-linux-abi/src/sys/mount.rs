@@ -12,10 +12,12 @@
 //! The other namespaces are answered "unsupported" (ADR 0012 appendix).
 //! A plain fork after `setns` into the default namespace keeps that
 //! journal. The child walks the shared root; `/apex` there stays the
-//! private tmpfs. `mount` of fstype `bpf` installs an empty bpffs.
-//! The kernel's sysfs mount point `/sys/fs/bpf` is that directory when
-//! the host path is not there yet. A path that is not a directory is
-//! `ENOTDIR`, and any other missing path is `ENOENT`.
+//! private tmpfs. `mount` of fstype `bpf` installs an empty bpffs. On
+//! sysfs or the path map's bpffs, `/sys/fs/bpf` is created when that
+//! host directory is missing. When `/sys` is still the image, because
+//! fstype `sysfs` is `ENODEV`, the same guest path is mounted without
+//! creating a directory in the image. A path that is not a directory
+//! is `ENOTDIR`, and any other missing path is `ENOENT`.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -116,7 +118,9 @@ pub fn setns(a: [u64; 6]) -> i64 {
 /// The kernel creates `/sys/fs/bpf` (`sysfs_create_mount_point`) before
 /// userspace mounts bpffs there. A resolved path whose host directory is
 /// missing is that mount point when it is `/sys/fs/bpf` on sysfs or on the
-/// path map's bpffs. Any other missing path stays missing.
+/// path map's bpffs. The image is not a place to create it: fstype
+/// `sysfs` is `ENODEV`, so `/sys` stays the image and the caller mounts
+/// bpffs over the missing name. Any other missing path stays missing.
 fn ensure_bpf_mount_point(target: &vfs::Resolved) -> Result<(), i64> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::stat(target.host.as_ptr(), &mut st) } == 0 {
@@ -141,6 +145,21 @@ fn ensure_bpf_mount_point(target: &vfs::Resolved) -> Result<(), i64> {
             error.raw_os_error().unwrap_or(libc::EIO),
         ) as i64)),
     }
+}
+
+/// `Some` is the file type. `None` is a missing path (`ENOENT`). Any
+/// other `stat` failure is that errno.
+fn stat_mount_point(target: &vfs::Resolved) -> Result<Option<u32>, i64> {
+    // SAFETY: host path, local buffer.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(target.host.as_ptr(), &mut st) } == 0 {
+        return Ok(Some(st.st_mode & libc::S_IFMT));
+    }
+    let error = crate::errno::last();
+    if error == ENOENT {
+        return Ok(None);
+    }
+    Err(-(error as i64))
 }
 
 fn resolve(path: u64, follow: bool) -> Result<vfs::Resolved, i64> {
@@ -197,12 +216,18 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
         return Err(-(EPERM as i64));
     }
     let target = resolve(a[1], true)?;
-    if flags & (MS_REMOUNT | PROPAGATION | MS_BIND | MS_MOVE) == 0
-        && super::guest_cstr(a[2]).ok().as_deref() == Some(b"bpf".as_slice())
-    {
+    // `resolve` names the image path when the last component is absent.
+    // It does not return `ENOENT` for that. The following `stat` does.
+    let bpf_create = flags & (MS_REMOUNT | PROPAGATION | MS_BIND | MS_MOVE) == 0
+        && super::guest_cstr(a[2]).ok().as_deref() == Some(b"bpf".as_slice());
+    let image_bpf = bpf_create
+        && target.guest == "/sys/fs/bpf"
+        && target.area == Area::Image
+        && stat_mount_point(&target)?.is_none();
+    if bpf_create && !image_bpf {
         ensure_bpf_mount_point(&target)?;
     }
-    if !is_dir(&target)? && flags & (MS_BIND | MS_MOVE) == 0 {
+    if !image_bpf && !is_dir(&target)? && flags & (MS_BIND | MS_MOVE) == 0 {
         return Err(-(ENOTDIR as i64));
     }
     if flags & MS_REMOUNT != 0 {
@@ -1389,5 +1414,47 @@ mod tests {
         assert_eq!(vfs::remove_mount("/sys/fs/bpf"), Ok(true));
         assert_eq!(vfs::remove_mount("/data/bpf-host"), Ok(true));
         assert_eq!(vfs::remove_mount("/sys"), Ok(true));
+    }
+
+    /// The Mac layout: fstype `sysfs` is `ENODEV`, so `/sys` stays an
+    /// image directory and `/sys/fs/bpf` is not in that tree. The bpf
+    /// mount still installs an empty bpffs, and `mkdir` of `tethering`
+    /// lands there. Another missing path stays `ENOENT`.
+    #[test]
+    fn bpf_mount_on_image_sys_installs_bpffs() {
+        let (_view, _root) = vfs::test_view();
+        let image_sys = vfs::root().join("sys");
+        std::fs::create_dir_all(&image_sys).unwrap();
+        assert!(!image_sys.join("fs/bpf").exists());
+        let (_, area) = vfs::lookup("/sys");
+        assert_eq!(area, Area::Image);
+        let (source, sys, sysfs) = (at("sysfs"), at("/sys"), at("sysfs"));
+        assert_eq!(mount([p(&source), p(&sys), p(&sysfs), 0, 0, 0]), -(ENODEV as i64));
+        let (_, area) = vfs::lookup("/sys");
+        assert_eq!(area, Area::Image);
+        let (source, target, fstype) = (at("bpf"), at("/sys/fs/bpf"), at("bpf"));
+        let flags = 2 | 4 | 8;
+        assert_eq!(mount([p(&source), p(&target), p(&fstype), flags, 0, 0]), 0);
+        assert_eq!(vfs::fstype("/sys/fs/bpf").as_deref(), Some("bpf"));
+        let (host, area) = vfs::lookup("/sys/fs/bpf");
+        assert_eq!(area, Area::Writable);
+        assert!(!image_sys.join("fs/bpf").exists());
+        assert!(std::fs::read_dir(&host).unwrap().next().is_none());
+        mkdir("/sys/fs/bpf/tethering", 0o755, 0);
+        assert!(host.join("tethering").is_dir());
+        assert!(!image_sys.join("fs/bpf").exists());
+        let pstore = at("/sys/fs/pstore");
+        let pstore_type = at("pstore");
+        assert_eq!(
+            mount([p(&source), p(&pstore), p(&pstore_type), flags, 0, 0]),
+            -(ENOENT as i64)
+        );
+        let other = at("/sys/fs/selinux");
+        assert_eq!(
+            mount([p(&source), p(&other), p(&fstype), flags, 0, 0]),
+            -(ENOENT as i64)
+        );
+        assert_eq!(vfs::remove_mount("/sys/fs/bpf"), Ok(true));
+        let _ = std::fs::remove_dir_all(&image_sys);
     }
 }

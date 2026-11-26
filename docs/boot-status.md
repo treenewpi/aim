@@ -460,12 +460,30 @@ gets `EACCES`. That file is mode 0644, values 0, 1 and 2, default 2,
 and 1 locks until the boot ends. A write needs `CAP_SYS_ADMIN`; an
 unprivileged open for write is `EACCES`. NetBpfLoad next writes
 `/proc/sys/net/core/bpf_jit_enable` (1 only, the 6.12
-`CONFIG_BPF_JIT_ALWAYS_ON` value) and `bpf_jit_kallsyms`. Init's
-`mount` of fstype `bpf` on `/sys/fs/bpf` was `ENOENT`: the sysfs mount
-point was not a directory. The mount now installs an empty bpffs
-there. A missing path stays `ENOENT`. `/sys/fs/pstore` is still
-`ENOENT`. A later `bpf` operation that is not implemented returns its
-own errno. This is not Mac-remeasured. The pinned layer has 35
+`CONFIG_BPF_JIT_ALWAYS_ON` value) and `bpf_jit_kallsyms`.
+`14377e2187894241e7b6066060e01097ccd2c816` (archive SHA256
+`d282826b95150aa21e52360a43b32f3e86257080085342da29b46fa9639f7e19`,
+init 2026-11-26 08:53:26 Asia/Kuala_Lumpur) remeasured that. It is not
+a boot. Init ran 11.925s and rebooted `reboot,bpfloader-failed`.
+Formal apexd activated 35 packages, including `com.android.art`, and
+art_boot exited 0. NetBpfLoad (pid 64660, uid 0) wrote
+`unprivileged_bpf_disabled` `0`, `bpf_jit_enable` `1` and
+`bpf_jit_kallsyms` `1`. Each `openat` returned 3 and each write
+returned 2. The stop moved. First-stage `mount("sysfs", "/sys",
+"sysfs", 0)` is `ENODEV`. A later remount returns 0 and does not
+install sysfs: every `/sys` lookup is the image
+(`.../root/sys/...`). `mount("bpf", "/sys/fs/bpf", "bpf",
+MS_NOSUID|MS_NODEV|MS_NOEXEC)` is `ENOENT` at call 10411.
+`resolve` names that image path when `bpf` is absent; it does not
+itself return `ENOENT`. The mount point was created only when the
+area was kernfs or writable, which the Linux unit set up and the Mac
+image is not. NetBpfLoad's `mkdir("/sys/fs/bpf/tethering")` is
+`ENOENT`. `bpf()` was not called. The bpf mount on guest path
+`/sys/fs/bpf` now installs an empty bpffs without creating a
+directory in the image, and `mkdir` of `tethering` is on that bpffs.
+Any other missing path stays `ENOENT`, including `/sys/fs/pstore`.
+`sysfs` stays `ENODEV`. A later `bpf` operation that is not
+implemented returns its own errno. This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
