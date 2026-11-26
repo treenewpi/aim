@@ -166,6 +166,12 @@ impl Space {
         })
     }
 
+    /// Start and end of the mapping that contains `addr`.
+    pub fn bounds_at(&self, addr: u64) -> Option<(u64, u64)> {
+        let (&start, area) = self.areas.range(..=addr).next_back()?;
+        (area.end > addr).then_some((start, area.end))
+    }
+
     /// `(total_vm, data_vm)` in bytes, the program break's heap `brk`
     /// bytes counted as data.
     fn totals(&self, brk: u64) -> (u64, u64) {

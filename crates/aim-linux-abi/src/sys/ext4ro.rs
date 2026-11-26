@@ -531,6 +531,15 @@ mod tests {
         }
         write_inode(&mut img, 12, S_IFREG | 0o644, file.len() as u64, &file_ext);
         img[6 * bs..6 * bs + file.len()].copy_from_slice(file);
+        let mut tool_ext = [0u8; 24];
+        put16(&mut tool_ext, 0, EXTENT_MAGIC);
+        put16(&mut tool_ext, 2, 1);
+        put16(&mut tool_ext, 4, 4);
+        put32(&mut tool_ext, 12, 0);
+        put16(&mut tool_ext, 16, 1);
+        put32(&mut tool_ext, 20, 8);
+        write_inode(&mut img, 13, S_IFREG | 0o755, 4, &tool_ext);
+        img[8 * bs..8 * bs + 4].copy_from_slice(b"exec");
         // directory block: . .. apex_manifest.pb
         let dir = &mut img[5 * bs..6 * bs];
         put32(dir, 0, 2);
@@ -546,11 +555,38 @@ mod tests {
         dir[21] = b'.';
         let name = b"apex_manifest.pb";
         put32(dir, 24, 12);
-        put16(dir, 28, (bs - 24) as u16);
+        put16(dir, 28, 24);
         dir[30] = name.len() as u8;
         dir[31] = 1;
         dir[32..32 + name.len()].copy_from_slice(name);
+        let tool = b"tool";
+        put32(dir, 48, 13);
+        put16(dir, 52, (bs - 48) as u16);
+        dir[54] = tool.len() as u8;
+        dir[55] = 1;
+        dir[56..56 + tool.len()].copy_from_slice(tool);
         img
+    }
+
+    /// The inode mode is the host mode, including under a umask that would
+    /// clear execute on create. A mode without execute is not given it.
+    #[test]
+    fn install_keeps_regular_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let img = image(MANIFEST, false);
+        let parsed = Image::open(img).unwrap();
+        let dir = std::env::temp_dir().join(format!("aim-ext4-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let previous = unsafe { libc::umask(0o077) };
+        parsed.install(&dir).unwrap();
+        unsafe { libc::umask(previous) };
+        let mode = |name: &str| {
+            fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode("tool"), 0o755);
+        assert_eq!(mode("apex_manifest.pb"), 0o644);
+        assert_eq!(fs::read(dir.join("tool")).unwrap(), b"exec");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

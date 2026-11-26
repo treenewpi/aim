@@ -541,6 +541,7 @@ pub fn mount_ext4(source: &str, guest: &str, readonly: bool) -> Result<(), Errno
     remember_superblock(&host, source);
     if let Err(error) = vfs::add_mount(guest, host.clone(), Area::Image, source, "ext4") {
         let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_file(vfs::ext4_stamp_path(&host));
         SUPERBLOCKS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -586,20 +587,41 @@ fn materialize(source: &str) -> Result<PathBuf, Errno> {
     let host = fresh_dir()?;
     if let Err(error) = image.install(&host) {
         let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_file(vfs::ext4_stamp_path(&host));
+        return Err(error);
+    }
+    if let Err(error) = vfs::note_ext4_host(&host) {
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_file(vfs::ext4_stamp_path(&host));
         return Err(error);
     }
     Ok(host)
 }
 
+/// A new directory under `apex-mounts`. The name carries this process's
+/// pid, and an existing directory is left alone: another process's counter
+/// also starts at 1, and installing into that directory deleted the tree a
+/// mount still named.
 fn fresh_dir() -> Result<PathBuf, Errno> {
     static SEQ: AtomicU64 = AtomicU64::new(1);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let base = vfs::runtime_dir()
-        .map(|p| p.join("apex-mounts"))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("aim-apex-mounts-{}", std::process::id())));
-    let dir = base.join(n.to_string());
-    fs::create_dir_all(&dir).map_err(|e| errno::from_darwin(e.raw_os_error().unwrap_or(libc::EIO)))?;
-    Ok(dir)
+    let base = vfs::runtime_dir().map(|p| p.join("apex-mounts")).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("aim-apex-mounts-{}", std::process::id()))
+    });
+    fs::create_dir_all(&base)
+        .map_err(|e| errno::from_darwin(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    let pid = std::process::id();
+    for _ in 0..100_000 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("{pid}-{n}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)));
+            }
+        }
+    }
+    Err(crate::errno::ENOMEM)
 }
 
 fn reader_for(source: &str) -> Result<Box<dyn ReadAt + Send>, Errno> {
@@ -1800,6 +1822,54 @@ mod tests {
         clr_fd(7).unwrap();
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&host);
+    }
+
+    /// A directory that already holds a mounted tree is not the next
+    /// payload's host. Two processes both start their counter at 1; reusing
+    /// `apex-mounts/1` deleted `linker64` while a mount still named it.
+    #[test]
+    fn a_later_host_does_not_reuse_a_mounted_ext4_directory() {
+        let _gate = gate();
+        let (_view, root) = crate::vfs::test_view();
+        let base = root.join("apex-mounts");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let pid = std::process::id();
+        let mut planted = Vec::new();
+        for n in 1..=128 {
+            let dir = base.join(format!("{pid}-{n}"));
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin/linker64"), b"already-mounted").unwrap();
+            planted.push(dir);
+            let legacy = base.join(n.to_string());
+            fs::create_dir_all(legacy.join("bin")).unwrap();
+            fs::write(legacy.join("bin/linker64"), b"legacy-mounted").unwrap();
+            planted.push(legacy);
+        }
+        let host = fresh_dir().unwrap();
+        assert!(
+            host.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                name.starts_with(&format!("{pid}-"))
+            }),
+            "host {}",
+            host.display()
+        );
+        assert!(
+            fs::read_dir(&host).unwrap().next().is_none(),
+            "reused {}",
+            host.display()
+        );
+        for dir in &planted {
+            let bytes = fs::read(dir.join("bin/linker64")).unwrap_or_default();
+            assert!(
+                bytes == b"already-mounted" || bytes == b"legacy-mounted",
+                "wiped {} ({})",
+                dir.display(),
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

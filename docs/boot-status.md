@@ -502,26 +502,57 @@ guest stderr SHA256
 remeasured that. It is not a boot. Init exited 6. There is no
 `system_server`, and `boot_completed` stays 0. First-stage
 `mount("sysfs", "/sys")` is 0, `mount("bpf", "/sys/fs/bpf")` is 0,
-`mkdir` of `tethering` is 0, and bpfloader exited 0. keystore2 was
-started five times. The first two execs reached the linker's CFI
-shadow update. `mremap` of one 4 KiB page with
-`MREMAP_MAYMOVE|MREMAP_FIXED` returned `EINVAL`, and
-`linker_cfi.cpp`'s check aborted. A same-size move of one guest page
-now moves that slice on the 16 KiB host page. The host page stays
-write-wins and is never writable and executable together. The call
-returns the new address, or the errno of a move it refuses. A
-read-only page is read-only again after the moved bytes are written.
-After
-formal apexd mounted the runtime APEX at
-`/apex/com.android.runtime@1` and activated 35 packages, the next two
-execs still resolved `PT_INTERP` `/system/bin/linker64` through the
-bootstrap `apex-mounts/1` host, which was already gone (`ENOENT`,
-status 127). An ext4 mount whose host directory is gone does not
-cover the path and does not hide the mount under it, so the walk
-reaches the activated tree. A path that is still missing stays
-`ENOENT`. The third start aborted after that `mremap` had returned an
-address. Its text was written to the log socket while logd was down.
-This is not Mac-remeasured. The pinned layer has 35
+`mkdir` of `tethering` is 0, and bpfloader exited 0. A same-size move
+of one guest page moves that slice on the 16 KiB host page. The host
+page stays write-wins and is never writable and executable together.
+The call returns the new address, or the errno of a move it refuses.
+A read-only page is read-only again after the moved bytes are written.
+`6b165e9e1dc3f6112f1e69af4bb452898dbcc22d` (archive SHA256
+`8c1deec0e76321326ac2cc21fddaac0d765e36ebb6600ab1604f3e4cdc776004`,
+guest stderr SHA256
+`23247a2040607ac314354ce601766afee0ab555d4b4d86c49ea716954be9ca36`)
+remeasured that. It is not a boot. There is no `system_server`, and
+`boot_completed` stays 0. Init ran 18.003s and rebooted
+`reboot,boringssl-self-check-failed`. First-stage `mount("sysfs",
+"/sys")` is 0, `mount("bpf", "/sys/fs/bpf")` is 0, `mkdir` of
+`tethering` is 0, and bpfloader exited 0 with its interpreter already
+on `apex-mounts/19`. keystore2's first start (pid 67287) completed 57
+same-size `MREMAP_MAYMOVE|MREMAP_FIXED` moves of one 4 KiB page, each
+returning 0. netd completed 39, each 0. The log has no
+`linker_cfi.cpp`, `ShadowWrite`, or `MAP_FAILED`. That start still
+aborted after those moves. The abort text was not available because
+logd was down. netd (pid 67321, interpreter `apex-mounts/19`) then
+grew one 4 KiB page to 8 KiB with `MREMAP_MAYMOVE` 115 times, each
+`ENOMEM`, and aborted in `__cxa_atexit`. zygote (pid 67323) was
+killed on netd's `onrestart`. A guest-page-aligned grow that is not a
+whole number of 16 KiB host pages extends in place when the extra
+pages are not a different mapping, and otherwise moves when
+`MREMAP_MAYMOVE` is set. The extra pages are mapped, or the call
+returns the errno. It does not report success for a page it did not
+map, and it does not take a neighbor that is already mapped. Host
+`mmap`, `mprotect` and `mremap` stay 16 KiB and 16 KiB-aligned. After
+formal apexd, bpfloader, netd, zygote, surfaceflinger, credstore and
+gpuservice resolved `PT_INTERP` `/system/bin/linker64` to
+`apex-mounts/19` and read 4096 bytes. keystore2's later starts (pids
+67315 and 67340) and lmkd still resolved it to
+`apex-mounts/1/bin/linker64` (`ENOENT`, status 127). Each process
+started its `apex-mounts` counter at 1, and installing a payload
+removed the directory already at that path, so a mount that still
+named it saw another tree or a missing file. A new payload takes a
+directory that does not already exist. The installed directory is
+recorded beside it. A directory that is gone, or that no longer
+contains that record, does not cover the path. A bind of that host
+does not either. The walk reaches the activated tree. A path that is
+still missing stays `ENOENT`. `boringssl_self_test_apex64` (pid 67362,
+uid 9999) exited 127 in 0.023s. `interpret` of
+`/apex/com.android.conscrypt/bin/boringssl_self_test64` was `EACCES`
+at host `apex-mounts/4/bin/boringssl_self_test64`. That check is the
+host file: it is not a regular file, or the host user cannot execute
+it. The mode written for a regular file is the inode mode. A mode
+without execute is left without execute. `apex-mounts/4` is an early
+host, and a later payload no longer reuses it. A replaced host does
+not stay selected. The check is not skipped, and an exec that did not
+run is not reported as success. This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

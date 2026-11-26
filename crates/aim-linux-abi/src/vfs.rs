@@ -3203,19 +3203,74 @@ fn hidden(mounts: &[Mount], m: &Mount) -> bool {
         .any(|n| n.seq > m.seq && below(&n.guest, &m.guest).is_some())
 }
 
-/// An ext4 mount whose host directory is gone. The directory is the
-/// superblock filled when the mount was created. Apexd's activation of the
-/// official payload leaves that bootstrap directory removed while the mount
-/// entry can still be the one a walk selects. The entry then names a path
-/// that `stat` cannot open. It does not cover the guest path, and it does
-/// not hide the mount underneath, so the walk sees the symlink to the
-/// activated tree. A directory that is still there keeps covering the path.
+/// Sidecar beside an ext4 host directory. The same bytes are written inside
+/// the directory. Removing and creating the directory again drops the inner
+/// copy; an inode number can be reused, so the bytes are the record.
+pub(crate) fn ext4_stamp_path(host: &Path) -> PathBuf {
+    let mut name = host.file_name().unwrap_or_default().to_os_string();
+    name.push(".stamp");
+    host.with_file_name(name)
+}
+
+fn ext4_stamp_file(host: &Path) -> PathBuf {
+    host.join(".aim-ext4-stamp")
+}
+
+/// Remember the directory `host` that an ext4 mount just installed.
+///
+/// A later install must not reuse this path. If something replaces the
+/// directory anyway, the copy of this record inside it is gone and the
+/// mount stops covering the guest path.
+pub(crate) fn note_ext4_host(host: &Path) -> Result<(), Errno> {
+    let meta = std::fs::metadata(host).map_err(|error| {
+        errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+    })?;
+    if !meta.is_dir() {
+        return Err(errno::ENOTDIR);
+    }
+    let text = format!("{}\n", std::process::id());
+    let write = |path: &Path| {
+        std::fs::write(path, &text).map_err(|error| {
+            errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+        })
+    };
+    write(&ext4_stamp_file(host))?;
+    write(&ext4_stamp_path(host))
+}
+
+/// The recorded directory was removed and created again. The path exists,
+/// but it is not the tree this mount installed. A failed read other than
+/// a missing file keeps the mount.
+fn ext4_identity_replaced(host: &Path) -> bool {
+    let expected = match std::fs::read(ext4_stamp_path(host)) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    match std::fs::read(ext4_stamp_file(host)) {
+        Ok(found) => found != expected,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// An ext4 mount whose host directory is gone, or no longer the directory
+/// that was installed. The directory is the superblock filled when the
+/// mount was created. A later payload used to remove that directory and
+/// create it again, so the mount still named a path whose `linker64` was
+/// missing and hid the activated tree. A bind of the same host does too.
+/// The entry does not cover the guest path. A directory that is still the
+/// installed one keeps covering the path. `EACCES` does not.
 fn ext4_host_gone(mount: &Mount) -> bool {
-    if mount.fstype.as_deref() != Some("ext4") {
+    let stamped = ext4_stamp_path(&mount.host).is_file();
+    let ext4 = mount.fstype.as_deref() == Some("ext4");
+    let bind_of_ext4 = mount.fstype.as_deref() == Some("bind") && stamped;
+    if !ext4 && !bind_of_ext4 {
         return false;
     }
     match std::fs::metadata(&mount.host) {
-        Ok(meta) => !meta.is_dir(),
+        Ok(meta) => !meta.is_dir() || ext4_identity_replaced(&mount.host),
         // A missing directory does not cover the path. Any other error,
         // including EACCES, leaves the mount in place so the caller's
         // open returns that errno.
@@ -5865,6 +5920,99 @@ mod tests {
         );
         assert!(!old_host.exists());
         assert!(!new_host.exists());
+        let _ = std::fs::remove_file(&image);
+    }
+
+    /// The bootstrap directory still exists, but it is not the directory
+    /// that was mounted: it was removed and created again, and `linker64`
+    /// is gone. A bind of that host is the mount a walk would select. Both
+    /// yield the activated tree. The replaced directory is not recreated
+    /// when the activated tree is gone too.
+    #[test]
+    fn a_replaced_ext4_host_yields_the_activated_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _apex = Unmount("/apex");
+        let _old = Unmount("/apex/com.android.runtime");
+        let _bind = Unmount("/apex/com.android.runtime");
+        let _new = Unmount("/apex/com.android.runtime@1");
+        let image = vfs().root.join("system/bin/linker64");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&image);
+        std::os::unix::fs::symlink("/apex/com.android.runtime/bin/linker64", &image).unwrap();
+        let old_host = dir.join("runtime-replaced-linker");
+        let new_host = dir.join("runtime-replaced-activated");
+        let tmp = dir.join("runtime-replaced-tmp");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink("com.android.runtime@1", tmp.join("com.android.runtime"))
+            .unwrap();
+        note_ext4_host(&old_host).unwrap();
+        add_mount("/apex", tmp, Area::Writable, "tmpfs", "tmpfs").unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "ext4",
+        )
+        .unwrap();
+        add_mount(
+            "/apex/com.android.runtime@1",
+            new_host.clone(),
+            Area::Image,
+            "/system/apex/com.android.runtime.apex",
+            "ext4",
+        )
+        .unwrap();
+        let live = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let live_host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"bootstrap-linker");
+        std::fs::remove_dir_all(&old_host).unwrap();
+        std::fs::create_dir_all(&old_host).unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "bind",
+        )
+        .unwrap();
+        let after = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            after_host.starts_with(&new_host),
+            "resolve kept {}",
+            after_host.display()
+        );
+        assert_eq!(std::fs::read(&after_host).unwrap(), b"activated-linker");
+        std::fs::remove_dir_all(&new_host).unwrap();
+        let missed = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let missed_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(missed.host.as_bytes()));
+        assert!(
+            std::fs::read(&missed_host).is_err(),
+            "missing interpreter opened {}",
+            missed_host.display()
+        );
+        assert!(old_host.exists());
+        assert!(!new_host.exists());
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
         let _ = std::fs::remove_file(&image);
     }
 }

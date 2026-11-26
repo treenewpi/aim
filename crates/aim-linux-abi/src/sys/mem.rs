@@ -2949,6 +2949,240 @@ fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
     apply_host_prot(host, &pieces, from, new_host, true)
 }
 
+/// Whether the guest page a grow would enter is already this mapping, free,
+/// or a different mapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrowSlice {
+    /// The page is already part of the mapping being grown.
+    Same,
+    /// Nothing is mapped here. The grow has to map it.
+    Free,
+    /// A different mapping occupies this guest page.
+    Neighbor,
+}
+
+/// `page` as a grow of the mapping at `old` sees it.
+///
+/// A uniform host page is one guest mapping rounded up to 16 KiB. Its tail
+/// is that mapping. A slice recorded on its own, or a vm area that starts
+/// at a different address, is a neighbor and is not absorbed.
+fn grow_slice(old: u64, page: u64) -> GrowSlice {
+    let host = page & !(PAGE - 1);
+    let slot = ((page - host) / GUEST_PAGE) as usize;
+    let pieces = PAGE_PIECES.lock().unwrap().get(&host).copied();
+    let (old_bounds, page_bounds) =
+        vm_account::with(|space| (space.bounds_at(old), space.bounds_at(page)));
+    let same_area = match (old_bounds, page_bounds) {
+        (Some((start, end)), Some((page_start, page_end))) => {
+            start == page_start && end == page_end
+        }
+        _ => false,
+    };
+    // A vm area that starts at a different address is a neighbor even when
+    // the host page's protections match and no per-slice row remains.
+    if page_bounds.is_some() && !same_area {
+        return GrowSlice::Neighbor;
+    }
+    if let Some(pieces) = pieces {
+        if pieces.present & (1 << slot) == 0 {
+            return GrowSlice::Free;
+        }
+        let unaccounted_tail = old_bounds.is_none()
+            && page_bounds.is_none()
+            && host == (old & !(PAGE - 1));
+        return if same_area || unaccounted_tail {
+            GrowSlice::Same
+        } else {
+            GrowSlice::Neighbor
+        };
+    }
+    if same_area {
+        return GrowSlice::Same;
+    }
+    match page_prot(host) {
+        None => GrowSlice::Free,
+        Some(_)
+            if old_bounds.is_none() && page_bounds.is_none() && host == (old & !(PAGE - 1)) =>
+        {
+            GrowSlice::Same
+        }
+        Some(_) => GrowSlice::Neighbor,
+    }
+}
+
+/// Anonymous host pages for a grow that cannot extend in place.
+///
+/// The length and the address passed to `mmap` are multiples of the 16 KiB
+/// host page. A 4 KiB kernel may hand back a 4 KiB-aligned address; that
+/// mapping is released and the call fails, rather than protecting a
+/// sub-page.
+fn map_grow_destination(len: u64) -> Result<u64, i64> {
+    let bytes = page_up(len);
+    let span = bytes + PAGE;
+    let addr = super::arena::map_anon(span, libc::PROT_READ | libc::PROT_WRITE)?;
+    if addr & (PAGE - 1) != 0 {
+        // SAFETY: this mapping was just created and is not guest-visible.
+        unsafe { libc::munmap(addr as *mut _, span as usize) };
+        return Err(-(ENOMEM as i64));
+    }
+    // SAFETY: the extra host page is the alignment slack, 16 KiB at a
+    // 16 KiB-aligned address.
+    unsafe { libc::munmap((addr + bytes) as *mut _, PAGE as usize) };
+    Ok(addr)
+}
+
+/// Move `[old, old+old_len)` to a free range of `new_len`, zeroing the
+/// extra guest pages. The extra pages are mapped here. A failure returns
+/// the errno and does not report the old address as the grown mapping.
+fn relocate_grow(old: u64, old_len: u64, new_len: u64) -> i64 {
+    let end = old + old_len;
+    let mut moved = Vec::with_capacity((old_len / GUEST_PAGE) as usize);
+    let mut page = old;
+    while page < end {
+        let prot = match guest_slice_prot(page) {
+            Ok(prot) => prot,
+            Err(error) => return error,
+        };
+        let bytes = match copy_slice(page) {
+            Ok(bytes) => bytes,
+            Err(error) => return error,
+        };
+        moved.push((prot, bytes));
+        page += GUEST_PAGE;
+    }
+    let dest = match map_grow_destination(new_len) {
+        Ok(addr) => addr,
+        Err(error) => return error,
+    };
+    let host_end = dest + page_up(new_len);
+    let new_end = dest + new_len;
+    let extend_prot = moved
+        .last()
+        .map(|(prot, _)| *prot)
+        .unwrap_or(libc::PROT_READ as u32);
+    for (index, (prot, bytes)) in moved.iter().enumerate() {
+        let result = place_slice(dest + index as u64 * GUEST_PAGE, *prot, bytes);
+        if result < 0 {
+            let _ = punch_guest_range(dest, host_end);
+            return result;
+        }
+    }
+    let zeros = [0u8; 4096];
+    let mut page = dest + old_len;
+    while page < new_end {
+        let result = place_slice(page, extend_prot, &zeros);
+        if result < 0 {
+            let _ = punch_guest_range(dest, host_end);
+            return result;
+        }
+        page += GUEST_PAGE;
+    }
+    if new_end < host_end {
+        let punched = punch_guest_range(new_end, host_end);
+        if punched < 0 {
+            return punched;
+        }
+    }
+    let mut page = dest;
+    while page < new_end {
+        if guest_slice_prot(page).is_err() {
+            let _ = punch_guest_range(dest, host_end);
+            return -(ENOMEM as i64);
+        }
+        page += GUEST_PAGE;
+    }
+    let punched = punch_guest_range(old, end);
+    if punched < 0 {
+        return punched;
+    }
+    forget_guest_slices(old, end);
+    copies::moved(old, dest, old_len);
+    copies::forget(dest + old_len, new_end);
+    let kind = vm_account::with(|space| space.kind_at(old));
+    if let Some(kind) = kind {
+        vm_account::with(|space| {
+            space.unmap(old, end);
+            space.map(dest, new_end, kind);
+        });
+    }
+    super::vma_names::remap(old, old_len, dest, new_len, false);
+    if let Err(error) = super::verity_pager::reconcile_memberships() {
+        return -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64);
+    }
+    dest as i64
+}
+
+/// Grow a sub-page mapping with `MREMAP_MAYMOVE`.
+///
+/// In place when every extra guest page is free or already the tail of this
+/// mapping. A neighbor that is already mapped is not absorbed: the whole
+/// new length moves, or the call is `ENOMEM` without `MREMAP_MAYMOVE`. The
+/// extra pages are mapped before the call returns their address.
+fn grow_subpage(old: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
+    let new_end = match old.checked_add(new_len) {
+        Some(end) => end,
+        None => return -(ENOMEM as i64),
+    };
+    let kind = vm_account::with(|space| space.kind_at(old));
+    if let Some(kind) = kind {
+        let (limits, heap) = (super::cred::memory_limits(), brk_heap());
+        if !vm_account::with(|space| space.may_expand(limits, heap, kind.data(), new_len - old_len))
+        {
+            return -(ENOMEM as i64);
+        }
+    }
+    let mut blocked = false;
+    let mut page = old + old_len;
+    while page < new_end {
+        if grow_slice(old, page) == GrowSlice::Neighbor {
+            blocked = true;
+            break;
+        }
+        page += GUEST_PAGE;
+    }
+    if blocked {
+        if flags & MREMAP_MAYMOVE == 0 {
+            return -(ENOMEM as i64);
+        }
+        return relocate_grow(old, old_len, new_len);
+    }
+    let extend_prot = match guest_slice_prot(old + old_len - GUEST_PAGE) {
+        Ok(prot) => prot,
+        Err(error) => return error,
+    };
+    let zeros = [0u8; 4096];
+    let mut page = old + old_len;
+    while page < new_end {
+        if grow_slice(old, page) == GrowSlice::Free {
+            let result = place_slice(page, extend_prot, &zeros);
+            if result < 0 {
+                return result;
+            }
+        }
+        page += GUEST_PAGE;
+    }
+    let mut page = old + old_len;
+    while page < new_end {
+        if guest_slice_prot(page).is_err() {
+            return -(ENOMEM as i64);
+        }
+        page += GUEST_PAGE;
+    }
+    if let Some(kind) = kind {
+        vm_account::with(|space| {
+            if space.bounds_at(old).is_none_or(|(_, end)| end < new_end) {
+                space.map(old + old_len, new_end, kind);
+            }
+        });
+    }
+    copies::forget(old + old_len, new_end);
+    super::vma_names::remap(old, old_len, old, new_len, false);
+    if let Err(error) = super::verity_pager::reconcile_memberships() {
+        return -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64);
+    }
+    old as i64
+}
+
 /// `mremap` of a range that is not a whole number of 16 KiB host pages.
 ///
 /// Bionic's CFI shadow update moves one 4 KiB page with
@@ -2956,9 +3190,9 @@ fn place_slice(addr: u64, prot: u32, bytes: &[u8; 4096]) -> i64 {
 /// would take the next three slices with it, and a destination that is only
 /// 4 KiB-aligned is `EINVAL` on the host-page path. The slice moves, or the
 /// call returns the errno of a move Linux would refuse. A successful return
-/// is the new address. Shrinking in place punches the tail. A grow, or a
-/// move whose size changes, would have to be rounded onto a neighbor, so
-/// that call is `ENOMEM`.
+/// is the new address. Shrinking in place punches the tail. A grow maps the
+/// extra guest pages or moves them off a neighbor. A fixed move that changes
+/// size, or that overlaps the source, stays refused.
 fn mremap_subpage(a: [u64; 6]) -> i64 {
     let _epoch = super::verity_pager::mutation();
     let _mapping = super::memfd::mapping_change();
@@ -3070,7 +3304,7 @@ fn mremap_subpage(a: [u64; 6]) -> i64 {
         return new_addr as i64;
     }
     if new_len > old_len {
-        return -(ENOMEM as i64);
+        return grow_subpage(old, old_len, new_len, flags);
     }
     if new_len < old_len {
         let tail = old + new_len;
@@ -4180,5 +4414,97 @@ mod tests {
             libc::munmap(ro_src_raw as *mut _, 2 * PAGE as usize);
             libc::munmap(ro_dst_raw as *mut _, 2 * PAGE as usize);
         }
+    }
+
+    /// `__cxa_atexit` grows one 4 KiB page to 8 KiB with `MREMAP_MAYMOVE`.
+    /// The extra page is usable. A neighbor already mapped at the next
+    /// guest page is not absorbed: the grow moves, and that neighbor's
+    /// bytes stay.
+    #[test]
+    fn maymove_grows_a_guest_page_to_two() {
+        let len = 2 * PAGE as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let raw = ptr as u64;
+        let src = (raw + PAGE - 1) & !(PAGE - 1);
+        assert!(src + PAGE <= raw + len as u64);
+        unsafe {
+            std::ptr::write_bytes(src as *mut u8, 0x5a, 0x1000);
+            std::ptr::write_bytes((src + 0x1000) as *mut u8, 0x11, 0x1000);
+            std::ptr::write_bytes((src + 0x2000) as *mut u8, 0x22, 0x1000);
+        }
+        let grown = mremap([src, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0]);
+        assert_eq!(grown, src as i64);
+        unsafe {
+            assert_eq!(*(src as *const u8), 0x5a);
+            assert_eq!(*((src + 0x1000) as *const u8), 0x11);
+            *((src + 0x1000) as *mut u8) = 0x77;
+            assert_eq!(*((src + 0x1000) as *const u8), 0x77);
+            assert_eq!(*((src + 0x2000) as *const u8), 0x22);
+        }
+        unsafe { libc::munmap(ptr, len) };
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let raw = ptr as u64;
+        let src = (raw + PAGE - 1) & !(PAGE - 1);
+        assert!(src + PAGE <= raw + len as u64);
+        unsafe {
+            std::ptr::write_bytes(src as *mut u8, 0x5a, 0x1000);
+            std::ptr::write_bytes((src + 0x1000) as *mut u8, 0x11, 0x1000);
+        }
+        let neighbor = src + 0x1000;
+        assert_eq!(
+            mmap([
+                neighbor,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            ]),
+            neighbor as i64
+        );
+        unsafe {
+            std::ptr::write_bytes(neighbor as *mut u8, 0x11, 0x1000);
+        }
+        assert_eq!(
+            mremap([src, 0x1000, 0x2000, 0, 0, 0]),
+            -(ENOMEM as i64)
+        );
+        unsafe {
+            assert_eq!(*(neighbor as *const u8), 0x11);
+        }
+        let moved = mremap([src, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0]);
+        assert!(moved > 0, "grow returned {moved}");
+        assert_ne!(moved as u64, src);
+        let dest = moved as u64;
+        unsafe {
+            assert_eq!(*(dest as *const u8), 0x5a);
+            assert_eq!(*((dest + 0x1000) as *const u8), 0);
+            *((dest + 0x1000) as *mut u8) = 0x3c;
+            assert_eq!(*((dest + 0x1000) as *const u8), 0x3c);
+            assert_eq!(*(neighbor as *const u8), 0x11);
+        }
+        unsafe { libc::munmap(ptr, len) };
+        unsafe { libc::munmap(dest as *mut _, PAGE as usize) };
     }
 }
