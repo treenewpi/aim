@@ -734,6 +734,12 @@ pub(super) fn inode_mutation(
         Ok(stat) => stat,
         Err(error) => return error,
     };
+    // A mount at `/` whose host is the image directory is still that
+    // directory. chmod/chown of it must not change the host mode or write
+    // a guest-inode; uid 9999 searches the mode the image was published with.
+    if vfs::is_image_root_inode(&initial) {
+        return -(crate::errno::EROFS as i64);
+    }
     attrs::with_inode_lock(host, &initial, || {
         let stat = metadata_stat(host, guest, follow).map_err(|error| (-error) as i32)?;
         let result = change(&stat);

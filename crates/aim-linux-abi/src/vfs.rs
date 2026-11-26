@@ -2726,6 +2726,34 @@ pub fn root() -> &'static Path {
     &vfs().root
 }
 
+/// Whether `st` is the image directory itself. A mount whose host is that
+/// directory still names this inode; a guest chmod of it is `EROFS` and
+/// its `dev.aim.guest-inode` is not its mode. Children are other inodes.
+pub fn is_image_root_inode(st: &libc::stat) -> bool {
+    let Some(&(dev, ino)) = image_root_identity() else {
+        return false;
+    };
+    dev == st.st_dev && ino == st.st_ino
+}
+
+/// `(st_dev, st_ino)` of the image directory. A failed stat is not cached:
+/// the directory is not replaced once this process has published it.
+fn image_root_identity() -> Option<&'static (libc::dev_t, u64)> {
+    static CACHED: OnceLock<(libc::dev_t, u64)> = OnceLock::new();
+    if let Some(id) = CACHED.get() {
+        return Some(id);
+    }
+    let root = VFS.get()?;
+    let path = CString::new(root.root.as_os_str().as_bytes()).ok()?;
+    let mut root_st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated path, local buffer.
+    if unsafe { libc::lstat(path.as_ptr(), &mut root_st) } != 0 {
+        return None;
+    }
+    let _ = CACHED.set((root_st.st_dev, root_st.st_ino));
+    CACHED.get()
+}
+
 /// The guest-init runtime directory (`<runtime>/fs-attrs`, `sockets`,
 /// `identity`), when running under a path map.
 pub fn runtime_dir() -> Option<&'static Path> {

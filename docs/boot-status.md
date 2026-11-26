@@ -680,13 +680,18 @@ oneshot is not reported as success. `service 'servicemanager'
 requested start, but it is already running` is `Service::Start`
 seeing the process still running. After apexd was already dead, some
 execs logged `guest-search path="/" errno=13 st_mode=0o40700`. That
-view is later than the abort. It is not the sealed image root. A
-bind of a directory on the shared root joins that root's peer group,
-and a mount stacked on the bind was propagated to the peer's
-mountpoint, so lookup of `/` in the unshared namespace was that
-mount's host (mode 0700, no android-inode) instead of the image
-directory. The copy now follows the bind's root inside the shared
-tree, and `/` stays the image directory. A denial logs the host path. logd `EACCES`, `crash_dump64`
+view is later than the abort. On the 07e217e remasure the logged host
+path is the image directory. After the run its Darwin mode is 0700
+and it has a mode-only `dev.aim.guest-inode` (presence 4, mode 0700).
+`dev.aim.android-inode` is absent on that directory and on `/system`,
+so the walk uses the host mode. The guest-inode is the record a chmod
+writes. A mount whose host is the image directory classified `/` as
+writable, so the chmod cleared search for uid 9999 and wrote that
+attribute. chmod of the image directory's inode is EROFS: it does not
+change the host mode and does not write a guest-inode. A guest-inode
+already on that inode does not hide an android-inode. uid 9999 had
+searched `/` while the published mode still granted search. A denial
+logs the host path. logd `EACCES`, `crash_dump64`
 `ENOENT`, missing libraries, keystore2 and netd `SIGABRT`, and
 zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and

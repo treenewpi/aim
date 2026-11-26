@@ -198,8 +198,19 @@ pub(super) fn remove(host: Host, name: &CStr) -> Result<bool, crate::errno::Errn
     }
 }
 
+fn host_is_image_root(host: Host) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let got = unsafe {
+        match host {
+            Host::Path(p) | Host::Image(p) => libc::lstat(p.as_ptr(), &mut st),
+            Host::Fd(fd) => libc::fstat(fd, &mut st),
+        }
+    };
+    got == 0 && vfs::is_image_root_inode(&st)
+}
+
 fn change(host: Host, call: impl Fn() -> i32) -> Result<bool, crate::errno::Errno> {
-    if matches!(host, Host::Image(_)) {
+    if matches!(host, Host::Image(_)) || host_is_image_root(host) {
         return Ok(false);
     }
     let set = || {
@@ -510,6 +521,13 @@ fn lookup_stat(host: Host, guest: impl FnOnce() -> String, st: &libc::stat) -> A
         if device != Attr::default() {
             return device;
         }
+    }
+    // The image directory is the read-only root even when a mount at `/`
+    // names it as a writable host. A mode-only guest-inode there is a
+    // chmod that should have been EROFS; it must not hide android-inode
+    // or replace the host mode.
+    if vfs::is_image_root_inode(st) {
+        return original(host).unwrap_or_default();
     }
     let (inode, original) = inode_attrs(host, st);
     if let Some(a) = inode {
@@ -828,8 +846,13 @@ fn record_inode(
     if !recording() {
         return Ok(());
     }
-    let epoch = mode_epoch()?;
     let stat = host_stat(host)?;
+    // chmod of this inode is EROFS. Do not leave a guest-inode or a table
+    // line that a later stat would use as its mode.
+    if vfs::is_image_root_inode(&stat) {
+        return Ok(());
+    }
+    let epoch = mode_epoch()?;
     let result = with_inode_lock(host, &stat, || {
         if stat.st_mode & libc::S_IFMT == libc::S_IFCHR {
             let previous = table_lookup_key(&device_key(&stat));
@@ -1632,6 +1655,139 @@ mod tests {
             );
         }
         *INODES.lock().unwrap() = None;
+    }
+
+    /// A chmod of the image directory, including one reached through a
+    /// writable mount whose host is that directory, must not replace its
+    /// mode. uid 9999 searched `/` before that mode became 0700.
+    #[test]
+    fn image_root_chmod_does_not_record_a_mode_only_guest_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, _root) = vfs::test_view();
+        let image = vfs::root().to_path_buf();
+        let previous = std::fs::symlink_metadata(&image).unwrap().permissions();
+        // Owner write so the android-inode attribute can be stored.
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = std::ffi::CString::new(image.as_os_str().as_encoded_bytes()).unwrap();
+        let name = std::ffi::CStr::from_bytes_with_nul(b"dev.aim.guest-inode\0").unwrap();
+        let _ = unsafe {
+            aim_storage::host::removexattr(
+                host.as_ptr(),
+                name.as_ptr(),
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        struct Restore<'a> {
+            image: &'a std::path::Path,
+            mode: std::fs::Permissions,
+            host: &'a std::ffi::CString,
+            name: &'a std::ffi::CStr,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = vfs::remove_mount("/");
+                let _ = unsafe {
+                    aim_storage::host::removexattr(
+                        self.host.as_ptr(),
+                        self.name.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    )
+                };
+                let dari = std::ffi::CString::new("user.aim.android-inode").unwrap();
+                let _ = unsafe {
+                    aim_storage::host::removexattr(
+                        self.host.as_ptr(),
+                        dari.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    )
+                };
+                let _ = std::fs::set_permissions(self.image, self.mode.clone());
+                *INODES.lock().unwrap() = None;
+            }
+        }
+        let _restore = Restore {
+            image: &image,
+            mode: previous,
+            host: &host,
+            name,
+        };
+        vfs::add_mount("/", image.clone(), vfs::Area::Writable, "tmpfs", "tmpfs").unwrap();
+        // android-inode 0755 on a host 0700 directory stays the guest mode.
+        // A guest-inode must not replace it; this tree's `/system` has
+        // neither attribute, so the published host mode is what search uses.
+        let dari = {
+            let mut bytes = b"DARI\x01\0\0\0".to_vec();
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0o755u32.to_le_bytes());
+            bytes
+        };
+        let dari_name = std::ffi::CString::new("user.aim.android-inode").unwrap();
+        assert_eq!(
+            unsafe {
+                aim_storage::host::setxattr(
+                    host.as_ptr(),
+                    dari_name.as_ptr(),
+                    dari.as_ptr().cast(),
+                    dari.len(),
+                    0,
+                    aim_storage::host::XATTR_NOFOLLOW,
+                )
+            },
+            0,
+            "android-inode: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        *INODES.lock().unwrap() = None;
+        assert_eq!(path_stat("/").unwrap().st_mode & 0o7777, 0o755);
+        let _ = unsafe {
+            aim_storage::host::removexattr(
+                host.as_ptr(),
+                dari_name.as_ptr(),
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o555)).unwrap();
+        *INODES.lock().unwrap() = None;
+        let slash = std::ffi::CString::new("/").unwrap();
+        let chmod = super::super::fsops::fchmodat([
+            vfs::LINUX_AT_FDCWD as u64,
+            slash.as_ptr() as u64,
+            0o700,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!(chmod, -(crate::errno::EROFS as i64), "chmod /");
+        let mode = std::fs::symlink_metadata(&image).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "host mode of the image root");
+        let mut present = [0u8; 20];
+        let n = unsafe {
+            aim_storage::host::getxattr(
+                host.as_ptr(),
+                name.as_ptr(),
+                present.as_mut_ptr().cast(),
+                present.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        assert!(n < 0, "guest-inode was written on the image root");
+        let stat = path_stat("/").unwrap();
+        assert_eq!(stat.st_mode & 0o7777, 0o555);
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        assert_eq!(search("/", &super::super::cred::current(), FS, None), Ok(()));
+        super::super::cred::init(saved, None);
     }
 
     #[test]
