@@ -487,11 +487,11 @@ started 2026-11-26 09:07:15 Asia/Kuala_Lumpur) did not reach init.
 `linux-run` exited 101: `st.st_mode` is `u16` on Darwin and the new
 `stat` helper returned `u32` (`E0308` at `mount.rs:156`). That
 approach, mounting bpffs over a missing image path, is not the fix.
-`mount` of fstype `sysfs` now installs a kernfs. Its host directory
+`mount` of fstype `sysfs` installs a kernfs. Its host directory
 has the kernel's top-level mount points, including `/sys/fs`, and
-nothing is created in the image. Userspace mkdirs `/sys/fs/bpf` on
-that sysfs, then `mount` of fstype `bpf` installs an empty bpffs on
-the existing directory, and `mkdir` of `tethering` is on the bpffs.
+`sysfs_create_mount_point` for `/sys/fs/bpf`. Nothing is created in
+the image. Init's `mount` of fstype `bpf` on that existing directory
+installs an empty bpffs, and `mkdir` of `tethering` is on the bpffs.
 A missing path stays `ENOENT`, including `/sys/fs/pstore` and
 `/sys/fs/selinux`. A remount whose path is not a mount root, or whose
 fstype is not the one mounted there, is `EINVAL`. `bpf()` is

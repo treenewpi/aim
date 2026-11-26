@@ -14,10 +14,11 @@
 //! journal. The child walks the shared root; `/apex` there stays the
 //! private tmpfs. `mount` of fstype `sysfs` installs a kernfs whose
 //! host directory has the kernel's top-level mount points, including
-//! `/sys/fs`. Userspace mkdirs `/sys/fs/bpf` there, then `mount` of
-//! fstype `bpf` installs an empty bpffs on that existing directory.
-//! A path that is not a directory is `ENOTDIR`, and a missing path is
-//! `ENOENT`. A remount names the filesystem that is already mounted.
+//! `/sys/fs`, and `sysfs_create_mount_point` for bpffs at
+//! `/sys/fs/bpf`. `mount` of fstype `bpf` installs an empty bpffs on
+//! that existing directory. A path that is not a directory is
+//! `ENOTDIR`, and a missing path is `ENOENT`. A remount names the
+//! filesystem that is already mounted.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -115,13 +116,23 @@ pub fn setns(a: [u64; 6]) -> i64 {
     }
 }
 
-/// Top-level directories `sysfs_fill_super` creates. `/sys/fs` is
-/// `fs_kobj`. `bpf`, `pstore` and `selinux` are not among them:
-/// userspace mkdirs `/sys/fs/bpf`, and the others stay missing.
+/// Top-level directories `sysfs_fill_super` creates, plus
+/// `sysfs_create_mount_point(fs_kobj, "bpf")`. `/sys/fs/pstore` and
+/// `/sys/fs/selinux` stay absent until those filesystems exist.
 fn sysfs_dir() -> Result<PathBuf, i64> {
     let dir = tmpfs_dir(&[])?;
     for name in [
-        "block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power",
+        "block",
+        "bus",
+        "class",
+        "dev",
+        "devices",
+        "firmware",
+        "fs",
+        "fs/bpf",
+        "kernel",
+        "module",
+        "power",
     ] {
         std::fs::create_dir(dir.join(name)).map_err(|error| {
             -(crate::errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO)) as i64)
@@ -313,7 +324,7 @@ fn do_mount(a: [u64; 6]) -> Result<(), i64> {
         b"bpf" => {
             // `bpf_fill_super`: a new bpffs root is mode 01777. The
             // directory is the superblock. Pins are files in it. The
-            // mount point is the directory userspace already created.
+            // mount point already exists; this does not create it.
             let dir = tmpfs_dir(&[])?;
             vfs::add_mount(&target.guest, dir, Area::Writable, "bpf", "bpf")
                 .map_err(|error| -(error as i64))?;
@@ -1394,12 +1405,12 @@ mod tests {
         assert_eq!(vfs::remove_mount("/sys"), Ok(true));
     }
 
-    /// Init mounts sysfs on the image's `/sys`, mkdirs `/sys/fs/bpf`,
-    /// then mounts bpffs there. A remount while `/sys` is still the
-    /// image is `EINVAL`. A bpf mount on a directory that was not
-    /// created stays `ENOENT`.
+    /// Init mounts sysfs, then mounts bpffs on `/sys/fs/bpf` with no
+    /// mkdir in between. The kernel created that directory.
+    /// A remount while `/sys` is still the image is `EINVAL`. A bpf
+    /// mount on a directory that was not created stays `ENOENT`.
     #[test]
-    fn sysfs_then_mkdir_then_bpf_mount() {
+    fn sysfs_creates_the_bpf_mount_point() {
         let (_view, _root) = vfs::test_view();
         let image_sys = vfs::root().join("sys");
         std::fs::create_dir_all(&image_sys).unwrap();
@@ -1420,11 +1431,10 @@ mod tests {
         assert_eq!(vfs::fstype("/sys").as_deref(), Some("sysfs"));
         assert_eq!(mount([p(&source), p(&sys), p(&sysfs), remount, 0, 0]), 0);
         assert!(!image_sys.join("fs").exists());
-        mkdir("/sys/fs/bpf", 0o755, 0);
-        assert!(!image_sys.join("fs/bpf").exists());
         let (bpf_host, area) = vfs::lookup("/sys/fs/bpf");
         assert_eq!(area, Area::Kernfs);
         assert!(bpf_host.is_dir());
+        assert!(std::fs::read_dir(&bpf_host).unwrap().next().is_none());
         assert!(!bpf_host.starts_with(&image_sys));
         let (bpf, target, fstype) = (at("bpf"), at("/sys/fs/bpf"), at("bpf"));
         let flags = 2 | 4 | 8;
