@@ -478,12 +478,24 @@ MS_NOSUID|MS_NODEV|MS_NOEXEC)` is `ENOENT` at call 10411.
 itself return `ENOENT`. The mount point was created only when the
 area was kernfs or writable, which the Linux unit set up and the Mac
 image is not. NetBpfLoad's `mkdir("/sys/fs/bpf/tethering")` is
-`ENOENT`. `bpf()` was not called. The bpf mount on guest path
-`/sys/fs/bpf` now installs an empty bpffs without creating a
-directory in the image, and `mkdir` of `tethering` is on that bpffs.
-Any other missing path stays `ENOENT`, including `/sys/fs/pstore`.
-`sysfs` stays `ENODEV`. A later `bpf` operation that is not
-implemented returns its own errno. This is not Mac-remeasured. The pinned layer has 35
+`ENOENT`. `bpf()` was not called. Writing `0` to
+`unprivileged_bpf_disabled` is the Android V+ value and is not a bug.
+`46ac521f9d2055bef529d7950c4833967fd50d3d` (archive SHA256
+`dfbd4f4a3418b4888ebd2f15e2c24130248098494a746cad6ba507d287a111a0`,
+SHA256SUMS `caf27b966144fad4cc099ab834a46c437bf9be05b5c367a84c70993fba87c8be`,
+started 2026-11-26 09:07:15 Asia/Kuala_Lumpur) did not reach init.
+`linux-run` exited 101: `st.st_mode` is `u16` on Darwin and the new
+`stat` helper returned `u32` (`E0308` at `mount.rs:156`). That
+approach, mounting bpffs over a missing image path, is not the fix.
+`mount` of fstype `sysfs` now installs a kernfs. Its host directory
+has the kernel's top-level mount points, including `/sys/fs`, and
+nothing is created in the image. Userspace mkdirs `/sys/fs/bpf` on
+that sysfs, then `mount` of fstype `bpf` installs an empty bpffs on
+the existing directory, and `mkdir` of `tethering` is on the bpffs.
+A missing path stays `ENOENT`, including `/sys/fs/pstore` and
+`/sys/fs/selinux`. A remount whose path is not a mount root, or whose
+fstype is not the one mounted there, is `EINVAL`. `bpf()` is
+unchanged. This is not Mac-remeasured. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has
