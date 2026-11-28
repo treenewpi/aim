@@ -432,7 +432,7 @@ impl AppHost {
             }),
             Message::Action { code } => call(PERFORM_EDITOR_ACTION, &|p| p.write_i32(*code)),
             Message::Key { code } => {
-                let now = super::clock_ms(libc::CLOCK_UPTIME_RAW);
+                let now = super::clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
                 for action in [ACTION_DOWN, ACTION_UP] {
                     call(SEND_KEY_EVENT, &|p| {
                         p.write_i32(1);

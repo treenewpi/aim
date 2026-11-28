@@ -134,10 +134,10 @@ impl Shared {
     }
 
     /// A POSIX record lock request on byte `at` of the file.
-    fn lock(&self, at: i64, kind: i16, wait: bool) -> i32 {
+    fn lock(&self, at: i64, kind: impl Into<i32>, wait: bool) -> i32 {
         // SAFETY: an all-zero flock is valid.
         let mut range: libc::flock = unsafe { std::mem::zeroed() };
-        range.l_type = kind;
+        range.l_type = kind.into() as _;
         range.l_whence = libc::SEEK_SET as i16;
         range.l_start = at;
         range.l_len = 1;

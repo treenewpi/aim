@@ -20,6 +20,9 @@ pub struct Copy {
     pub offset: u64,
     pub dev: u64,
     pub ino: u64,
+    /// Anonymous memory filled from the file. A host file mapping is
+    /// `false`: the guest range is the file, not a copy.
+    pub anonymous: bool,
 }
 
 static COPIES: Mutex<BTreeMap<u64, Copy>> = Mutex::new(BTreeMap::new());
@@ -56,11 +59,23 @@ pub fn note(start: u64, len: u64, host: &Path, guest: &str, offset: u64) {
         use std::os::unix::fs::MetadataExt;
         (m.dev() as u32 as u64, m.ino())
     });
-    note_file(start, len, host, guest, offset, (dev, ino));
+    note_file(start, len, host, guest, offset, (dev, ino), true);
 }
 
 /// As [`note`], for the file with device and inode `id`.
-pub fn note_file(start: u64, len: u64, host: &Path, guest: &str, offset: u64, id: (u64, u64)) {
+///
+/// `anonymous` is set when the guest range is a private copy rather than
+/// a host file mapping. `/proc/self/maps` still names the file it was
+/// filled from.
+pub fn note_file(
+    start: u64,
+    len: u64,
+    host: &Path,
+    guest: &str,
+    offset: u64,
+    id: (u64, u64),
+    anonymous: bool,
+) {
     let (dev, ino) = id;
     forget(start, start + len);
     COPIES.lock().unwrap().insert(
@@ -72,8 +87,16 @@ pub fn note_file(start: u64, len: u64, host: &Path, guest: &str, offset: u64, id
             offset,
             dev,
             ino,
+            anonymous,
         },
     );
+}
+
+/// True when `[lo, hi)` overlaps a private copy that is not a file mapping.
+pub fn covers_anonymous(lo: u64, hi: u64) -> bool {
+    covered(lo, hi).into_iter().any(|(_, _, copy)| {
+        copy.is_some_and(|(c, _)| c.anonymous)
+    })
 }
 
 /// The copy containing `addr`, with the file offset of `addr`.
@@ -81,6 +104,39 @@ pub fn find(addr: u64) -> Option<(Copy, u64)> {
     let m = COPIES.lock().unwrap();
     let (s, c) = m.range(..=addr).next_back()?;
     (addr < c.end).then(|| (c.clone(), c.offset + (addr - s)))
+}
+
+/// `[lo, hi)` cut at copy boundaries. `Some` is the file-backed piece and
+/// the file offset of its start. `None` is a gap: anonymous, including the
+/// ELF `.bss` that starts on the next 4 KiB page after the file bytes.
+pub fn covered(lo: u64, hi: u64) -> Vec<(u64, u64, Option<(Copy, u64)>)> {
+    if lo >= hi {
+        return Vec::new();
+    }
+    let m = COPIES.lock().unwrap();
+    let mut out = Vec::new();
+    let mut cur = lo;
+    let from = m
+        .range(..lo)
+        .next_back()
+        .filter(|(_, c)| c.end > lo)
+        .map_or(lo, |(&s, _)| s);
+    for (&key, c) in m.range(from..hi) {
+        let start = key.max(lo);
+        let end = c.end.min(hi);
+        if start >= end {
+            continue;
+        }
+        if start > cur {
+            out.push((cur, start, None));
+        }
+        out.push((start, end, Some((c.clone(), c.offset + (start - key)))));
+        cur = end;
+    }
+    if cur < hi {
+        out.push((cur, hi, None));
+    }
+    out
 }
 
 /// mremap moved `[old, old+len)` to `new`.
@@ -120,6 +176,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
         w.u64(c.offset);
         w.u64(c.dev);
         w.u64(c.ino);
+        w.bool(c.anonymous);
     });
 }
 
@@ -134,8 +191,55 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 offset: r.u64(),
                 dev: r.u64(),
                 ino: r.u64(),
+                anonymous: r.bool(),
             },
         )
     });
     COPIES.lock().unwrap().extend(v);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn bss_on_the_next_guest_page_is_not_a_file_copy() {
+        // Measured init PR_SET_VMA ranges. The file VMA ends where bionic's
+        // 4 KiB PAGE_END(filesz) ends. Naming starts there.
+        let path = Path::new("/system/bin/init");
+        note_file(
+            0x8000_4c40_00,
+            0x1000,
+            path,
+            "/system/bin/init",
+            0x4c_4000,
+            (1, 2),
+            true,
+        );
+        note_file(
+            0x8000_2f80_00,
+            0x1000,
+            path,
+            "/system/bin/init",
+            0x2f_8000,
+            (1, 2),
+            true,
+        );
+        assert!(
+            covered(0x8000_4c50_00, 0x8000_4d80_00)
+                .iter()
+                .all(|(_, _, copy)| copy.is_none())
+        );
+        assert!(
+            covered(0x8000_2f90_00, 0x8000_2fa0_00)
+                .iter()
+                .all(|(_, _, copy)| copy.is_none())
+        );
+        let across = covered(0x8000_4c40_00, 0x8000_4c60_00);
+        assert!(across[0].2.is_some());
+        assert!(across[1].2.is_none());
+        assert_eq!(across[0].1, 0x8000_4c50_00);
+        forget(0x8000_2f80_00, 0x8000_4d80_00);
+    }
 }

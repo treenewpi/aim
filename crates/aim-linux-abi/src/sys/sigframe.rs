@@ -164,7 +164,9 @@ const _: () = assert!(std::mem::offset_of!(DarwinMcontext, v) == 288);
 /// `uc` must be the ucontext a Darwin signal handler received.
 pub unsafe fn mcontext<'a>(uc: *mut libc::c_void) -> &'a mut DarwinMcontext {
     // SAFETY: caller contract; uc_mcontext points at the saved state.
-    unsafe { &mut *((*(uc as *mut libc::ucontext_t)).uc_mcontext as *mut DarwinMcontext) }
+    unsafe {
+        &mut *(aim_storage::host::mcontext_ptr(uc as *mut libc::ucontext_t) as *mut DarwinMcontext)
+    }
 }
 
 const NZCV: u64 = 0xf000_0000;
@@ -471,12 +473,20 @@ pub fn translate_fault(hsig: i32, host_code: i32, si_addr: u64, m: &DarwinMconte
             let addr = if stale { si_addr } else { m.far };
             if data_abort && esr & 0x3f == 0x21 {
                 (SIGBUS, BUS_ADRALN, addr)
+            } else if super::mem::past_eof_bus(addr) {
+                (SIGBUS, BUS_ADRERR, addr)
             } else if (super::window::BASE..super::window::BASE + 0x1000).contains(&addr) {
                 // The first page of ART's heap window is the null page of
                 // heap references (offset 0 is null): report the access
                 // as the null-page fault an implicit null check expects.
                 (SIGSEGV, SEGV_MAPERR, addr - super::window::BASE)
             } else {
+                if insn_abort {
+                    // A slice that wants execute while a neighbor wants write
+                    // is not executable. Name that window. The classification
+                    // below is still SIGSEGV at this address. Do not emulate.
+                    super::mem::note_exec_window(addr);
+                }
                 let need = if insn_abort {
                     libc::PROT_EXEC
                 } else if data_abort && esr & (1 << 6) != 0 {

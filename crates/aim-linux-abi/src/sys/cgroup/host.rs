@@ -157,8 +157,8 @@ struct Suppression {
 }
 
 unsafe extern "C" {
-    static mach_task_self_: libc::mach_port_t;
-    fn task_policy_set(task: libc::mach_port_t, flavor: u32, policy: *mut i32, count: u32) -> i32;
+    static mach_task_self_: crate::mach_port_t;
+    fn task_policy_set(task: crate::mach_port_t, flavor: u32, policy: *mut i32, count: u32) -> i32;
 }
 
 /// Apply in the target process, where Darwin permits thread QoS and disk
@@ -292,8 +292,8 @@ pub(super) fn update(
     Ok(())
 }
 
-pub(crate) fn qos(qos: i32, min: i32, max: i32) -> libc::qos_class_t {
-    use libc::qos_class_t::*;
+pub(crate) fn qos(qos: i32, min: i32, max: i32) -> crate::qos_class_t {
+    use crate::qos_class_t::*;
     match qos.max(min).min(max) {
         BACKGROUND => QOS_CLASS_BACKGROUND,
         UTILITY => QOS_CLASS_UTILITY,

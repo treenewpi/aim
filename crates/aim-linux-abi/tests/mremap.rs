@@ -93,6 +93,84 @@ fn byte(addr: u64) -> u8 {
     unsafe { (addr as *const u8).read() }
 }
 
+fn mprotect(addr: u64, len: usize, prot: u64) -> i64 {
+    syscall(226, [addr, len as u64, prot, 0, 0, 0])
+}
+
+/// Bionic's CFI shadow update: one 4 KiB page, `MREMAP_MAYMOVE|MREMAP_FIXED`,
+/// onto an address that is 4 KiB-aligned and not 16 KiB-aligned. The slice
+/// moves. The other slices of both host pages stay. The host page is not
+/// writable and executable together.
+#[test]
+fn fixed_mremap_moves_one_guest_page() {
+    let _serial = serial();
+    let src = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let dst_base = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let dst = dst_base + 0x1000;
+    assert_eq!(src & 0x3fff, 0);
+    assert_eq!(dst & 0xfff, 0);
+    assert_ne!(dst & 0x3fff, 0);
+    fill(src, 0x1000, 0x5a);
+    fill(src + 0x1000, 0x1000, 0x11);
+    fill(dst_base, 0x1000, 0x22);
+    fill(dst, 0x1000, 0x33);
+    fill(dst + 0x1000, 0x1000, 0x44);
+    assert_eq!(
+        mprotect(src, 0x1000, libc::PROT_READ as u64 | libc::PROT_EXEC as u64),
+        0
+    );
+    let moved = mremap(src, 0x1000, 0x1000, MAYMOVE | FIXED, dst);
+    assert_eq!(moved, dst as i64);
+    assert_eq!(byte(dst), 0x5a);
+    assert_eq!(byte(dst + 16), 0x5a);
+    assert_eq!(byte(src + 0x1000), 0x11);
+    assert_eq!(byte(dst_base), 0x22);
+    assert_eq!(byte(dst + 0x1000), 0x44);
+    let (_start, _end, prot, _shared) = patch::vm::region(dst).expect("dest host page");
+    assert_eq!(
+        prot & (libc::PROT_WRITE | libc::PROT_EXEC),
+        libc::PROT_WRITE,
+        "host prot {prot:#x}"
+    );
+    assert_eq!(
+        mremap(src, 0x1000, 0x1000, MAYMOVE | FIXED, dst + 0x2000),
+        -(libc::EFAULT as i64)
+    );
+    assert_eq!(
+        mremap(dst_base, 0x2000, 0x2000, MAYMOVE | FIXED, dst_base + 0x1000),
+        -(libc::EINVAL as i64)
+    );
+    assert_eq!(
+        mremap(src + 0x1000, 0x1000, 0x1000, FIXED, dst + 0x2000),
+        -(libc::EINVAL as i64)
+    );
+    // The published slice and the shadow page are both read-only. The
+    // temporary write of the moved bytes must be put back.
+    let ro_src = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let ro_base = map(PAGE, libc::PROT_READ | libc::PROT_WRITE);
+    let ro = ro_base + 0x1000;
+    fill(ro_src, 0x1000, 0xab);
+    fill(ro_src + 0x1000, 0x1000, 0xcd);
+    fill(ro_base, 0x1000, 0x21);
+    fill(ro + 0x1000, 0x1000, 0x43);
+    assert_eq!(mprotect(ro_src, PAGE, libc::PROT_READ as u64), 0);
+    assert_eq!(mprotect(ro_base, PAGE, libc::PROT_READ as u64), 0);
+    assert_eq!(
+        mremap(ro_src, 0x1000, 0x1000, MAYMOVE | FIXED, ro),
+        ro as i64
+    );
+    assert_eq!(byte(ro), 0xab);
+    assert_eq!(byte(ro_base), 0x21);
+    assert_eq!(byte(ro + 0x1000), 0x43);
+    assert_eq!(byte(ro_src + 0x1000), 0xcd);
+    let (_start, _end, prot, _shared) = patch::vm::region(ro).expect("read-only dest host page");
+    assert_eq!(
+        prot & (libc::PROT_WRITE | libc::PROT_EXEC),
+        0,
+        "read-only shadow stayed writable: host prot {prot:#x}"
+    );
+}
+
 #[test]
 fn fixed_move_replaces_the_target_and_unmaps_the_source() {
     let _serial = serial();

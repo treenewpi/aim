@@ -568,6 +568,7 @@ pub fn translate(bytes: &[u8], opts: &Options) -> Result<Translation, String> {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "macos")]
 mod exec_tests;
 #[cfg(test)]
 mod tests;

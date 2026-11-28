@@ -59,7 +59,7 @@ fn connect(fd: i32, endpoint: &aim_binder_host::socket_scm::Endpoint) -> Result<
         return Err(errno::EINVAL);
     }
     address.sun_family = libc::AF_UNIX as _;
-    address.sun_len = (2 + endpoint.path.len() + 1) as u8;
+    aim_storage::host::set_sun_len(&mut address, (2 + endpoint.path.len() + 1) as u8);
     for (target, source) in address.sun_path.iter_mut().zip(&endpoint.path) {
         *target = *source as _;
     }
@@ -67,7 +67,7 @@ fn connect(fd: i32, endpoint: &aim_binder_host::socket_scm::Endpoint) -> Result<
         libc::connect(
             fd,
             (&address as *const libc::sockaddr_un).cast(),
-            address.sun_len as _,
+            aim_storage::host::sun_len(&address) as _,
         )
     };
     if result < 0 {

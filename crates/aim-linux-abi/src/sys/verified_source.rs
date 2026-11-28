@@ -20,6 +20,29 @@ pub struct VerifiedSource {
 fn io(error: std::io::Error) -> Errno {
     errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
 }
+
+/// The guest ids and mode that made an exec check return `error`. The
+/// decision is unchanged; this is the line a later log did not have.
+fn note_denied(kind: &str, path: &str, error: Errno) {
+    if !super::tracing() {
+        return;
+    }
+    let id = cred::current();
+    let (host, _) = crate::vfs::lookup(path);
+    let view = match attrs::path_stat(path) {
+        Ok(st) => format!(
+            "st_uid={} st_gid={} st_mode={:#o}",
+            st.st_uid, st.st_gid, st.st_mode
+        ),
+        Err(stat_error) => format!("stat errno={stat_error}"),
+    };
+    crate::diag!(
+        "[linux-abi] exec: stage=interpret reason={kind} path=\"{path}\" host=\"{}\" errno={error} uid={} gid={} {view}",
+        host.display(),
+        id.uid[attrs::FS],
+        id.gid[attrs::FS]
+    );
+}
 impl VerifiedSource {
     pub fn from_descriptor(
         fd: BorrowedFd<'_>,
@@ -72,6 +95,16 @@ impl VerifiedSource {
     /// Native loader path after generic guest resolution. Guest pathname policy
     /// is checked against the pinned descriptor rather than host user rights.
     pub fn open(host: &CStr, execute: bool) -> Result<Self, Errno> {
+        let guest = crate::vfs::guest_path_of_host(std::path::Path::new(
+            std::ffi::OsStr::from_bytes(host.to_bytes()),
+        ));
+        Self::open_guest(host, guest.as_deref(), execute)
+    }
+
+    /// [`open`] of the path `execve` already resolved. That string is the
+    /// walk Linux checked. Mapping the host path again can name a different
+    /// guest path, and an fd stat reads a guest inode the image stat ignores.
+    pub fn open_guest(host: &CStr, guest: Option<&str>, execute: bool) -> Result<Self, Errno> {
         let data = PrivateFd::allocate(|| {
             let fd = unsafe { libc::open(host.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
             if fd < 0 {
@@ -80,9 +113,6 @@ impl VerifiedSource {
             Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
         })
         .map_err(io)?;
-        let guest = crate::vfs::guest_path_of_host(std::path::Path::new(
-            std::ffi::OsStr::from_bytes(host.to_bytes()),
-        ));
         if let Some(guest) = guest {
             let id = cred::current();
             let mut at = String::from("/");
@@ -94,24 +124,36 @@ impl VerifiedSource {
                 .split_last()
                 .map_or(&[][..], |(_, parents)| parents)
             {
-                attrs::search(&at, &id, attrs::FS, None)?;
+                if let Err(error) = attrs::search(&at, &id, attrs::FS, None) {
+                    note_denied("guest-search", &at, error);
+                    return Err(error);
+                }
                 if at != "/" {
                     at.push('/');
                 }
                 at.push_str(component);
             }
-            attrs::search(&at, &id, attrs::FS, None)?;
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(data.as_raw_fd(), &mut stat) } < 0 {
-                return Err(errno::last());
+            if let Err(error) = attrs::search(&at, &id, attrs::FS, None) {
+                note_denied("guest-search", &at, error);
+                return Err(error);
             }
-            attrs::apply(attrs::Host::Fd(data.as_raw_fd()), || guest, &mut stat);
+            // The same view `path_stat` uses. An image file's android inode
+            // is that view; a guest inode on the fd is not.
+            let stat = match attrs::path_stat(guest) {
+                Ok(stat) => stat,
+                Err(error) => {
+                    note_denied("guest-stat", guest, error);
+                    return Err(error);
+                }
+            };
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                note_denied("guest-type", guest, errno::EACCES);
                 return Err(errno::EACCES);
             }
             if attrs::recording()
                 && !attrs::permits(&stat, if execute { 1 } else { 4 }, &id, attrs::FS)
             {
+                note_denied("guest-mode", guest, errno::EACCES);
                 return Err(errno::EACCES);
             }
         }

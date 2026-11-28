@@ -665,8 +665,11 @@ fn save_vfork(w: &mut Writer, pipe: Option<(i32, i32)>) {
 /// Fork the calling guest thread's process; the child's pid.
 pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Result<i32, i64> {
     let exe = super::super::exec::launch_exe().ok_or(-(libc::ENOEXEC as i64))?;
-    let mount_text =
-        crate::vfs::fork_mounts_text(setup.new_mount_namespace).map_err(|error| -(error as i64))?;
+    let mount_text = crate::vfs::fork_mounts_text(setup.new_mount_namespace).map_err(|error| {
+        let error = -(error as i64);
+        crate::diag!("[linux-abi] clone: parent mount text errno {error}");
+        error
+    })?;
     let mut w = Writer::default();
     w.u64(setup.stack);
     w.opt(setup.tls, |w, v| w.u64(v));
@@ -728,7 +731,7 @@ pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Resu
     let writer_receipts = fdtab::fork_writer_receipts().map_err(|error| -(error as i64))?;
     let (fds, guest_receipts) = fdtab::fork_guest_snapshot().map_err(|error| -(error as i64))?;
     super::super::procfs::fork_prepare();
-    state::save_files(&mut w, &mount_text);
+    state::save_files(&mut w, &mount_text, setup.new_mount_namespace);
     let diag = crate::diag::log_fd();
     if !fds.iter().any(|(fd, ..)| *fd == diag) {
         w.retain_private(diag);
@@ -761,12 +764,15 @@ pub fn fork(ctx: &GuestContext, setup: &ChildSetup, runtime: &[CString]) -> Resu
         Ok(pid) => {
             if let Err(error) = crate::vfs::publish_fork_mounts(pid, &mount_text) {
                 abandon(pid, port);
-                return Err(-(error as i64));
+                let error = -(error as i64);
+                crate::diag!("[linux-abi] clone: parent publish mounts errno {error}");
+                return Err(error);
             }
             // Before the handover: the child keeps this entry.
             crate::sys::cred::note_child(pid);
             if let Err(error) = crate::sys::pty_owner::inherit_child(pid) {
                 abandon(pid, port);
+                crate::diag!("[linux-abi] clone: parent pty inherit errno {error}");
                 return Err(-(error as i64));
             }
             if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
@@ -995,22 +1001,32 @@ fn spawn_program_suspended(
     struct Setup {
         attr: libc::posix_spawnattr_t,
         actions: libc::posix_spawn_file_actions_t,
+        attr_on: bool,
+        actions_on: bool,
     }
     impl Drop for Setup {
         fn drop(&mut self) {
             unsafe {
-                if !self.actions.is_null() {
+                if self.actions_on {
                     libc::posix_spawn_file_actions_destroy(&mut self.actions);
                 }
-                if !self.attr.is_null() {
+                if self.attr_on {
                     libc::posix_spawnattr_destroy(&mut self.attr);
                 }
             }
         }
     }
     let mut setup = Setup {
+        #[cfg(target_os = "macos")]
         attr: std::ptr::null_mut(),
+        #[cfg(target_os = "macos")]
         actions: std::ptr::null_mut(),
+        #[cfg(not(target_os = "macos"))]
+        attr: unsafe { std::mem::zeroed() },
+        #[cfg(not(target_os = "macos"))]
+        actions: unsafe { std::mem::zeroed() },
+        attr_on: false,
+        actions_on: false,
     };
     let mut pid = 0;
     let checked = |error: i32| {
@@ -1022,21 +1038,23 @@ fn spawn_program_suspended(
     };
     unsafe {
         checked(libc::posix_spawnattr_init(&mut setup.attr))?;
+        setup.attr_on = true;
         aim_process::disclaim(&mut setup.attr).map_err(|error| {
             -(errno::from_darwin(error.raw_os_error().unwrap_or(libc::ENOSYS)) as i64)
         })?;
         checked(libc::posix_spawn_file_actions_init(&mut setup.actions))?;
-        let mut all: libc::sigset_t = 0;
+        setup.actions_on = true;
+        let mut all = crate::hostlibc::empty_sigset();
         libc::sigfillset(&mut all);
-        let none: libc::sigset_t = 0;
+        let none = crate::hostlibc::empty_sigset();
         checked(libc::posix_spawnattr_setsigdefault(&mut setup.attr, &all))?;
         checked(libc::posix_spawnattr_setsigmask(&mut setup.attr, &none))?;
         checked(libc::posix_spawnattr_setflags(
             &mut setup.attr,
-            (libc::POSIX_SPAWN_CLOEXEC_DEFAULT
-                | libc::POSIX_SPAWN_SETSIGDEF
-                | libc::POSIX_SPAWN_SETSIGMASK
-                | if suspended { 0x80 } else { 0 }) as i16,
+            (aim_storage::host::POSIX_SPAWN_CLOEXEC_DEFAULT as i32
+                | libc::POSIX_SPAWN_SETSIGDEF as i32
+                | libc::POSIX_SPAWN_SETSIGMASK as i32
+                | if suspended { 0x80 } else { 0 }) as _,
         ))?;
         let mut ports = [port];
         checked(posix_spawnattr_set_registered_ports_np(
@@ -1051,16 +1069,74 @@ fn spawn_program_suspended(
                 libc::posix_spawn_file_actions_adddup2(&mut setup.actions, source, target)
             })?;
         }
-        checked(libc::posix_spawn(
+        // Darwin `posix_spawn` returns `ENOENT` when the calling thread's
+        // cwd cannot be opened, and attributes it to the executable. The
+        // guest `clone` did not name that path.
+        repair_host_cwd(std::path::Path::new(exe.to_str().unwrap_or("")).parent());
+        let spawned = libc::posix_spawn(
             &mut pid,
             exe.as_ptr(),
             &setup.actions,
             &setup.attr,
             argv.as_ptr() as *const *mut libc::c_char,
             *_NSGetEnviron() as *const *mut libc::c_char,
-        ))?;
+        );
+        if let Err(error) = map_spawn_errno(exe, spawned) {
+            return Err(error);
+        }
     }
     Ok(pid)
+}
+
+/// `posix_spawn`'s errno, as a guest `clone` result. A host `ENOENT` (the
+/// executable path, or Darwin failing to open `.`) is not a missing guest
+/// path; it is traced and reported as `EIO`.
+pub(crate) fn map_spawn_errno(exe: &std::ffi::CStr, spawned: i32) -> Result<(), i64> {
+    if spawned == 0 {
+        return Ok(());
+    }
+    let guest = errno::from_darwin(spawned);
+    if guest == libc::ENOENT {
+        crate::diag!(
+            "[linux-abi] fork: posix_spawn {} returned ENOENT (host path, not a guest path)",
+            exe.to_string_lossy()
+        );
+        return Err(-(crate::errno::EIO as i64));
+    }
+    Err(-(guest as i64))
+}
+
+/// Darwin `posix_spawn` opens `.` for the child. If that directory is gone,
+/// the spawn returns `ENOENT` for the executable. Move the host cwd to
+/// `fallback` (or `/`) so the next spawn is not that error. The guest cwd
+/// is the VFS one and is left as it is.
+pub(crate) fn repair_host_cwd(fallback: Option<&std::path::Path>) {
+    let probe = unsafe {
+        libc::open(
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if probe >= 0 {
+        unsafe { libc::close(probe) };
+        return;
+    }
+    let error = errno::last();
+    let dir = fallback.unwrap_or(std::path::Path::new("/"));
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new("/")
+    } else {
+        dir
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    crate::diag!(
+        "[linux-abi] host cwd is not a directory (errno {error}); chdir {}",
+        dir.display()
+    );
+    unsafe { libc::chdir(path.as_ptr()) };
 }
 
 #[cfg(test)]
@@ -1731,9 +1807,31 @@ fn become_child(h: Handover) -> String {
     super::child_started(c, stack, set_tid, clear_tid);
     if let Some(p) = thread_of {
         super::super::procrec::set_tgid(p);
+    } else {
+        note_child_apex();
     }
     // SAFETY: this thread's context, holding the forking thread's registers.
     unsafe { context::resume(ctx) }
+}
+
+/// The child's apex mounts, after `clone` has a pid. A fork without
+/// `CLONE_NEWNS` reloaded the namespace journal. The program this child
+/// will exec, and that program's `PT_INTERP`, are not known yet: `execve`
+/// logs the interpreter it actually resolves.
+fn note_child_apex() {
+    if !crate::sys::tracing() {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    let apex = crate::vfs::own_mounts_text()
+        .lines()
+        .filter(|line| line.contains("/apex"))
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let page = super::super::exec::probe_page("/apex/com.android.runtime/bin/linker64");
+    crate::diag!("[linux-abi] fork child pid={pid} linker64 {page} apex={apex}");
 }
 
 fn confirm_ready(parent: Port, member: u64) -> Result<(), String> {

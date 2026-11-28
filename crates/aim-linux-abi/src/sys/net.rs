@@ -618,7 +618,7 @@ fn own_cred() -> Cred {
 }
 
 fn peer_cred(fd: i32) -> Option<Cred> {
-    Some(cred_of(get_int(fd, 0, libc::LOCAL_PEERPID)?))
+    Some(cred_of(get_int(fd, 0, aim_storage::host::LOCAL_PEERPID)?))
 }
 
 const FRAME: usize = 16;
@@ -1007,7 +1007,7 @@ fn new_host_socket(domain: i32, ty: i32) -> Result<i32, i64> {
     if fd < 0 {
         return Err(-(errno::last() as i64));
     }
-    set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1);
+    set_int(fd, libc::SOL_SOCKET, aim_storage::host::SO_NOSIGPIPE, 1);
     Ok(fd)
 }
 
@@ -1082,7 +1082,7 @@ pub fn socket(a: [u64; 6]) -> i64 {
                 }
                 return -(error as i64);
             }
-            set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1);
+            set_int(fd, libc::SOL_SOCKET, aim_storage::host::SO_NOSIGPIPE, 1);
             let groups = match super::bpf::socket_cgroup() {
                 Ok(groups) => groups,
                 Err(error) => {
@@ -1197,7 +1197,7 @@ pub fn socketpair(a: [u64; 6]) -> i64 {
         return -(errno::last() as i64);
     }
     for fd in fds {
-        set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1);
+        set_int(fd, libc::SOL_SOCKET, aim_storage::host::SO_NOSIGPIPE, 1);
         setup_unix(fd, st);
         fdtab::set_flags(fd, ty & L_SOCK_NONBLOCK != 0, ty & L_SOCK_CLOEXEC != 0);
         fdtab::insert(fd, Kind::Sock(Sock::new(st)));
@@ -1418,11 +1418,12 @@ pub fn connect(a: [u64; 6]) -> i64 {
             // `unix_dgram_connect` of AF_UNSPEC disconnects; Darwin's
             // connect does, then fails with EINVAL.
             if let Some(s) = any_sock(&input).filter(|s| s.unix_datagram()) {
-                let unspec = libc::sockaddr {
-                    sa_len: 2,
-                    sa_family: libc::AF_UNSPEC as u8,
-                    sa_data: [0; 14],
-                };
+                let mut unspec: libc::sockaddr = unsafe { std::mem::zeroed() };
+                #[cfg(target_os = "macos")]
+                {
+                    unspec.sa_len = 2;
+                }
+                unspec.sa_family = libc::AF_UNSPEC as _;
                 let connected = had_peer(&s, fd);
                 // SAFETY: a sockaddr of ours, of its length.
                 unsafe { libc::connect(fd, &unspec, 2) };
@@ -1746,7 +1747,7 @@ pub fn accept4(a: [u64; 6]) -> i64 {
         flags & L_SOCK_NONBLOCK != 0,
         flags & L_SOCK_CLOEXEC != 0,
     );
-    set_int(nfd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1);
+    set_int(nfd, libc::SOL_SOCKET, aim_storage::host::SO_NOSIGPIPE, 1);
     let peer = linux_addr_of_host(&sa, len);
     if let Some(l) = sock(&input) {
         let s = Sock::new(l.ty);
@@ -1861,7 +1862,7 @@ fn name_of(input: &SocketInput, peer: bool, out: u64, outlen: u64) -> i64 {
         let known = if peer { &s.peer } else { &s.local };
         if let Some(n) = known.lock().unwrap().clone() {
             // A peer name is only valid while connected.
-            if !peer || get_int(fd, 0, libc::LOCAL_PEERPID).is_some() {
+            if !peer || get_int(fd, 0, aim_storage::host::LOCAL_PEERPID).is_some() {
                 user_try!(put_addr(&n, out, outlen));
                 return 0;
             }
@@ -2466,10 +2467,10 @@ fn sendmsg_host(
         m.msg_namelen = len;
     }
     m.msg_iov = iov.as_mut_ptr();
-    m.msg_iovlen = iov.len() as i32;
+    m.msg_iovlen = iov.len() as _;
     if !ctrl.is_empty() {
         m.msg_control = ctrl.as_mut_ptr().cast();
-        m.msg_controllen = ctrl.len() as u32;
+        m.msg_controllen = ctrl.len() as _;
     }
     // SAFETY: a msghdr over live buffers.
     errno::check(unsafe { libc::sendmsg(fd, &m, flags) } as i64)
@@ -2945,10 +2946,10 @@ fn recvmsg_host(
         m.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
     }
     m.msg_iov = iov.as_mut_ptr();
-    m.msg_iovlen = iov.len() as i32;
+    m.msg_iovlen = iov.len() as _;
     if !ctrl.is_empty() {
         m.msg_control = ctrl.as_mut_ptr().cast();
-        m.msg_controllen = ctrl.len() as u32;
+        m.msg_controllen = ctrl.len() as _;
     }
     // SAFETY: a msghdr over live buffers.
     let r = unsafe { libc::recvmsg(fd, &mut m, flags) };
@@ -2978,7 +2979,7 @@ pub(super) fn fionread(fd: i32) -> Option<Result<i32, i64>> {
     };
     match (&s.family, s.ty) {
         (Family::Inet(o), _) if o.link_udp.load(Ordering::Relaxed) => Some(
-            get_int(fd, libc::SOL_SOCKET, libc::SO_NREAD)
+            get_int(fd, libc::SOL_SOCKET, aim_storage::host::SO_NREAD)
                 .map(|n| (n - 16).max(0))
                 .ok_or_else(|| -(errno::last() as i64)),
         ),
@@ -2996,7 +2997,7 @@ pub(super) fn fionread(fd: i32) -> Option<Result<i32, i64>> {
 /// The first queued datagram's payload: Darwin's SO_NREAD (the first
 /// record's data), less the header of a framed one.
 fn next_datagram(fd: i32) -> Result<i32, i64> {
-    let Some(n) = get_int(fd, libc::SOL_SOCKET, libc::SO_NREAD) else {
+    let Some(n) = get_int(fd, libc::SOL_SOCKET, aim_storage::host::SO_NREAD) else {
         return Err(-(errno::last() as i64));
     };
     if (n as usize) < FRAME {
@@ -3794,7 +3795,7 @@ fn set_buffer(fd: i32, opt: u64, v: i32) -> i64 {
     let mut len = std::mem::size_of::<i32>();
     // SAFETY: an int sysctl into a local of its size.
     let read = unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c"kern.ipc.maxsockbuf".as_ptr(),
             (&mut max as *mut i32).cast(),
             &mut len,
@@ -3824,7 +3825,7 @@ fn int_option(level: u64, opt: u64) -> Option<(i32, i32)> {
         (1, L_SO_SNDLOWAT) => (libc::SOL_SOCKET, libc::SO_SNDLOWAT),
         (1, L_SO_ACCEPTCONN) => (libc::SOL_SOCKET, libc::SO_ACCEPTCONN),
         (IPPROTO_TCP, 1) => (libc::IPPROTO_TCP, libc::TCP_NODELAY),
-        (IPPROTO_TCP, 4) => (libc::IPPROTO_TCP, libc::TCP_KEEPALIVE),
+        (IPPROTO_TCP, 4) => (libc::IPPROTO_TCP, aim_storage::host::TCP_KEEPALIVE),
         (IPPROTO_TCP, 5) => (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
         (IPPROTO_TCP, 6) => (libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
         (IPPROTO_IP, 1) => (libc::IPPROTO_IP, libc::IP_TOS),
@@ -3985,7 +3986,7 @@ pub fn setsockopt(a: [u64; 6]) -> i64 {
             let t = user_read!(val, [i64; 2]);
             let tv = libc::timeval {
                 tv_sec: t[0],
-                tv_usec: t[1] as i32,
+                tv_usec: t[1] as _,
             };
             let o = if matches!(opt, L_SO_RCVTIMEO | L_SO_RCVTIMEO_NEW) {
                 libc::SO_RCVTIMEO
@@ -4194,9 +4195,9 @@ fn bind_host_interface(fd: i32, index: u32) -> Result<(), errno::Errno> {
     unsafe { libc::getsockname(fd, (&mut sa as *mut libc::sockaddr_storage).cast(), &mut sl) };
     let v6 = sa.ss_family as i32 == libc::AF_INET6;
     let (l, o) = if v6 {
-        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+        (libc::IPPROTO_IPV6, aim_storage::host::IPV6_BOUND_IF)
     } else {
-        (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+        (libc::IPPROTO_IP, aim_storage::host::IP_BOUND_IF)
     };
     let i = index as i32;
     // SAFETY: an int option on the host socket.
@@ -4240,7 +4241,7 @@ fn host_protocol(fd: i32) -> i32 {
     let mut info = [0u8; SIZE];
     // SAFETY: proc_pidfdinfo into a buffer of the struct's size.
     let n = unsafe {
-        libc::proc_pidfdinfo(
+        crate::hostlibc::proc_pidfdinfo(
             libc::getpid(),
             fd,
             PROC_PIDFDSOCKETINFO,
@@ -4276,7 +4277,7 @@ fn socket_info(fd: i32) -> Option<[u8; SOCKET_FDINFO]> {
     let mut info = [0u8; SOCKET_FDINFO];
     // SAFETY: proc_pidfdinfo into a buffer of the struct's size.
     let n = unsafe {
-        libc::proc_pidfdinfo(
+        crate::hostlibc::proc_pidfdinfo(
             libc::getpid(),
             fd,
             PROC_PIDFDSOCKETINFO,

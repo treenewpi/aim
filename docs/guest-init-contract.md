@@ -91,7 +91,9 @@ kernfs	/proc	<runtime>/kernfs/proc
 | everything else | `<image>/...` | `root`, read-only | derived image |
 
 `<runtime>` defaults to `<data>.run`, beside the data directory and not
-in its image (docs/storage.md), and is recreated on every boot. Runtime
+in its image (docs/storage.md), and is recreated on every boot. linux-run
+refuses to start unless that directory, the writable layers, `TMPDIR`,
+and an unmapped guest root are on a case-sensitive volume. Runtime
 preparation creates `/dev/pts` as an actual directory for ancestor permission
 checks. Its numeric entries are the guest's own devpts instance (`sys/tty.rs`):
 the PTY owner numbers the guest's pairs, the lowest free index first, and
@@ -327,8 +329,11 @@ its host path. The table is small and written almost only by init at boot.
 `stat`, `fstat` and `newfstatat` report the inode's attribute (its absent
 fields: uid 0, gid 0, the host permission bits); without one, the table's
 fields, then an image file's original owner and mode
-(`dev.aim.android-inode`), then uid 0 and gid 0 with the host permission
-bits. Reading an attribute costs about 15 µs on the development Mac, so
+(`dev.aim.android-inode`, or `user.aim.android-inode` where the host
+rejects the first name), then that file's `fs_config` uid and gid
+(the host permission bits stay; the record's mode is not applied),
+then uid 0 and gid 0 with the host permission bits. Reading an
+attribute costs about 15 µs on the development Mac, so
 each process keeps what it read by (dev, ino) while the inode's ctime,
 which every attribute change updates, stays the same. Two known
 requirements:
@@ -384,6 +389,8 @@ A dry run of the pinned image records 43 values (dry run, 2026-09-27):
 Kernel filesystems init mounts stay unmounted: `/dev/memcg` and
 `/dev/stune` (not in `cgroups.json`), configfs, tracefs, pstore, bpf,
 functionfs and binderfs. Commands on their files are logged as no-ops.
+Original `/system/bin/init` mounts binderfs with the `mount` syscall,
+which creates `binder-control` and serves `BINDER_CTL_ADD`.
 
 The cgroup v1 controllers of `cgroups.json` the layer provides (`blkio`,
 `cpu`, `cpuset`, `aim_storage::cgroup_v1`) are mounted by `SetupCgroups` as
@@ -500,5 +507,18 @@ in the guest or passed by a service's `file` line.
   init would do: `critical process 'servicemanager' exited 4 times before
   boot completed`.
 - Tracked in #174.
+
+That list is the 2026-09-27 `linux-run`. It is not a trace of today's
+`/system/bin/init`. Those three calls are dispatched now, and original
+servicemanager has since reached `main` on the Mac. The 2026-11-19 macmini probe of `/system/bin/init` (commit `88f3d34`)
+captured the fd 2 `writev` of 149 bytes. It is Scudo's zero chunk
+header at tagged `0x2000081af1ed6c0` (untagged `0x81af1ed6c0`). That
+address is in the guest page after the 4 KiB `MADV_DONTNEED` at call
+2371. The syscall layer had rounded that discard up to 16 KiB and
+zeroed the live header. `MADV_DONTNEED` now discards 4 KiB guest
+pages. The check and the abort stay. The run still exited 6 before
+`property_info` and before any second-stage `mount`. The fix has not
+been measured again. `/linkerconfig` still contains `ld.config.txt`
+and is not replaced. See [boot-status.md](boot-status.md).
 
 The current state of the boot is in [boot-status.md](boot-status.md).

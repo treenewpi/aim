@@ -231,6 +231,7 @@ impl Device {
     fn describe(&self, conn: UnixStream) {
         let on = 1i32;
         // Disconnecting a query client must not signal the display server.
+        #[cfg(target_os = "macos")]
         let no_sigpipe = unsafe {
             libc::setsockopt(
                 conn.as_raw_fd(),
@@ -239,6 +240,12 @@ impl Device {
                 (&on as *const i32).cast(),
                 size_of::<i32>() as libc::socklen_t,
             )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let no_sigpipe = {
+            let _ = on;
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            0
         };
         if no_sigpipe < 0
             || conn.set_read_timeout(None).is_err()

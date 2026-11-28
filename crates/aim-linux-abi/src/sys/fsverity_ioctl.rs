@@ -51,7 +51,7 @@ fn enable(pin: &Pinned, arg: u64) -> Result<i64, Errno> {
     let fd = pin.descriptor().as_raw_fd();
     let stat = super::fs::stat_fd_kernel(fd).map_err(|error| (-error) as Errno)?;
     // `inode_permission(MAY_WRITE)`: an immutable inode is EPERM.
-    if stat.st_flags & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0 {
+    if aim_storage::host::file_flags(&stat) & (aim_storage::host::UF_IMMUTABLE | aim_storage::host::SF_IMMUTABLE) != 0 {
         return Err(errno::EPERM);
     }
     if !super::attrs::permits(&stat, 2, &super::cred::current(), super::attrs::FS) {
@@ -66,7 +66,7 @@ fn enable(pin: &Pinned, arg: u64) -> Result<i64, Errno> {
     {
         return Err(errno::EBADF);
     }
-    if stat.st_flags & (libc::UF_APPEND | libc::SF_APPEND) != 0 {
+    if aim_storage::host::file_flags(&stat) & (aim_storage::host::UF_APPEND | aim_storage::host::SF_APPEND) != 0 {
         return Err(errno::EPERM);
     }
     if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
@@ -348,7 +348,7 @@ mod tests {
         assert!(immutable_fd >= 0);
         let host = std::ffi::CString::new(immutable.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(
-            unsafe { libc::chflags(host.as_ptr(), libc::UF_IMMUTABLE) },
+            unsafe { aim_storage::host::chflags(host.as_ptr(), aim_storage::host::UF_IMMUTABLE) },
             0
         );
         assert_eq!(
@@ -362,7 +362,7 @@ mod tests {
             ]),
             -(errno::EPERM as i64)
         );
-        assert_eq!(unsafe { libc::chflags(host.as_ptr(), 0) }, 0);
+        assert_eq!(unsafe { aim_storage::host::chflags(host.as_ptr(), 0) }, 0);
         assert_eq!(
             super::super::fs::close([immutable_fd as u64, 0, 0, 0, 0, 0]),
             0

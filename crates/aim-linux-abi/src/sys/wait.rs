@@ -368,16 +368,16 @@ pub fn waitid(a: [u64; 6]) -> i64 {
     if unsafe { libc::waitid(htype, hid, &mut info, hopts) } < 0 {
         return -(errno::last() as i64);
     }
-    if info.si_pid == 0 && idtype == P_PIDFD && options & WNOHANG == 0 {
+    if aim_storage::host::si_pid(&info) == 0 && idtype == P_PIDFD && options & WNOHANG == 0 {
         // A non-blocking pidfd whose process is still running.
         return -(EAGAIN as i64);
     }
-    if reap_with_wait4 && info.si_pid != 0 {
+    if reap_with_wait4 && aim_storage::host::si_pid(&info) != 0 {
         let mut st = 0;
         // SAFETY: local buffers.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         let flags = libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED;
-        if unsafe { libc::wait4(info.si_pid, &mut st, flags, &mut ru) } > 0 {
+        if unsafe { libc::wait4(aim_storage::host::si_pid(&info), &mut st, flags, &mut ru) } > 0 {
             user_try!(put_rusage(&ru, rusage));
         }
     } else if rusage != 0 {
@@ -389,16 +389,20 @@ pub fn waitid(a: [u64; 6]) -> i64 {
         libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
     );
     // Read before the entry and the record go.
-    let child = (info.si_pid != 0).then(|| {
+    let child = (aim_storage::host::si_pid(&info) != 0).then(|| {
         (
-            info.si_pid,
-            child_info(info.si_pid, info.si_code, info.si_status),
-            super::signal::sender_uid(info.si_pid),
+            aim_storage::host::si_pid(&info),
+            child_info(
+                aim_storage::host::si_pid(&info),
+                info.si_code,
+                aim_storage::host::si_status(&info),
+            ),
+            super::signal::sender_uid(aim_storage::host::si_pid(&info)),
         )
     });
-    if info.si_pid != 0 && ended && options & WNOWAIT == 0 {
-        reaped(info.si_pid);
-        notice_reaped(info.si_pid);
+    if aim_storage::host::si_pid(&info) != 0 && ended && options & WNOWAIT == 0 {
+        reaped(aim_storage::host::si_pid(&info));
+        notice_reaped(aim_storage::host::si_pid(&info));
     }
     if infop != 0 {
         user_try!(put_wait_siginfo(infop, child));
@@ -438,7 +442,7 @@ impl PidFd {
         if let Some(reap) = self.reap.get().filter(|_| self.reaped()) {
             apply(
                 reap.0,
-                &[kev(REAPED, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)],
+                &[kev(REAPED, crate::hostlibc::EVFILT_USER, 0, crate::hostlibc::NOTE_TRIGGER)],
             );
         }
     }
@@ -475,7 +479,7 @@ struct ReapWatch(i32);
 impl ReapWatch {
     fn new(pid: i32) -> Result<Self, i64> {
         // SAFETY: plain kqueue creation.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { crate::hostlibc::kqueue() };
         if kq < 0 {
             return Err(-(errno::last() as i64));
         }
@@ -484,8 +488,8 @@ impl ReapWatch {
         let r = apply(
             watch.0,
             &[
-                kev(REAPED, libc::EVFILT_USER, libc::EV_ADD, 0),
-                kev(pid as usize, libc::EVFILT_PROC, libc::EV_ADD, NOTE_REAP),
+                kev(REAPED, crate::hostlibc::EVFILT_USER, crate::hostlibc::EV_ADD, 0),
+                kev(pid as usize, crate::hostlibc::EVFILT_PROC, crate::hostlibc::EV_ADD, NOTE_REAP),
             ],
         );
         // A process filter fails for a zombie or a process gone (ESRCH),
@@ -508,8 +512,8 @@ impl Drop for ReapWatch {
     }
 }
 
-fn kev(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
-    libc::kevent {
+fn kev(ident: usize, filter: i16, flags: u16, fflags: u32) -> crate::hostlibc::kevent {
+    crate::hostlibc::kevent {
         ident,
         filter,
         flags,
@@ -520,15 +524,15 @@ fn kev(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
 }
 
 /// Apply `changes` to `kq`, returning each change's error (0 on success).
-fn apply(kq: i32, changes: &[libc::kevent]) -> Vec<i64> {
+fn apply(kq: i32, changes: &[crate::hostlibc::kevent]) -> Vec<i64> {
     let mut changes = changes.to_vec();
     for c in &mut changes {
-        c.flags |= libc::EV_RECEIPT;
+        c.flags |= crate::hostlibc::EV_RECEIPT;
     }
     let mut out = changes.clone();
     // SAFETY: local arrays of equal length.
     let n = unsafe {
-        libc::kevent(
+        crate::hostlibc::kevent(
             kq,
             changes.as_ptr(),
             changes.len() as i32,
@@ -547,7 +551,7 @@ fn apply(kq: i32, changes: &[libc::kevent]) -> Vec<i64> {
 /// unless `watch`.
 fn new_pidfd_kqueue(pid: i32, watch: bool) -> Result<i32, i64> {
     // SAFETY: plain kqueue creation.
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return Err(-(errno::last() as i64));
     }
@@ -555,9 +559,9 @@ fn new_pidfd_kqueue(pid: i32, watch: bool) -> Result<i32, i64> {
     unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) };
     let proc = kev(
         pid as usize,
-        libc::EVFILT_PROC,
-        libc::EV_ADD,
-        libc::NOTE_EXIT,
+        crate::hostlibc::EVFILT_PROC,
+        crate::hostlibc::EV_ADD,
+        crate::hostlibc::NOTE_EXIT,
     );
     if !watch || apply(kq, &[proc]) != [0] {
         // The process is gone or a zombie: it still exists for its parent
@@ -570,8 +574,8 @@ fn new_pidfd_kqueue(pid: i32, watch: bool) -> Result<i32, i64> {
         let exited = apply(
             kq,
             &[
-                kev(PIDFD_EXITED, libc::EVFILT_USER, libc::EV_ADD, 0),
-                kev(PIDFD_EXITED, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER),
+                kev(PIDFD_EXITED, crate::hostlibc::EVFILT_USER, crate::hostlibc::EV_ADD, 0),
+                kev(PIDFD_EXITED, crate::hostlibc::EVFILT_USER, 0, crate::hostlibc::NOTE_TRIGGER),
             ],
         );
         if let Some(&e) = exited.iter().find(|&&e| e != 0) {

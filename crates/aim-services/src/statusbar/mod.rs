@@ -453,17 +453,25 @@ fn connect(display: &Path) -> Result<UnixStream, String> {
         return Err("headless display has no native UI surface".into());
     }
     // SO_NOSIGPIPE: a write after the server has gone fails instead.
-    let on: libc::c_int = 1;
-    // SAFETY: setsockopt on our socket with a local int.
-    unsafe {
-        libc::setsockopt(
+    // Linux has no such socket option; ignore SIGPIPE for this process.
+    #[cfg(target_os = "macos")]
+    {
+        let on: libc::c_int = 1;
+        // SAFETY: setsockopt on our socket with a local int.
+        unsafe {
+            libc::setsockopt(
             link.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_NOSIGPIPE,
             (&on as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
-    };
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     Ok(link)
 }
 

@@ -15,7 +15,7 @@ use crate::errno::{self, EINVAL};
 
 /// `st_flags` of a dma-buf and of the heap node: neither ashmem's
 /// (`UF_NODUMP | UF_OPAQUE`) nor a memfd's (`UF_NODUMP | UF_HIDDEN`).
-const MARK: u32 = libc::UF_NODUMP | libc::UF_TRACKED;
+const MARK: u32 = aim_storage::host::UF_NODUMP | aim_storage::host::UF_TRACKED;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -57,7 +57,7 @@ fn marked_file(size: u64, cloexec: bool) -> i64 {
             return -(errno::last() as i64);
         }
         libc::unlink(tmpl.as_ptr().cast());
-        if libc::fchflags(fd, MARK) < 0 || libc::ftruncate(fd, size as i64) < 0 {
+        if aim_storage::host::fchflags(fd, MARK) < 0 || libc::ftruncate(fd, size as i64) < 0 {
             let e = errno::last();
             libc::close(fd);
             return -(e as i64);
@@ -77,7 +77,7 @@ pub fn open(guest: &str, flags: u64) -> Option<i64> {
 }
 
 fn kind_of(st: &libc::stat) -> Option<Kind> {
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_nlink != 0 || st.st_flags & MARK != MARK
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_nlink != 0 || aim_storage::host::file_flags(&st) & MARK != MARK
     {
         return None;
     }
@@ -106,7 +106,7 @@ pub fn as_device(st: &mut libc::stat) -> bool {
         return false;
     }
     st.st_mode = libc::S_IFCHR | 0o444;
-    st.st_rdev = RDEV;
+    st.st_rdev = RDEV as _;
     st.st_nlink = 1;
     st.st_size = 0;
     st.st_blocks = 0;
@@ -122,8 +122,22 @@ pub fn stat(guest: &str) -> Option<libc::stat> {
     }
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     st.st_mode = libc::S_IFREG;
-    st.st_flags = MARK;
-    as_device(&mut st);
+    #[cfg(target_os = "macos")]
+    {
+        st.st_flags = MARK;
+    }
+    if !as_device(&mut st) {
+        #[cfg(not(target_os = "macos"))]
+        {
+            st.st_mode = libc::S_IFCHR | 0o444;
+            st.st_rdev = RDEV as _;
+            st.st_nlink = 1;
+            st.st_size = 0;
+            st.st_blocks = 0;
+            st.st_uid = 1000;
+            st.st_gid = 1000;
+        }
+    }
     Some(st)
 }
 
@@ -132,7 +146,7 @@ fn name(fd: i32) -> String {
     let mut buf = [0u8; NAME_LEN];
     // SAFETY: reading our attribute into a local buffer.
     let n = unsafe {
-        libc::fgetxattr(
+        aim_storage::host::fgetxattr(
             fd,
             NAME_XATTR.as_ptr(),
             buf.as_mut_ptr().cast(),
@@ -228,7 +242,7 @@ pub fn ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
             };
             // SAFETY: writing our attribute from the guest's bytes.
             let r = unsafe {
-                libc::fsetxattr(fd, NAME_XATTR.as_ptr(), bytes.as_ptr().cast(), end, 0, 0)
+                aim_storage::host::fsetxattr(fd, NAME_XATTR.as_ptr(), bytes.as_ptr().cast(), end, 0, 0)
             };
             if r < 0 { -(errno::last() as i64) } else { 0 }
         }
@@ -257,8 +271,8 @@ mod tests {
         let heap = open(SYSTEM, O_CLOEXEC).unwrap() as i32;
         let mut st = stat_of(heap).unwrap();
         assert!(as_device(&mut st));
-        assert_eq!((st.st_mode, st.st_rdev), (libc::S_IFCHR | 0o444, RDEV));
-        assert_eq!(stat(SYSTEM).map(|s| s.st_rdev), Some(RDEV));
+        assert_eq!((st.st_mode, st.st_rdev), (libc::S_IFCHR | 0o444, RDEV as _));
+        assert_eq!(stat(SYSTEM).map(|s| s.st_rdev), Some(RDEV as _));
         // Bad flags and an empty buffer are refused.
         assert_eq!(alloc(heap, 4096, 0o100).0, -(EINVAL as i64));
         assert_eq!(alloc(heap, 0, 2).0, -(EINVAL as i64));

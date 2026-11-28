@@ -173,7 +173,7 @@ fn unshared_offset(fd: i32) -> Option<i64> {
     let mut info = [0u64; 22];
     // SAFETY: a buffer of the flavour's size.
     let n = unsafe {
-        libc::proc_pidfdinfo(
+        crate::hostlibc::proc_pidfdinfo(
             libc::getpid(),
             fd,
             PROC_PIDFDVNODEINFO,

@@ -11,8 +11,10 @@
 //! - [`context`] and `trampoline.S` carry guest register state across the
 //!   boundary; [`sys`] implements the syscalls with Linux semantics.
 
+pub(crate) mod hostlibc;
 pub mod a64;
 pub mod cache;
+mod case_volume;
 pub mod context;
 pub mod diag;
 pub mod elf;
@@ -30,6 +32,25 @@ pub mod zip;
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+pub(crate) use libc::mach_port_t;
+#[cfg(not(target_os = "macos"))]
+pub(crate) type mach_port_t = u32;
+
+#[cfg(target_os = "macos")]
+pub(crate) use libc::qos_class_t;
+#[cfg(not(target_os = "macos"))]
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum qos_class_t {
+    QOS_CLASS_USER_INTERACTIVE = 0x21,
+    QOS_CLASS_USER_INITIATED = 0x19,
+    QOS_CLASS_DEFAULT = 0x15,
+    QOS_CLASS_UTILITY = 0x11,
+    QOS_CLASS_BACKGROUND = 0x09,
+    QOS_CLASS_UNSPECIFIED = 0x00,
+}
 
 pub struct RunOptions<'a> {
     pub root: &'a Path,
@@ -116,6 +137,9 @@ pub fn run_fork_child(opts: RunOptions) -> String {
     if let Err(e) = vfs::init(opts.root, opts.path_map) {
         return e;
     }
+    if let Err(e) = vfs::require_case_sensitive_backing() {
+        return e;
+    }
     if let Err(error) = start_verity_runtime() {
         return error;
     }
@@ -170,6 +194,9 @@ pub fn run(mut opts: RunOptions) -> String {
         return error;
     }
     if let Err(e) = vfs::init(opts.root, opts.path_map) {
+        return e;
+    }
+    if let Err(e) = vfs::require_case_sensitive_backing() {
         return e;
     }
     if let Some(runtime) = vfs::standalone_runtime()

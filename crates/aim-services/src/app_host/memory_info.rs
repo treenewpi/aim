@@ -256,7 +256,7 @@ impl AppHost {
             ));
         }
         let pids = pids.ok_or_else(|| Exception::new(EX_NULL_POINTER, "pids is null"))?;
-        let last_now = clock_ms(libc::CLOCK_UPTIME_RAW) - self.memory_info_throttle_time();
+        let last_now = clock_ms(crate::host_os::CLOCK_UPTIME_RAW) - self.memory_info_throttle_time();
         let all_users =
             self.check_permission(Some("android.permission.INTERACT_ACROSS_USERS_FULL"), uid)? == 0;
         let all_uids = self.get_tasks_allowed(uid)?;
@@ -280,7 +280,7 @@ impl AppHost {
             // cannot be read or parsed.
             let info = ProcessMemoryInfo(self.read_memory_info(pid)?.unwrap_or_default());
             if target.is_some() {
-                let now = clock_ms(libc::CLOCK_UPTIME_RAW);
+                let now = clock_ms(crate::host_os::CLOCK_UPTIME_RAW);
                 if let Some(a) = self
                     .apps
                     .lock()

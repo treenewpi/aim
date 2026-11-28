@@ -74,9 +74,9 @@ unsafe extern "C" {
     );
     fn dispatch_resume(object: *mut libc::c_void);
     fn pthread_fchdir_np(fd: i32) -> i32;
-    fn mach_vm_read_overwrite(t: libc::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
-    fn mach_vm_write(t: libc::mach_port_t, a: u64, d: usize, n: u32) -> i32;
-    static mach_task_self_: libc::mach_port_t;
+    fn mach_vm_read_overwrite(t: crate::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
+    fn mach_vm_write(t: crate::mach_port_t, a: u64, d: usize, n: u32) -> i32;
+    static mach_task_self_: crate::mach_port_t;
 }
 
 /// The layer's fds of this module: they stay with this process
@@ -157,12 +157,12 @@ fn err(e: i32) -> Vec<u8> {
 fn sockaddr(name: &str) -> (libc::sockaddr_un, libc::socklen_t) {
     // SAFETY: plain data.
     let mut a: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    a.sun_family = libc::AF_UNIX as u8;
+    a.sun_family = libc::AF_UNIX as _;
     for (d, &s) in a.sun_path.iter_mut().zip(name.as_bytes()) {
         *d = s as libc::c_char;
     }
     let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1;
-    a.sun_len = len as u8;
+    aim_storage::host::set_sun_len(&mut a, len as u8);
     (a, len as libc::socklen_t)
 }
 
@@ -182,11 +182,11 @@ fn at(
             return -1;
         }
         let r = f(s, (&a as *const libc::sockaddr_un).cast(), len);
-        let error = *libc::__error();
+        let error = *crate::hostlibc::__error();
         if crate::errno::retry_host(|| pthread_fchdir_np(-1)).is_err() {
             return -1;
         }
-        *libc::__error() = error;
+        *crate::hostlibc::__error() = error;
         r
     }
 }
@@ -210,7 +210,7 @@ fn socket() -> Result<i32, i64> {
             libc::setsockopt(
                 s,
                 libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
+                aim_storage::host::SO_NOSIGPIPE,
                 (&one as *const i32).cast(),
                 4,
             )
@@ -242,7 +242,7 @@ pub(super) fn connect(pid: i32) -> Result<i32, i64> {
             lock(&OWN).push(s);
             return Ok(s);
         }
-        let error = unsafe { *libc::__error() };
+        let error = unsafe { *crate::hostlibc::__error() };
         fdtab::unhide(s);
         // A connect interrupted before completion can still be in progress.
         // No request was sent: restart with a fresh socket, not the RPC.
@@ -256,7 +256,7 @@ pub(super) fn connect(pid: i32) -> Result<i32, i64> {
         if error == libc::EINTR {
             continue;
         }
-        if !crate::sys::pidns::running(pid) || unsafe { libc::kill(pid, libc::SIGINFO) } != 0 {
+        if !crate::sys::pidns::running(pid) || unsafe { libc::kill(pid, aim_storage::host::SIGINFO) } != 0 {
             return Err(esrch);
         }
         std::thread::sleep(
@@ -306,7 +306,7 @@ pub fn start() {
     unsafe {
         let s = dispatch_source_create(
             &_dispatch_source_type_signal,
-            libc::SIGINFO as usize,
+            aim_storage::host::SIGINFO as usize,
             0,
             dispatch_get_global_queue(0, 0),
         );
@@ -362,8 +362,8 @@ fn peer_pid(fd: i32) -> i32 {
     unsafe {
         libc::getsockopt(
             fd,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
+            aim_storage::host::SOL_LOCAL,
+            aim_storage::host::LOCAL_PEERPID,
             (&mut pid as *mut i32).cast(),
             &mut len,
         )

@@ -1,6 +1,7 @@
 //! Actual anonymous pipe identities from the Darwin kernel.
 use std::{io, mem, os::fd::AsRawFd};
 pub type Key = (u64, u64);
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct FileInfo {
     flags: u32,
@@ -9,6 +10,7 @@ struct FileInfo {
     kind: i32,
     guard: u32,
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct PipeInfo {
     stat: libc::vinfo_stat,
@@ -17,6 +19,7 @@ struct PipeInfo {
     status: i32,
     reserved: i32,
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct PipeFd {
     file: FileInfo,
@@ -25,6 +28,7 @@ struct PipeFd {
 fn failure(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
 }
+#[cfg(target_os = "macos")]
 pub fn info(fd: i32) -> io::Result<Key> {
     let mut value: PipeFd = unsafe { mem::zeroed() };
     let size = mem::size_of_val(&value) as i32;
@@ -46,6 +50,14 @@ pub fn info(fd: i32) -> io::Result<Key> {
         });
     }
     Ok((value.pipe.handle, value.pipe.peer))
+}
+#[cfg(not(target_os = "macos"))]
+pub fn info(fd: i32) -> io::Result<Key> {
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.st_dev as u64, stat.st_ino))
 }
 /// Only anonymous, write-end pipe descriptors can be registered capabilities.
 pub fn key(fd: i32) -> io::Result<Option<Key>> {

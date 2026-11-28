@@ -7,10 +7,47 @@
 //! transaction file answers the write that precedes the read. A refused
 //! write fails with the handler's errno.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::fdtab::{self, Kind};
 use crate::errno::{self, Errno};
+
+/// Guest `O_ACCMODE` for a knob. The host file is `O_RDWR` so that a reply
+/// can be rewritten; Linux still returns `EBADF` for the direction the
+/// guest did not open.
+static ACCESS: Mutex<BTreeMap<i32, i32>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn set_access(fd: i32, accmode: i32) {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fd, accmode & 0o3);
+}
+
+pub(super) fn access(fd: i32) -> Option<i32> {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&fd)
+        .copied()
+}
+
+pub(super) fn clear_access(fd: i32) {
+    ACCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&fd);
+}
+
+pub(super) fn dup_access(old: i32, new: i32) {
+    let mut map = ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mode) = map.get(&old).copied() {
+        map.insert(new, mode);
+    } else {
+        map.remove(&new);
+    }
+}
 
 /// The owner of the open file, independent of the process writing it.
 /// Fork carries this identity, never a callback or the opener's credentials.
@@ -25,6 +62,10 @@ pub enum Knob {
     Comm(i32),
     Uevent(super::uevent::Device),
     FuseAbort(super::fuse::SessionKey),
+    /// A `proc_dointvec_minmax` file. The string is its guest path.
+    Sysctl(&'static str),
+    /// `/sys/block/<dev>/queue/{scheduler,nr_requests,read_ahead_kb}`.
+    LoopQueue(String),
 }
 
 impl Knob {
@@ -40,6 +81,8 @@ impl Knob {
             Self::Comm(tid) => super::procfs::write_comm(*tid, bytes).map(|()| None),
             Self::Uevent(dev) => super::uevent::synthesize(dev, bytes).map(|()| None),
             Self::FuseAbort(key) => super::fuse::abort(key).map(|()| None),
+            Self::Sysctl(path) => super::sysctl::write(path, bytes),
+            Self::LoopQueue(path) => super::loopdev::write_queue(path, bytes).map(|()| None),
         }
     }
 }
@@ -84,6 +127,14 @@ pub(super) fn save(k: &Knob, w: &mut super::fork_state::Writer) {
             w.u32(8);
             w.path(key.transport());
         }
+        Knob::Sysctl(path) => {
+            w.u32(9);
+            w.str(path);
+        }
+        Knob::LoopQueue(path) => {
+            w.u32(10);
+            w.str(path);
+        }
     }
 }
 
@@ -113,6 +164,14 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Option<Arc<Knob>> {
             env: r.seq(|r| r.str()),
         }),
         8 => Knob::FuseAbort(super::fuse::SessionKey::from_transport(r.path())),
+        9 => {
+            let Some(path) = super::sysctl::static_path(&r.str()) else {
+                r.invalidate();
+                return None;
+            };
+            Knob::Sysctl(path)
+        }
+        10 => Knob::LoopQueue(r.str()),
         _ => {
             r.invalidate();
             return None;
@@ -192,6 +251,8 @@ mod tests {
             Knob::FuseAbort(super::super::fuse::SessionKey::from_transport(
                 "/runtime/fuse/socket".into(),
             )),
+            Knob::Sysctl("/proc/sys/kernel/kptr_restrict"),
+            Knob::LoopQueue("/sys/block/loop0/queue/read_ahead_kb".into()),
         ];
         for owner in owners {
             let mut w = Writer::default();

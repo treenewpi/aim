@@ -261,7 +261,47 @@ of our own.
 - **Syscall cost:** a lean integer-only path costs about 3–4 ns. The full
   save is only for clone, signals and sigreturn.
 - **16 KiB pages:** match a Linux 16K kernel. Large reservations are cheap.
-  Nothing maps below 4 GiB, hence the ART exception above.
+  Nothing maps below 4 GiB, hence the ART exception above.   A file `mmap`
+  whose offset is a multiple of 4 KiB maps the enclosing host pages and
+  returns a pointer displaced by `offset & 0x3fff`. A guest page that
+  starts at or after EOF is installed, and a touch raises SIGBUS. A
+  past-EOF page that shares a host page with file bytes stays that
+  shared mapping.   `MAP_PRIVATE` whose address and offset disagree modulo
+  16 KiB is a copy; `MAP_SHARED` at that residue is `EINVAL`.
+  `AT_PAGESZ` stays 16384. This image's bionic does not read it:
+  `getpagesize` and `sysconf(_SC_PAGESIZE)` in the apex libc and the
+  bootstrap libc are `mov w0, #4096; ret`. The linker steps reservations
+  by that 4096. A host page's protection is write-wins over all four
+  4 KiB slices on it, including another module's data and an anonymous
+  mapping. Read is the union. Write is set if any slice asks for write.
+  Execute is set only when some slice asks for execute and none asks for
+  write. `PROT_NONE`, including the linker's reservation gap between
+  segments, contributes nothing. A non-fixed mmap starts on a host-page
+  boundary. Sharing a host page is only for a guest `MAP_FIXED`, and the
+  diagnostic names the syscall that established each slice and that
+  slice's protection history. Write and execute are never set together.
+  When the last writable slice is
+  dropped, by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is
+  restored and `sys_icache_invalidate` covers the whole 16 KiB page.
+  An instruction fetch from a slice that wants execute while a neighbor
+  wants write is `SIGSEGV` `SEGV_ACCERR` at that address. The diagnostic
+  names the module and slice that wanted execute, the module and slice
+  that holds write, and the thread. It does not emulate the fetch.
+  AOSP `android-16.0.0_r1` `soinfo::link_image` (`linker/linker.cpp`)
+  calls `relocate` and then `protect_relro`, which
+  `phdr_table_protect_gnu_relro` (`linker/linker_phdr.cpp`) turns into
+  `PROT_READ`. `soinfo::call_constructors` (`linker/linker_soinfo.cpp`)
+  runs `DT_INIT` and then `DT_INIT_ARRAY` only after that link, from
+  `linker_main.cpp` and from `do_dlopen`. The library's own constructors
+  do not run during its RELRO window. Another thread can still execute a
+  different module whose text shares the host page. A request that
+  itself asks for write and execute stays `EINVAL` on a private copy.
+  Thirty-eight ELFs in this layer still place an executable byte and a
+  byte that stays writable after GNU RELRO on one 16 KiB page at some
+  4 KiB bias. Bias 0 is safe for every oat and odex in that set.
+  `vendor/bin/vncserver`, `vendor/lib64/libdrm.so.2`,
+  `libdrm_amdgpu.so.1`, `libdrm_etnaviv.so.1`, and `libdrm_radeon.so.1`
+  also collide at bias 0. Those five are not on the default boot path.
 
 ## P1 binder driver (2026-09-27)
 
@@ -616,7 +656,32 @@ peripheral mode and no `/sys/class/android_usb`.
 ### Kernel features to emulate
 
 binder, FUSE, `/proc` and `/sys` per the device contract, the netlink subset
-the remaining original daemons use, evdev, and memfd/ashmem.
+the remaining original daemons use, evdev, and memfd/ashmem. Original
+init's `mount` of fstype `binder` is binderfs: `binder-control` and
+`BINDER_CTL_ADD` of `binder`, `hwbinder` and `vndbinder`. Those nodes
+open the binder host named by `linux-run --binder`. Loop
+(`/dev/loop-control` is 10:237, `/dev/loopN` is 7:N) and device-mapper
+(`/dev/device-mapper` is 10:236, `/dev/block/dm-N` is 253:N) record that
+device number at open; `stat` and `fstat` report it, and ioctl follows
+it, so a device-mapper command is not accepted on loop-control. The
+loop and device-mapper tables are a file in the runtime directory, so
+a later process's `DM_DEV_STATUS` and `/sys/dev/block/M:N` see a device
+another process created. `LOOP_CTL_ADD` creates the `/dev/loopN` and
+`/dev/block/loopN` nodes.
+`LOOP_CTL_ADD`, `LOOP_CTL_REMOVE` and `LOOP_CTL_GET_FREE` are `0x4c80`
+through `0x4c82`. Device-mapper commands are
+`_IOWR(0xfd, nr, struct dm_ioctl)` with size 312, including `DM_VERSION`.
+The Mac trace of `63008084d55ca0d2065100aa7a29fa5913e1d755` did not issue
+`DM_VERSION` before `DM_DEV_CREATE`. Any other command on those fds is
+`ENOTTY`.
+A read-only `ext4` mount of one of those devices is the bytes that block
+source returns. The pinned layer's 35 payloads share one feature set:
+compat `0x28` (`EXT_ATTR|DIR_INDEX`), incompat `0x42`
+(`FILETYPE|EXTENTS`), ro_compat `0x407b` (including `SHARED_BLOCKS`, not
+`METADATA_CSUM`). `FLEX_BG` and `INLINE_DATA` are unset. An incompat bit
+outside `FILETYPE|EXTENTS` is `EINVAL`. A dm-verity table is checked per
+data block on read against the hashtree and the root digest; a mismatch
+is `EIO`. Preinstalled bootstrap apexes do not load that table.
 
 - **uevents:** NETLINK_KOBJECT_UEVENT sockets receive the kernel's
   uevents (`ACTION@DEVPATH`, the variables, `SEQNUM`) with the kernel's
@@ -713,8 +778,20 @@ the remaining original daemons use, evdev, and memfd/ashmem.
   Linux's; dirty pages go to the private ones first; Swap is the
   compressor's pages; Referenced comes from `mincore`. LazyFree, KSM, THP
   and hugetlb are 0, and VmFlags has only what protections, sharing, the
-  stack and mlock tell. Names set with `PR_SET_VMA_ANON_NAME` are not
-  kept (#1581).
+  stack and mlock tell. Names set with `PR_SET_VMA_ANON_NAME` are kept
+  by range (`sys/vma_names.rs`). The start has to be a multiple of the
+  4 KiB guest granule bionic names, the same granule `mprotect` accepts
+  inside a 16 KiB host page. A 16 KiB-only alignment check returned
+  EINVAL for the linker's slice at `0x8004ce9000` length `0x8000` and
+  the process continued. On `90882eb` the same call returned 0, and
+  `0x80004c5000` length `0x13000` and `0x80002f9000` length `0x1000`
+  returned EBADF: the load-time file note was rounded to the host page,
+  so the anonymous `.bss` in that page was classified as a file. The
+  file extent now ends on the 4 KiB page after the file bytes, and a
+  Darwin entry that continues into the `.bss` is split there. A start
+  that is not 4 KiB aligned, a bad name, a real file or memfd mapping,
+  and a hole still fail. Sorting heaps by those names is still open
+  (#1581).
 - **Answered "unsupported" (Android falls back):** cgroup v1 controllers
   other than `blkio`, `cpu` and `cpuset`, the other namespaces, SELinux enforcement (permissive), userfaultfd (ART
   uses its copying collector) and BINDER_FREEZE.

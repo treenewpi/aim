@@ -30,6 +30,7 @@ struct Registered {
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(Default::default);
 
 /// Darwin's kernel socket handles, not a socket type or userspace marker.
+#[cfg(target_os = "macos")]
 pub(crate) fn socket_identity(fd: RawFd) -> io::Result<(u64, u64)> {
     // SDK sys/proc_info.h: socket_fdinfo, psi.soi_so, psi.soi_proto.pri_un.
     let mut info = [0u8; 792];
@@ -47,6 +48,17 @@ pub(crate) fn socket_identity(fd: RawFd) -> io::Result<(u64, u64)> {
     }
     let word = |at| u64::from_ne_bytes(info[at..at + 8].try_into().unwrap());
     Ok((word(160), word(264)))
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn socket_identity(fd: RawFd) -> io::Result<(u64, u64)> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.st_ino == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok((stat.st_ino, stat.st_ino.rotate_left(17) | 1))
 }
 
 /// Compare two pinned descriptors' actual kernel endpoints, never FD numbers.
@@ -481,11 +493,11 @@ pub(crate) fn send(fd: RawFd, bytes: &[u8], reply: RawFd) -> io::Result<()> {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = libc::CMSG_SPACE(4);
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
         let c = libc::CMSG_FIRSTHDR(&msg);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(4);
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<i32>(), reply);
         let n = libc::sendmsg(fd, &msg, 0);
         if n < 0 {
@@ -527,7 +539,7 @@ pub(crate) fn receive_flags_phase(
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = std::mem::size_of_val(&control) as u32;
+        msg.msg_controllen = std::mem::size_of_val(&control) as _;
         let n = libc::recvmsg(fd, &mut msg, flags);
         if n <= 0 {
             return Err(ReceiveFailure {
@@ -543,7 +555,7 @@ pub(crate) fn receive_flags_phase(
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let length = (*c).cmsg_len.saturating_sub(libc::CMSG_LEN(0));
+                let length = (*c).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as _);
                 for index in 0..length / 4 {
                     descriptors.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
                         libc::CMSG_DATA(c).add(index as usize * 4).cast::<i32>(),

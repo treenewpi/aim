@@ -805,17 +805,30 @@ fn periodic_window(interval: i64, flex: i64, original_latest: i64, now: i64) -> 
 /// `MemInfoReader` reads of the guest's `/proc/meminfo`).
 fn default_concurrency_limit() -> usize {
     let mut bytes: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: a u64 out-parameter of its size.
-    unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut bytes as *mut u64).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    #[cfg(target_os = "macos")]
+    {
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: a u64 out-parameter of its size.
+        unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    bytes = kb.parse::<u64>().unwrap_or(0).saturating_mul(1024);
+                }
+            }
+        }
+    }
     let gb = 1_000_000_000;
     match bytes {
         b if b <= 6 * gb => 16,

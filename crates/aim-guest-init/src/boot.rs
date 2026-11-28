@@ -66,6 +66,7 @@ fn init_caught_signal_mask() -> std::io::Result<u64> {
 /// Wakes the boot loop on every SIGCHLD, as init's signalfd does, so a
 /// child's exit (an `exec` ending) is handled at once rather than at the
 /// loop's next timeout. The thread ends with the loop's receiver.
+#[cfg(target_os = "macos")]
 fn watch_children(events: mpsc::Sender<PropertyEvent>) -> std::io::Result<()> {
     // SAFETY: a new kqueue and its signal filter; EVFILT_SIGNAL records the
     // signal beside its disposition.
@@ -100,6 +101,38 @@ fn watch_children(events: mpsc::Sender<PropertyEvent>) -> std::io::Result<()> {
         }
         // SAFETY: our kqueue.
         unsafe { libc::close(kq) };
+    });
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_children(events: mpsc::Sender<PropertyEvent>) -> std::io::Result<()> {
+    // signalfd delivers SIGCHLD the way kqueue's EVFILT_SIGNAL does. The
+    // signal has to be blocked for signalfd to receive it.
+    let mut set = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::thread::spawn(move || {
+        let mut info = unsafe { std::mem::zeroed::<libc::signalfd_siginfo>() };
+        loop {
+            let n = unsafe { libc::read(fd, (&mut info as *mut libc::signalfd_siginfo).cast(), std::mem::size_of_val(&info)) };
+            if n > 0 && events.send(PropertyEvent::ChildExited).is_err() {
+                break;
+            }
+            if n < 0 {
+                break;
+            }
+        }
+        unsafe { libc::close(fd) };
     });
     Ok(())
 }

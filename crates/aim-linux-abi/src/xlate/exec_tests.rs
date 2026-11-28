@@ -122,7 +122,7 @@ fn translated_file_runs_from_the_cache() {
     let mut buf = [0u8; 1024];
     // SAFETY: querying our own region.
     let n = unsafe {
-        libc::proc_regionfilename(libc::getpid(), text_addr, buf.as_mut_ptr().cast(), 1024)
+        crate::hostlibc::proc_regionfilename(libc::getpid(), text_addr, buf.as_mut_ptr().cast(), 1024)
     };
     let path = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
     assert!(path.contains(&r.key), "text backed by {path}");

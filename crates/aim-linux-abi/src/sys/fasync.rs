@@ -72,16 +72,16 @@ fn watch(kq: i32) {
     // SAFETY: this host thread takes no signals, so the kernel never picks
     // it for a process-directed one.
     unsafe {
-        let mut all: libc::sigset_t = 0;
+        let mut all = crate::hostlibc::empty_sigset();
         libc::sigfillset(&mut all);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
     // SAFETY: an all-zero kevent is valid.
-    let mut evs: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+    let mut evs: [crate::hostlibc::kevent; 16] = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: waiting for events into a local buffer.
         let n = unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 kq,
                 std::ptr::null(),
                 0,
@@ -127,16 +127,16 @@ pub fn register(kq: i32, target: Weak<dyn Arrival>) -> Result<u64, Errno> {
     }
     let w = watcher.as_mut().unwrap();
     w.next += 1;
-    let k = libc::kevent {
+    let k = crate::hostlibc::kevent {
         ident: kq as usize,
-        filter: libc::EVFILT_READ,
-        flags: libc::EV_ADD | libc::EV_CLEAR,
+        filter: crate::hostlibc::EVFILT_READ,
+        flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR,
         fflags: 0,
         data: 0,
         udata: w.next as usize as *mut _,
     };
     // SAFETY: one change, no events.
-    if unsafe { libc::kevent(w.kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+    if unsafe { crate::hostlibc::kevent(w.kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
         return Err(errno::last());
     }
     w.targets.insert(w.next, target);
@@ -152,29 +152,29 @@ pub fn unregister(id: u64) {
 
 /// The events a host file's private kqueue `kq` (its read and write
 /// knotes) holds now.
-fn knotes(kq: i32) -> Vec<libc::kevent> {
+fn knotes(kq: i32) -> Vec<crate::hostlibc::kevent> {
     // SAFETY: an all-zero kevent is valid.
-    let mut evs: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+    let mut evs: [crate::hostlibc::kevent; 2] = unsafe { std::mem::zeroed() };
     let zero = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: output array we own, no wait.
-    let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, evs.as_mut_ptr(), 2, &zero) };
+    let n = unsafe { crate::hostlibc::kevent(kq, std::ptr::null(), 0, evs.as_mut_ptr(), 2, &zero) };
     evs[..n.max(0) as usize].to_vec()
 }
 
 /// Discard what kqueue `kq` reports.
 pub fn drain(kq: i32) {
     // SAFETY: an all-zero kevent is valid.
-    let mut evs: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+    let mut evs: [crate::hostlibc::kevent; 16] = unsafe { std::mem::zeroed() };
     let zero = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: output array we own, no wait.
     while unsafe {
-        libc::kevent(
+        crate::hostlibc::kevent(
             kq,
             std::ptr::null(),
             0,
@@ -193,7 +193,7 @@ pub fn private_kqueue(source: Option<i32>) -> Result<i32, Errno> {
     let kq = unsafe {
         match source {
             Some(fd) => libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, fdtab::hidden_base()),
-            None => libc::kqueue(),
+            None => crate::hostlibc::kqueue(),
         }
     };
     if kq < 0 {
@@ -355,10 +355,10 @@ impl Fasync {
 
     /// The reasons (`signal::POLL_*`) that a knote's event signals, in
     /// order, into `out`, for a file that last had `seen` bytes to read.
-    fn reasons(self, held: i32, seen: &mut isize, e: &libc::kevent, out: &mut Vec<i32>) {
+    fn reasons(self, held: i32, seen: &mut isize, e: &crate::hostlibc::kevent, out: &mut Vec<i32>) {
         use super::signal::{POLL_HUP, POLL_IN, POLL_OUT};
-        let eof = e.flags & libc::EV_EOF != 0;
-        let read = e.filter == libc::EVFILT_READ;
+        let eof = e.flags & crate::hostlibc::EV_EOF != 0;
+        let read = e.filter == crate::hostlibc::EVFILT_READ;
         // Data that arrived in the same wakeup as the end is POLL_IN first.
         let arrived = read && e.data > *seen;
         if read {
@@ -534,9 +534,9 @@ pub fn fcntl(fd: i32, guest: i32, source: Source, cmd: u64, arg: u64) -> Option<
 fn host_owner(fd: i32) -> Result<i32, Errno> {
     // SAFETY: plain fcntl; F_GETOWN's -1 can be a group, so errno decides.
     unsafe {
-        *libc::__error() = 0;
+        *crate::hostlibc::__error() = 0;
         let owner = libc::fcntl(fd, libc::F_GETOWN);
-        if owner == -1 && *libc::__error() != 0 {
+        if owner == -1 && *crate::hostlibc::__error() != 0 {
             return Err(errno::last());
         }
         Ok(owner)
@@ -627,30 +627,30 @@ fn refresh(fd: i32, guest: i32, file: &Arc<File>) -> Result<(), Errno> {
     let registered = (|| {
         let mode = flags & libc::O_ACCMODE;
         let filters = [
-            (libc::EVFILT_READ, mode != libc::O_WRONLY),
+            (crate::hostlibc::EVFILT_READ, mode != libc::O_WRONLY),
             (
-                libc::EVFILT_WRITE,
+                crate::hostlibc::EVFILT_WRITE,
                 mode != libc::O_RDONLY && fasync != Fasync::Evdev,
             ),
         ];
         for (filter, _) in filters.into_iter().filter(|(_, wanted)| *wanted) {
-            let k = libc::kevent {
+            let k = crate::hostlibc::kevent {
                 ident: held as usize,
                 filter,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
+                flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR,
                 fflags: 0,
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
             // SAFETY: one change, no events.
-            if unsafe { libc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+            if unsafe { crate::hostlibc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
                 return Err(errno::last());
             }
         }
         // What is there already raises nothing.
         let seen = knotes(kq)
             .iter()
-            .find(|e| e.filter == libc::EVFILT_READ)
+            .find(|e| e.filter == crate::hostlibc::EVFILT_READ)
             .map_or(0, |e| e.data);
         let target: Weak<File> = Arc::downgrade(file);
         register(kq, target).map(|id| (id, seen))

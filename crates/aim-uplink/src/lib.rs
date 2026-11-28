@@ -36,6 +36,7 @@ pub struct Uplink6 {
 }
 
 /// Round a routing-socket address length up to Darwin's alignment.
+#[cfg(target_os = "macos")]
 fn roundup(len: usize) -> usize {
     if len == 0 { 4 } else { (len + 3) & !3 }
 }
@@ -44,17 +45,42 @@ fn roundup(len: usize) -> usize {
 /// unscoped one of the kernel's routing table, read with `sysctl`
 /// (NET_RT_FLAGS), as netstat(1) reads it. A routing socket's RTM_GET
 /// reply can be lost among other routing messages, and reading it blocks.
+#[cfg(target_os = "macos")]
 fn default_route() -> Option<(u32, Ipv4Addr)> {
     routes(libc::AF_INET, default_gateway)
+}
+#[cfg(not(target_os = "macos"))]
+fn default_route() -> Option<(u32, Ipv4Addr)> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 || f[1] != "00000000" {
+            continue;
+        }
+        let gateway = u32::from_str_radix(f[2], 16).ok()?;
+        let name = std::ffi::CString::new(f[0]).ok()?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            continue;
+        }
+        return Some((index, Ipv4Addr::from(gateway.to_ne_bytes())));
+    }
+    None
 }
 
 /// The interface index and gateway of the IPv6 default route, as
 /// [`default_route`] finds the IPv4 one.
+#[cfg(target_os = "macos")]
 fn default_route6() -> Option<(u32, Ipv6Addr)> {
     routes(libc::AF_INET6, default_gateway6)
 }
+#[cfg(not(target_os = "macos"))]
+fn default_route6() -> Option<(u32, Ipv6Addr)> {
+    None
+}
 
 /// The first unscoped gateway route of family `af` that `pick` takes.
+#[cfg(target_os = "macos")]
 fn routes<T>(af: i32, pick: impl Fn(i32, &[u8]) -> Option<T>) -> Option<(u32, T)> {
     let mut mib = [
         libc::CTL_NET,
@@ -124,6 +150,7 @@ fn routes<T>(af: i32, pick: impl Fn(i32, &[u8]) -> Option<T>) -> Option<(u32, T)
 
 /// The IPv4 gateway of a route whose addresses (`addrs`, an RTA_ mask)
 /// are `sa`, if it is a default route: destination 0.0.0.0, mask 0.
+#[cfg(target_os = "macos")]
 fn default_gateway(addrs: i32, sa: &[u8]) -> Option<Ipv4Addr> {
     let (mut at, mut gateway, mut default) = (0, None, false);
     for bit in 0..libc::RTAX_MAX {
@@ -152,6 +179,7 @@ fn default_gateway(addrs: i32, sa: &[u8]) -> Option<Ipv4Addr> {
 /// The IPv6 gateway of a route whose addresses are `sa`, if it is a
 /// default route (::/0); a link-local gateway's KAME-embedded scope (its
 /// third and fourth bytes) cleared.
+#[cfg(target_os = "macos")]
 fn default_gateway6(addrs: i32, sa: &[u8]) -> Option<Ipv6Addr> {
     let (mut at, mut gateway, mut default) = (0, None, false);
     for bit in 0..libc::RTAX_MAX {
@@ -181,6 +209,16 @@ fn default_gateway6(addrs: i32, sa: &[u8]) -> Option<Ipv6Addr> {
 
 fn prefix_of(mask: u32) -> u8 {
     mask.leading_ones() as u8
+}
+
+#[cfg(not(target_os = "macos"))]
+fn index_name(index: u32) -> Option<String> {
+    let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+    if unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_bytes();
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// The host's primary IPv4 network, or None when the Mac has none.
@@ -217,6 +255,7 @@ pub fn uplink() -> Option<Uplink> {
                         prefix = prefix_of(u32::from_be(m.sin_addr.s_addr));
                     }
                 }
+                #[cfg(target_os = "macos")]
                 libc::AF_LINK if !e.ifa_data.is_null() => {
                     mtu = (*(e.ifa_data as *const libc::if_data)).ifi_mtu;
                 }
@@ -224,6 +263,14 @@ pub fn uplink() -> Option<Uplink> {
             }
         }
         libc::freeifaddrs(ifa);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(name) = index_name(index) {
+        if let Ok(text) = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu")) {
+            if let Ok(n) = text.trim().parse() {
+                mtu = n;
+            }
+        }
     }
     Some(Uplink {
         index,
@@ -244,12 +291,14 @@ const IN6_IFF_TEMPORARY: i32 = 0x0080;
 const IN6_IFF_CLAT46: i32 = 0x1000;
 
 /// `SIOCGIFAFLAG_IN6`: `_IOWR('i', 73, struct in6_ifreq)`.
+#[cfg(target_os = "macos")]
 fn siocgifaflag_in6() -> libc::c_ulong {
     let size = std::mem::size_of::<libc::in6_ifreq>() as libc::c_ulong;
     0xc000_0000 | ((size & 0x1fff) << 16) | ((b'i' as libc::c_ulong) << 8) | 73
 }
 
 /// The flags of address `a` on interface `name` (`SIOCGIFAFLAG_IN6`).
+#[cfg(target_os = "macos")]
 fn addr_flags(
     s: i32,
     name: &[libc::c_char; libc::IF_NAMESIZE],
@@ -316,9 +365,12 @@ pub fn uplink6() -> Option<Uplink6> {
                     if link_local || a.is_loopback() || a.is_multicast() {
                         continue;
                     }
+                    #[cfg(target_os = "macos")]
                     let Some(flags) = addr_flags(s, &name, sa) else {
                         continue;
                     };
+                    #[cfg(not(target_os = "macos"))]
+                    let flags = 0;
                     if flags & unusable != 0 {
                         continue;
                     }
@@ -332,6 +384,7 @@ pub fn uplink6() -> Option<Uplink6> {
                         }
                     }
                 }
+                #[cfg(target_os = "macos")]
                 libc::AF_LINK if !e.ifa_data.is_null() => {
                     mtu = (*(e.ifa_data as *const libc::if_data)).ifi_mtu;
                 }
@@ -340,6 +393,14 @@ pub fn uplink6() -> Option<Uplink6> {
         }
         libc::freeifaddrs(ifa);
         libc::close(s);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(name) = index_name(index) {
+        if let Ok(text) = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu")) {
+            if let Ok(n) = text.trim().parse() {
+                mtu = n;
+            }
+        }
     }
     Some(Uplink6 {
         index,
@@ -359,13 +420,19 @@ pub const WATCH_PERIOD: Duration = Duration::from_millis(2000);
 /// needs no entitlement and no run loop, unlike SCDynamicStore or
 /// `nw_path_monitor`.
 pub fn routing_socket() -> i32 {
-    // SAFETY: a socket of the caller's.
-    unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) }
+    // SAFETY: a socket of the caller's. Linux has no PF_ROUTE socket.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    -1
 }
 
 /// Whether a routing message may change the default route or the
 /// addresses: route changes other than cloned, host and link-layer
 /// entries, address and interface changes.
+#[cfg(target_os = "macos")]
 fn relevant(msg: &[u8]) -> bool {
     if msg.len() < std::mem::size_of::<libc::rt_msghdr>() {
         return false;
@@ -399,7 +466,7 @@ pub fn watch(socket: i32, mut changed: impl FnMut()) -> ! {
         };
         let wait = due.saturating_duration_since(now).as_millis() as i32;
         // SAFETY: one pollfd on our stack (none: a plain sleep).
-        if unsafe { libc::poll(&mut p, (socket >= 0) as u32, wait) } <= 0 {
+        if unsafe { libc::poll(&mut p, (socket >= 0) as _, wait) } <= 0 {
             continue;
         }
         // A change comes as a burst of messages: let it finish, then
@@ -418,6 +485,7 @@ pub fn watch(socket: i32, mut changed: impl FnMut()) -> ! {
             if n <= 0 {
                 break;
             }
+            #[cfg(target_os = "macos")]
             if relevant(&buf[..n as usize]) {
                 due = Instant::now();
             }
@@ -563,6 +631,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn sin(a: [u8; 4]) -> Vec<u8> {
         let mut v = vec![16, libc::AF_INET as u8, 0, 0];
         v.extend(a);
@@ -570,6 +639,7 @@ mod tests {
         v
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_default_route_has_destination_and_mask_0() {
         let addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;
@@ -591,6 +661,7 @@ mod tests {
         assert_eq!(default_gateway(addrs, &narrow), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_default_route_is_the_one_route_8_gets() {
         let out = std::process::Command::new("/sbin/route")
@@ -629,6 +700,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     fn sin6(a: &str) -> Vec<u8> {
         let mut v = vec![28, libc::AF_INET6 as u8, 0, 0, 0, 0, 0, 0];
         v.extend(a.parse::<Ipv6Addr>().unwrap().octets());
@@ -636,6 +708,7 @@ mod tests {
         v
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_ipv6_default_route_has_destination_and_mask_0() {
         let addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;

@@ -99,7 +99,7 @@ fn create_object(mut header: Header, data_len: usize, initial: Option<&[u8]>, ac
     let result = (|| {
         let fd = file.as_raw_fd();
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
-            || unsafe { libc::fchflags(fd, MARK) } < 0
+            || unsafe { aim_storage::host::fchflags(fd, MARK) } < 0
         {
             return Err(errno::last());
         }
@@ -173,7 +173,7 @@ fn file_access(flags: u32) -> Result<i32, i64> {
 }
 /// `st_flags` of an object file: neither ashmem's, a memfd's nor a
 /// dma-buf's, which all have UF_NODUMP.
-const MARK: u32 = libc::UF_HIDDEN | libc::UF_OPAQUE;
+const MARK: u32 = aim_storage::host::UF_HIDDEN | aim_storage::host::UF_OPAQUE;
 
 /// Duplicate a fully initialized private description into a new guest
 /// slot, an object's (`fdtab::Kind::Bpf`) before the guest can reach it.
@@ -206,7 +206,7 @@ pub(super) fn adopt(fd: i32) {
     // SAFETY: fstat into a local buffer.
     if unsafe { libc::fstat(fd, &mut st) } == 0
         && st.st_mode & libc::S_IFMT == libc::S_IFREG
-        && st.st_flags & (MARK | libc::UF_NODUMP) == MARK
+        && aim_storage::host::file_flags(&st) & (MARK | aim_storage::host::UF_NODUMP) == MARK
         && is_object(fd)
     {
         fdtab::insert(fd, fdtab::Kind::Bpf);
@@ -215,15 +215,18 @@ pub(super) fn adopt(fd: i32) {
 
 /// Whether `region` maps an object file.
 pub(super) fn maps_object(region: &super::vmmap::Region) -> bool {
-    use std::os::{darwin::fs::MetadataExt as _, unix::fs::MetadataExt};
+    #[cfg(target_os = "macos")]
+    use std::os::darwin::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt;
     let Some((path, dev, ino)) = &region.file else {
         return false;
     };
     std::fs::metadata(path).is_ok_and(|m| {
-        m.is_file()
-            && m.dev() == *dev
-            && m.ino() == *ino
-            && m.st_flags() & (MARK | libc::UF_NODUMP) == MARK
+        #[cfg(target_os = "macos")]
+        let flags = m.st_flags();
+        #[cfg(not(target_os = "macos"))]
+        let flags = 0;
+        m.is_file() && m.dev() == *dev && m.ino() == *ino && flags & (MARK | aim_storage::host::UF_NODUMP) == MARK
     })
 }
 
@@ -703,7 +706,7 @@ fn object_path(fd: i32) -> Option<CString> {
     }
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } == 0 {
         let n = buf.iter().position(|&c| c == 0)?;
         let path = std::ffi::OsStr::from_bytes(&buf[..n]);
         if let Ok(metadata) = std::fs::metadata(path)
@@ -732,7 +735,7 @@ fn object_path(fd: i32) -> Option<CString> {
 pub(crate) fn is_object(fd: i32) -> bool {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } != 0 {
         return false;
     }
     let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());

@@ -35,7 +35,7 @@ const END: u64 = BASE + SIZE;
 pub const TAG: u32 = 243;
 
 unsafe extern "C" {
-    fn mach_vm_allocate(task: libc::mach_port_t, address: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_allocate(task: crate::mach_port_t, address: *mut u64, size: u64, flags: i32) -> i32;
 }
 
 /// Reserve `[lo, hi)` (page-aligned, inside the window). With `replace`,

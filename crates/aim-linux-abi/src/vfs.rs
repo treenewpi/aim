@@ -15,18 +15,18 @@
 //! - `/dev/input` is the display server's device directory
 //!   ([`set_input_dir`], `sys::evdev`).
 //! - The process's own mounts (`mount(2)` with `MS_BIND` or `tmpfs`,
-//!   `sys/mount.rs`) are entries over the same table. They belong to this
-//!   process and its children, as after `unshare(CLONE_NEWNS)`. A mount
-//!   hides the older ones at and below its mount point, as mounting over a
-//!   directory does (zygote's tmpfs over `/data/user` hides the path map's
-//!   `/data/user/0`).
+//!   `sys/mount.rs`) are entries over the calling thread's mount namespace.
+//!   Threads share that namespace until `unshare(CLONE_NEWNS)`, which also
+//!   unshares the caller's `fs_struct`. A mount hides the older ones at and
+//!   below its mount point, as mounting over a directory does (zygote's
+//!   tmpfs over `/data/user` hides the path map's `/data/user/0`).
 
-use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsStr};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::errno::{self, Errno};
@@ -112,7 +112,11 @@ fn mount_propagation(guest: &str) -> Propagation {
 }
 pub fn set_mount_propagation(guest: &str, flags: u64) -> Result<(), Errno> {
     if !REPLAYING_NAMESPACE.with(std::cell::Cell::get) && mount_namespace_id().is_some() {
-        return namespace_event(&format!("propagation-flags\t{guest}\t{flags}"));
+        namespace_event(&format!("propagation-flags\t{guest}\t{flags}"))?;
+        // Propagation is not a mount-vec field. Linux still advances
+        // `ns->event`, so a mounts file wakes even when its text does not.
+        note_mount_table();
+        return Ok(());
     }
     let kind = if flags & (1 << 19) != 0 {
         Propagation::Slave
@@ -127,7 +131,9 @@ pub fn set_mount_propagation(guest: &str, flags: u64) -> Result<(), Errno> {
     });
     rules.push((guest.into(), kind));
     drop(rules);
-    refresh_fuse_mounts()
+    refresh_fuse_mounts()?;
+    note_mount_table();
+    Ok(())
 }
 static PRIVATE_MOUNTS: AtomicBool = AtomicBool::new(false);
 fn fuse_table() -> Option<PathBuf> {
@@ -421,6 +427,7 @@ fn fuse_table_identity() -> Result<Option<(u64, i64, i64, i64, i64)>, Errno> {
     }
 }
 pub fn refresh_fuse_mounts() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     refresh_namespace()?;
     if fuse_table().is_none() {
         return Ok(());
@@ -479,6 +486,9 @@ pub fn refresh_fuse_mounts() -> Result<(), Errno> {
         }
         if mount_propagation(fields[0]) == Propagation::Private
             || !origin_visible(namespace.id(), receiving.as_slice(), fields[0], &origin)?
+            || mounts.iter().any(|mount| {
+                mount.guest == fields[0] && !mount.shared_fuse && !hidden(&mounts, mount)
+            })
         {
             continue;
         }
@@ -668,6 +678,9 @@ pub fn private_mount_namespace() -> Result<(), Errno> {
         publish_process_namespace()?;
     }
     PRIVATE_MOUNTS.store(true, Ordering::Release);
+    if let Some(id) = mount_namespace_id_locked() {
+        *current_mount_namespace().journal_id.lock().unwrap() = Some(id);
+    }
     Ok(())
 }
 
@@ -699,7 +712,813 @@ fn namespace_id(kind: &str) -> Result<String, Errno> {
 fn namespace_error(error: std::io::Error) -> Errno {
     errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
 }
+
+/// One mount namespace a thread can name with `/proc/<pid>/ns/mnt`.
+/// The open fd holds this `Arc` from the moment of `open`. `table` stays
+/// with the namespace; it is not looked up again from the calling thread
+/// at `setns`. `parked` is the propagation journal while another namespace
+/// owns the process-wide journal slot.
+pub(crate) struct MountNs {
+    ino: u64,
+    table: RwLock<Table>,
+    event: AtomicU64,
+    parked: Mutex<Option<ParkedJournal>>,
+    journal_id: Mutex<Option<String>>,
+}
+
+struct ParkedView {
+    owner: aim_storage::mount_namespace::Namespace,
+    records: std::sync::Arc<Vec<aim_storage::mount_namespace::MountRecord>>,
+    generation: u64,
+}
+
+struct ParkedJournal {
+    propagation: Vec<(String, Propagation)>,
+    private_mounts: bool,
+    view: Option<ParkedView>,
+}
+
+/// `fs_struct`. `users` is Linux `fs->users`: `CLONE_FS` shares one, and
+/// `unshare(CLONE_FS)` (implied by `CLONE_NEWNS`) gives the caller a private
+/// one. `mntns_install` returns `EINVAL` while `users != 1`.
+struct SharedFs {
+    users: AtomicU32,
+    cwd: Mutex<String>,
+}
+
+#[derive(Clone)]
+struct TaskState {
+    fs: Arc<SharedFs>,
+    ns: Arc<MountNs>,
+}
+
+thread_local! {
+    static TASK: std::cell::RefCell<Option<TaskState>> = const { std::cell::RefCell::new(None) };
+    static JOURNAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static JOURNAL_GUARD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+static TASKS: Mutex<BTreeMap<i32, TaskState>> = Mutex::new(BTreeMap::new());
+static JOURNAL: Mutex<()> = Mutex::new(());
+static JOURNAL_OWNER: AtomicU64 = AtomicU64::new(0);
+static BOOT_NS: Mutex<Option<Arc<MountNs>>> = Mutex::new(None);
+static BOOT_TABLE: Mutex<Option<Table>> = Mutex::new(None);
+static NAMESPACES: Mutex<BTreeMap<u64, Arc<MountNs>>> = Mutex::new(BTreeMap::new());
+static NEXT_NS_INO: AtomicU64 = AtomicU64::new(0x1000_0001);
+
+fn next_ns_ino() -> u64 {
+    NEXT_NS_INO.fetch_add(1, Ordering::Relaxed)
+}
+
+fn mount_namespace_id_locked() -> Option<String> {
+    NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.id().to_owned())
+}
+
+fn boot_namespace() -> Arc<MountNs> {
+    let mut slot = BOOT_NS.lock().unwrap();
+    if let Some(ns) = slot.as_ref() {
+        return Arc::clone(ns);
+    }
+    let table = BOOT_TABLE.lock().unwrap().take().unwrap_or(Table {
+        mounts: Vec::new(),
+        visible: OnceLock::new(),
+        generation: 0,
+        poll_stamp: 0,
+    });
+    let ns = Arc::new(MountNs {
+        ino: next_ns_ino(),
+        table: RwLock::new(table),
+        event: AtomicU64::new(0),
+        parked: Mutex::new(None),
+        journal_id: Mutex::new(mount_namespace_id_locked()),
+    });
+    NAMESPACES
+        .lock()
+        .unwrap()
+        .insert(ns.ino, Arc::clone(&ns));
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    *slot = Some(Arc::clone(&ns));
+    ns
+}
+
+fn fresh_task() -> TaskState {
+    let cwd = VFS
+        .get()
+        .map(|vfs| vfs.cwd.lock().unwrap().clone())
+        .unwrap_or_else(|| "/".to_owned());
+    TaskState {
+        fs: Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        }),
+        ns: boot_namespace(),
+    }
+}
+
+fn current_task() -> TaskState {
+    if let Some(tid) = crate::sys::current_guest_tid()
+        && let Some(task) = TASKS.lock().unwrap().get(&tid).cloned()
+    {
+        return task;
+    }
+    TASK.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(fresh_task());
+        }
+        slot.borrow().as_ref().unwrap().clone()
+    })
+}
+
+fn store_task(task: TaskState) {
+    if let Some(tid) = crate::sys::current_guest_tid() {
+        TASKS.lock().unwrap().insert(tid, task.clone());
+    }
+    TASK.with(|slot| *slot.borrow_mut() = Some(task));
+}
+
+fn current_mount_namespace() -> Arc<MountNs> {
+    current_task().ns
+}
+
+fn set_current_ns(ns: Arc<MountNs>) {
+    let mut task = current_task();
+    task.ns = ns;
+    store_task(task);
+}
+
+/// The main thread's mount namespace, so `/proc/self` names the leader
+/// after `register_current`.
+pub(crate) fn note_leader(tid: i32) {
+    let task = current_task();
+    TASKS.lock().unwrap().insert(tid, task);
+}
+
+/// A new guest thread. `share_fs` is `CLONE_FS`: one `fs_struct`, and the
+/// same mount namespace until this thread `unshare`s or `setns`s.
+pub(crate) fn bind_spawned_thread(tid: i32, share_fs: bool) {
+    let parent = current_task();
+    let fs = if share_fs {
+        parent.fs.users.fetch_add(1, Ordering::AcqRel);
+        Arc::clone(&parent.fs)
+    } else {
+        Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(parent.fs.cwd.lock().unwrap().clone()),
+        })
+    };
+    TASKS.lock().unwrap().insert(
+        tid,
+        TaskState {
+            fs,
+            ns: Arc::clone(&parent.ns),
+        },
+    );
+}
+
+/// The child host thread adopts the `TaskState` `spawn` stored for it.
+pub(crate) fn adopt_thread_task(tid: i32) {
+    if let Some(task) = TASKS.lock().unwrap().get(&tid).cloned() {
+        TASK.with(|slot| *slot.borrow_mut() = Some(task));
+    }
+}
+
+/// `exit` drops this thread's `CLONE_FS` hold.
+pub(crate) fn unbind_thread(tid: i32) {
+    if let Some(task) = TASKS.lock().unwrap().remove(&tid) {
+        task.fs.users.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `true` when `current->fs->users != 1`: `setns` of a mount namespace
+/// returns `EINVAL`.
+pub(crate) fn fs_is_shared() -> bool {
+    current_task().fs.users.load(Ordering::Acquire) != 1
+}
+
+/// `unshare(CLONE_FS)`. `CLONE_NEWNS` implies it. A private `fs_struct`
+/// (`users == 1`) is unchanged.
+pub fn unshare_fs() {
+    let task = current_task();
+    loop {
+        let users = task.fs.users.load(Ordering::Acquire);
+        if users <= 1 {
+            return;
+        }
+        if task
+            .fs
+            .users
+            .compare_exchange(users, users - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let cwd = task.fs.cwd.lock().unwrap().clone();
+        let mut updated = task;
+        updated.fs = Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        });
+        store_task(updated);
+        return;
+    }
+}
+
+fn task_namespace(tid: i32) -> Option<Arc<MountNs>> {
+    TASKS
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .map(|task| Arc::clone(&task.ns))
+}
+
+/// Mount namespace named by `/proc/<pid>/ns/mnt` or `task/<tid>/ns/mnt`.
+/// `None` is the thread-group leader (`/proc/self`).
+pub(crate) fn proc_mount_namespace(thread: Option<i32>) -> Arc<MountNs> {
+    let tid = thread.unwrap_or_else(crate::sys::main_guest_tid);
+    task_namespace(tid).unwrap_or_else(current_mount_namespace)
+}
+
+pub(crate) fn proc_namespace_link(thread: Option<i32>) -> String {
+    format!("mnt:[{}]", proc_mount_namespace(thread).ino)
+}
+
+/// `readlink` text of the leader's mount namespace (`/proc/self/ns/mnt`).
+pub fn mount_namespace_link() -> String {
+    proc_namespace_link(None)
+}
+
+pub(crate) fn mount_namespace(ino: u64) -> Option<Arc<MountNs>> {
+    NAMESPACES.lock().unwrap().get(&ino).map(Arc::clone)
+}
+
+pub(crate) fn mount_namespace_ino(ns: &MountNs) -> u64 {
+    ns.ino
+}
+
+pub(crate) fn mount_namespace_event(ns: &MountNs) -> u64 {
+    ns.event.load(Ordering::Acquire)
+}
+
+/// Journal id captured for this namespace, so an open mounts file keeps
+/// reading the namespace it named at `open`.
+pub(crate) fn mount_points_of(ns: &MountNs) -> Result<Vec<MountPoint>, Errno> {
+    if let Some(id) = ns.journal_id.lock().unwrap().clone() {
+        return namespace_mount_points(&id);
+    }
+    mount_points()
+}
+
+struct JournalEntered;
+
+impl Drop for JournalEntered {
+    fn drop(&mut self) {
+        JOURNAL_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                JOURNAL_GUARD.with(|guard| *guard.borrow_mut() = None);
+            }
+        });
+    }
+}
+
+fn journal_enter() -> Result<JournalEntered, Errno> {
+    let depth = JOURNAL_DEPTH.with(|depth| depth.get());
+    if depth == 0 {
+        let guard = JOURNAL.lock().unwrap_or_else(|error| error.into_inner());
+        // SAFETY: `JOURNAL` is static. The guard stays in this thread until
+        // the outermost `journal_enter` drops it.
+        let guard: std::sync::MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
+        JOURNAL_GUARD.with(|slot| *slot.borrow_mut() = Some(guard));
+        // Depth is raised before `align` so a nested enter (publish, refresh)
+        // does not lock `JOURNAL` again on this thread.
+        JOURNAL_DEPTH.with(|depth| depth.set(1));
+        if let Err(error) = align_locked() {
+            JOURNAL_DEPTH.with(|depth| depth.set(0));
+            JOURNAL_GUARD.with(|slot| *slot.borrow_mut() = None);
+            return Err(error);
+        }
+        return Ok(JournalEntered);
+    }
+    JOURNAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    Ok(JournalEntered)
+}
+
+fn copy_journal() -> ParkedJournal {
+    let view = NAMESPACE_VIEW.lock().unwrap();
+    ParkedJournal {
+        propagation: PROPAGATION_RULES.lock().unwrap().clone(),
+        private_mounts: PRIVATE_MOUNTS.load(Ordering::Acquire),
+        view: view.as_ref().map(|view| ParkedView {
+            owner: view.owner.clone(),
+            records: Arc::clone(&view.records),
+            generation: view.generation,
+        }),
+    }
+}
+
+fn take_journal() -> ParkedJournal {
+    let view = NAMESPACE_VIEW.lock().unwrap().take();
+    ParkedJournal {
+        propagation: std::mem::take(&mut *PROPAGATION_RULES.lock().unwrap()),
+        private_mounts: PRIVATE_MOUNTS.swap(false, Ordering::AcqRel),
+        view: view.map(|view| ParkedView {
+            owner: view.owner,
+            records: view.records,
+            generation: view.generation,
+        }),
+    }
+}
+
+fn install_parked(parked: ParkedJournal) -> Result<(), Errno> {
+    *PROPAGATION_RULES.lock().unwrap() = parked.propagation;
+    PRIVATE_MOUNTS.store(parked.private_mounts, Ordering::Release);
+    if let Some(view) = parked.view {
+        let page = view.owner.generation().map_err(namespace_error)?;
+        *NAMESPACE_VIEW.lock().unwrap() = Some(NamespaceView {
+            page,
+            owner: view.owner,
+            generation: view.generation,
+            records: view.records,
+        });
+        publish_process_namespace()?;
+    } else {
+        *NAMESPACE_VIEW.lock().unwrap() = None;
+    }
+    Ok(())
+}
+
+fn park_owner(ns: &MountNs) {
+    if JOURNAL_OWNER.load(Ordering::Acquire) != ns.ino {
+        return;
+    }
+    *ns.parked.lock().unwrap() = Some(take_journal());
+    JOURNAL_OWNER.store(0, Ordering::Release);
+}
+
+fn unpark(ns: &MountNs) -> Result<(), Errno> {
+    if let Some(parked) = ns.parked.lock().unwrap().take() {
+        install_parked(parked)?;
+    }
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    if ns.journal_id.lock().unwrap().is_none()
+        && let Some(id) = mount_namespace_id_locked()
+    {
+        *ns.journal_id.lock().unwrap() = Some(id);
+    }
+    Ok(())
+}
+
+fn align_locked() -> Result<(), Errno> {
+    let ns = current_mount_namespace();
+    let owner = JOURNAL_OWNER.load(Ordering::Acquire);
+    if owner == ns.ino {
+        if ns.journal_id.lock().unwrap().is_none()
+            && let Some(id) = mount_namespace_id_locked()
+        {
+            *ns.journal_id.lock().unwrap() = Some(id);
+        }
+        return Ok(());
+    }
+    if owner != 0 {
+        if let Some(previous) = NAMESPACES.lock().unwrap().get(&owner).cloned() {
+            park_owner(&previous);
+        } else {
+            JOURNAL_OWNER.store(0, Ordering::Release);
+        }
+    }
+    unpark(&ns)
+}
+
+fn duplicate_table(table: &Table) -> Table {
+    Table {
+        mounts: table.mounts.clone(),
+        visible: OnceLock::new(),
+        generation: table.generation,
+        poll_stamp: table.poll_stamp,
+    }
+}
+
+/// `unshare(CLONE_NEWNS)`: the caller's new namespace is a copy. Fds and
+/// other threads keep the namespace from before the call.
+pub fn split_mount_namespace() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
+    refresh_fuse_mounts()?;
+    let old = current_mount_namespace();
+    let old_id = old.journal_id.lock().unwrap().clone();
+    *old.parked.lock().unwrap() = Some(copy_journal());
+    if let Err(error) = private_mount_namespace() {
+        *old.parked.lock().unwrap() = None;
+        return Err(error);
+    }
+    let new_id = old.journal_id.lock().unwrap().clone();
+    *old.journal_id.lock().unwrap() = old_id;
+    let table = {
+        let guard = old.table.read().unwrap_or_else(|error| error.into_inner());
+        duplicate_table(&guard)
+    };
+    let ns = Arc::new(MountNs {
+        ino: next_ns_ino(),
+        table: RwLock::new(table),
+        event: AtomicU64::new(old.event.load(Ordering::Acquire)),
+        parked: Mutex::new(None),
+        journal_id: Mutex::new(new_id),
+    });
+    NAMESPACES.lock().unwrap().insert(ns.ino, Arc::clone(&ns));
+    set_current_ns(Arc::clone(&ns));
+    JOURNAL_OWNER.store(ns.ino, Ordering::Release);
+    Ok(())
+}
+
+/// `setns` into `target` for this thread only. `fs->users != 1` is
+/// `EINVAL`. The same namespace still sets the caller's cwd to `/`.
+pub(crate) fn switch_mount_namespace(target: &Arc<MountNs>) -> Result<(), Errno> {
+    if fs_is_shared() {
+        return Err(errno::EINVAL);
+    }
+    let _hold = journal_enter()?;
+    let current = current_mount_namespace();
+    if Arc::ptr_eq(&current, target) {
+        *current_task().fs.cwd.lock().unwrap() = "/".to_owned();
+        return Ok(());
+    }
+    park_owner(&current);
+    set_current_ns(Arc::clone(target));
+    if let Err(error) = unpark(target) {
+        set_current_ns(Arc::clone(&current));
+        let _ = unpark(&current);
+        return Err(error);
+    }
+    // A peer may have appended mounts while this namespace was parked.
+    // The walking table is this process's, so entering the namespace
+    // replays its journal before the next lookup.
+    if let Err(error) = refresh_namespace() {
+        set_current_ns(Arc::clone(&current));
+        let _ = unpark(&current);
+        return Err(error);
+    }
+    *current_task().fs.cwd.lock().unwrap() = "/".to_owned();
+    Ok(())
+}
+
+/// One mount, as a forked child reconstructs it. `origin` stays unset: the
+/// child keeps this snapshot and pins the journal generation so a refresh
+/// does not replay over it.
+#[derive(Clone)]
+pub(crate) struct ForkMount {
+    pub guest: String,
+    pub host: PathBuf,
+    pub area: Area,
+    pub source: Option<String>,
+    pub fstype: Option<String>,
+    pub own: bool,
+    pub seq: u64,
+    pub shared_fuse: bool,
+    pub projected_fuse: bool,
+    pub bind_source: Option<String>,
+    pub fuse: Option<FuseRoute>,
+}
+
+/// A mount namespace the child must be able to name. The parent's current
+/// namespace is included so a `CLONE_NEWNS` child can still `setns` back to
+/// it through an inherited fd.
+#[derive(Clone)]
+pub(crate) struct ForkNamespace {
+    pub ino: u64,
+    pub event: u64,
+    pub journal_id: Option<String>,
+    pub private_mounts: bool,
+    pub propagation: Vec<(String, u8)>,
+    pub mounts: Vec<ForkMount>,
+}
+
+/// Namespaces and the parent's current inode, captured while the parent
+/// still holds them. `new_namespace` is the child's `CLONE_NEWNS`.
+pub(crate) struct ForkNamespaces {
+    pub new_namespace: bool,
+    pub current: u64,
+    pub namespaces: Vec<ForkNamespace>,
+}
+
+fn propagation_code(kind: Propagation) -> u8 {
+    match kind {
+        Propagation::Private => 0,
+        Propagation::Slave => 1,
+        Propagation::Shared => 2,
+    }
+}
+
+fn propagation_kind(code: u8) -> Option<Propagation> {
+    match code {
+        0 => Some(Propagation::Private),
+        1 => Some(Propagation::Slave),
+        2 => Some(Propagation::Shared),
+        _ => None,
+    }
+}
+
+fn snapshot_mount(mount: &Mount) -> ForkMount {
+    ForkMount {
+        guest: mount.guest.clone(),
+        host: mount.host.clone(),
+        area: mount.area,
+        source: mount.source.clone(),
+        fstype: mount.fstype.clone(),
+        own: mount.own,
+        seq: mount.seq,
+        shared_fuse: mount.shared_fuse,
+        projected_fuse: mount.projected_fuse,
+        bind_source: mount.bind_source.clone(),
+        fuse: mount.fuse.clone(),
+    }
+}
+
+fn restore_mount(saved: &ForkMount) -> Mount {
+    Mount {
+        guest: saved.guest.clone(),
+        host: saved.host.clone(),
+        area: saved.area,
+        source: saved.source.clone(),
+        fstype: saved.fstype.clone(),
+        own: saved.own,
+        seq: saved.seq,
+        shared_fuse: saved.shared_fuse,
+        projected_fuse: saved.projected_fuse,
+        bind_source: saved.bind_source.clone(),
+        fuse: saved.fuse.clone(),
+        origin: None,
+    }
+}
+
+/// The namespaces this process holds, including the current one. A guest
+/// fork is a new host process (`docs/fork.md`), so the child cannot see
+/// these `Arc`s unless the image carries them.
+pub(crate) fn capture_fork_namespaces(new_namespace: bool) -> ForkNamespaces {
+    let current = current_mount_namespace().ino;
+    let held: Vec<Arc<MountNs>> = NAMESPACES.lock().unwrap().values().cloned().collect();
+    let mut namespaces = Vec::with_capacity(held.len());
+    for ns in held {
+        let parked = ns.parked.lock().unwrap();
+        let (private_mounts, rules) = if JOURNAL_OWNER.load(Ordering::Relaxed) == ns.ino {
+            (
+                PRIVATE_MOUNTS.load(Ordering::Relaxed),
+                PROPAGATION_RULES.lock().unwrap().clone(),
+            )
+        } else if let Some(parked) = parked.as_ref() {
+            (parked.private_mounts, parked.propagation.clone())
+        } else {
+            (false, Vec::new())
+        };
+        let table = ns.table.read().unwrap();
+        namespaces.push(ForkNamespace {
+            ino: ns.ino,
+            event: ns.event.load(Ordering::Relaxed),
+            journal_id: ns.journal_id.lock().unwrap().clone(),
+            private_mounts,
+            propagation: rules
+                .into_iter()
+                .map(|(root, kind)| (root, propagation_code(kind)))
+                .collect(),
+            mounts: table.mounts.iter().map(snapshot_mount).collect(),
+        });
+    }
+    ForkNamespaces {
+        new_namespace,
+        current,
+        namespaces,
+    }
+}
+
+fn claim_inode(ino: u64) {
+    let mut next = NEXT_NS_INO.load(Ordering::Relaxed);
+    while next <= ino {
+        match NEXT_NS_INO.compare_exchange_weak(
+            next,
+            ino + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => next = actual,
+        }
+    }
+}
+
+/// Replace the calling task's namespace with the same table under `ino`.
+/// `MountNs::ino` is fixed at construction.
+fn retarget_namespace(old: Arc<MountNs>, ino: u64) {
+    claim_inode(ino);
+    if old.ino == ino {
+        return;
+    }
+    let table = duplicate_table(&old.table.read().unwrap());
+    let ns = Arc::new(MountNs {
+        ino,
+        table: RwLock::new(table),
+        event: AtomicU64::new(old.event.load(Ordering::Relaxed)),
+        parked: Mutex::new(old.parked.lock().unwrap().take()),
+        journal_id: Mutex::new(old.journal_id.lock().unwrap().clone()),
+    });
+    let journal_owner = JOURNAL_OWNER.load(Ordering::Acquire) == old.ino;
+    {
+        let mut map = NAMESPACES.lock().unwrap();
+        map.remove(&old.ino);
+        map.insert(ino, Arc::clone(&ns));
+    }
+    // A fork child starts its inode counter where the parent did. The inode
+    // just removed is the one an inherited namespace is materialized under.
+    // Leaving the journal owner on it parks the live view onto that
+    // namespace at the next lookup, and every walk returns ENODEV.
+    if journal_owner {
+        JOURNAL_OWNER.store(ino, Ordering::Release);
+    }
+    if BOOT_NS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|boot| boot.ino == old.ino)
+    {
+        *BOOT_NS.lock().unwrap() = Some(Arc::clone(&ns));
+    }
+    set_current_ns(ns);
+}
+
+fn park_saved(saved: &ForkNamespace) -> Option<ParkedJournal> {
+    let propagation = saved
+        .propagation
+        .iter()
+        .filter_map(|(root, code)| Some((root.clone(), propagation_kind(*code)?)))
+        .collect();
+    let id = saved.journal_id.as_deref()?;
+    let runtime = runtime_dir()?;
+    let owner = aim_storage::mount_namespace::Namespace::open(runtime, id).ok()?;
+    // `origin_visible` searches these records. An empty list makes the next
+    // path walk return EIO when a fuse line names another namespace
+    // (`refresh_fuse_mounts`): that was the child's `readlink` of
+    // `/proc/self/exe` after `setns`. The generation stays on the page so
+    // an unchanged table is not rebuilt. An ext4 host the journal no longer
+    // records is still replayed (`ext4_journal_diverged`): the snapshot
+    // must not keep `apex-mounts/1` after the journal has moved that path.
+    let records = owner.read().ok()?.mounts;
+    let generation = owner.generation().ok()?.current();
+    Some(ParkedJournal {
+        propagation,
+        private_mounts: saved.private_mounts,
+        view: Some(ParkedView {
+            owner,
+            records: Arc::new(records),
+            generation,
+        }),
+    })
+}
+
+fn materialize_namespace(saved: &ForkNamespace) -> bool {
+    if NAMESPACES.lock().unwrap().contains_key(&saved.ino) {
+        claim_inode(saved.ino);
+        return true;
+    }
+    if saved
+        .propagation
+        .iter()
+        .any(|(_, code)| propagation_kind(*code).is_none())
+    {
+        return false;
+    }
+    let mounts: Vec<Mount> = saved.mounts.iter().map(restore_mount).collect();
+    let poll_stamp = mount_stamp(&mounts);
+    let ns = Arc::new(MountNs {
+        ino: saved.ino,
+        table: RwLock::new(Table {
+            mounts,
+            visible: OnceLock::new(),
+            generation: 0,
+            poll_stamp,
+        }),
+        event: AtomicU64::new(saved.event),
+        parked: Mutex::new(park_saved(saved)),
+        journal_id: Mutex::new(saved.journal_id.clone()),
+    });
+    NAMESPACES.lock().unwrap().insert(saved.ino, ns);
+    claim_inode(saved.ino);
+    true
+}
+
+/// Install captured namespaces into this process and give the calling task
+/// its own `fs_struct` (`users == 1`). Fork without `CLONE_FS` does that;
+/// the image never copies the parent's user count or its other threads.
+///
+/// Without `CLONE_NEWNS` the child's current namespace keeps the parent's
+/// current inode (the table `load_own_mounts` already filled). With
+/// `CLONE_NEWNS` that inode stays a separate namespace the inherited fds
+/// can still name, and the child's own namespace takes an inode that does
+/// not collide with any of them.
+pub(crate) fn install_fork_namespaces(image: &ForkNamespaces) -> bool {
+    let cwd = current_task().fs.cwd.lock().unwrap().clone();
+    let private = TaskState {
+        fs: Arc::new(SharedFs {
+            users: AtomicU32::new(1),
+            cwd: Mutex::new(cwd),
+        }),
+        ns: current_mount_namespace(),
+    };
+    store_task(private);
+    if image.new_namespace {
+        let boot = current_mount_namespace();
+        if image.namespaces.iter().any(|ns| ns.ino == boot.ino) {
+            let fresh = image
+                .namespaces
+                .iter()
+                .map(|ns| ns.ino)
+                .max()
+                .unwrap_or(boot.ino)
+                + 1;
+            retarget_namespace(boot, fresh);
+        }
+        for ns in &image.namespaces {
+            if !materialize_namespace(ns) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let boot = current_mount_namespace();
+    if boot.ino != image.current {
+        retarget_namespace(boot, image.current);
+    } else {
+        claim_inode(image.current);
+    }
+    for ns in &image.namespaces {
+        if ns.ino == image.current {
+            claim_inode(ns.ino);
+            continue;
+        }
+        if !materialize_namespace(ns) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+pub(crate) struct FsShare {
+    fs: Arc<SharedFs>,
+    ns: Arc<MountNs>,
+}
+
+#[cfg(test)]
+impl Drop for FsShare {
+    fn drop(&mut self) {
+        self.fs.users.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+impl FsShare {
+    pub(crate) fn namespace_link(&self) -> String {
+        format!("mnt:[{}]", self.ns.ino)
+    }
+
+    pub(crate) fn mounts_contain(&self, guest: &str) -> bool {
+        self.ns
+            .table
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .mounts
+            .iter()
+            .any(|mount| mount.guest == guest)
+    }
+}
+
+/// One extra `fs->users` and a hold on the namespace at this moment, the
+/// way a `CLONE_FS` sibling still lives in the pre-`unshare` namespace.
+#[cfg(test)]
+pub(crate) fn testing_share_fs() -> FsShare {
+    let task = current_task();
+    task.fs.users.fetch_add(1, Ordering::AcqRel);
+    FsShare {
+        fs: Arc::clone(&task.fs),
+        ns: Arc::clone(&task.ns),
+    }
+}
+
+/// Drop every namespace except the caller's, as a new process would before
+/// `install_fork_namespaces` rebuilds the ones an inherited fd names.
+#[cfg(test)]
+pub(crate) fn testing_forget_other_namespaces() {
+    let current = current_mount_namespace().ino;
+    NAMESPACES
+        .lock()
+        .unwrap()
+        .retain(|ino, _| *ino == current);
+}
+
 fn namespace_event(event: &str) -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
         return Ok(());
     }
@@ -739,6 +1558,30 @@ fn apply_namespace_state(state: aim_storage::mount_namespace::State) -> Result<(
         } else if let Some(rest) = event.strip_prefix("propagation-flags\t") {
             let (guest, flags) = rest.rsplit_once('\t').ok_or(errno::EIO)?;
             set_mount_propagation(guest, flags.parse().map_err(|_| errno::EIO)?)?;
+        } else if let Some(rest) = event.strip_prefix("propagated\t") {
+            let line = rest.lines().next().unwrap_or(rest);
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 7 {
+                return Err(errno::EINVAL);
+            }
+            let area = match fields[2] {
+                "ro" => Area::Image,
+                "rw" => Area::Writable,
+                "kernfs" => Area::Kernfs,
+                "host-device" => Area::HostDevice,
+                "input" => Area::Input,
+                _ => return Err(errno::EINVAL),
+            };
+            add_mount(
+                fields[3],
+                PathBuf::from(fields[4]),
+                area,
+                fields[5],
+                fields[6],
+            )?;
+            if let Some((_, rest)) = event.split_once('\n') {
+                load_own_mounts(rest)?;
+            }
         } else if let Some(rest) = event.strip_prefix("move\t") {
             let (from, to) = rest.split_once('\t').ok_or(errno::EIO)?;
             move_mount(from, to)?;
@@ -833,52 +1676,100 @@ fn publish_mount_policy(guest: &str) -> Result<(), Errno> {
     ))
 }
 
+/// An ext4 mount this process walks. A bind is one when it still carries
+/// the ext4 stamp, the same set [`ext4_host_gone`] skips.
+fn tracked_ext4(fstype: Option<&str>, host: &Path) -> bool {
+    match fstype {
+        Some("ext4") => true,
+        Some("bind") => ext4_stamp_path(host).is_file(),
+        _ => false,
+    }
+}
+
+/// The walking table's ext4 hosts are not the journal's. A fork snapshot
+/// can name `apex-mounts/1` while the journal has already moved that guest
+/// path to the activated host. The generation is then pinned to the
+/// journal's current value, so a generation check alone keeps the snapshot.
+fn ext4_journal_diverged(records: &[aim_storage::mount_namespace::MountRecord]) -> bool {
+    let mounts = vfs().mounts.read().unwrap();
+    let table = mounts
+        .iter()
+        .filter(|mount| mount.own && tracked_ext4(mount.fstype.as_deref(), &mount.host))
+        .map(|mount| (mount.guest.as_str(), mount.host.as_path()))
+        .collect::<Vec<_>>();
+    let journal = records
+        .iter()
+        .filter(|record| {
+            record.own && tracked_ext4(Some(record.fstype.as_str()), Path::new(&record.host))
+        })
+        .map(|record| (record.guest.as_str(), record.host.as_str()))
+        .collect::<Vec<_>>();
+    if table.len() != journal.len() {
+        return true;
+    }
+    table.iter().any(|(guest, host)| {
+        !journal
+            .iter()
+            .any(|(recorded, recorded_host)| recorded == guest && Path::new(recorded_host) == *host)
+    })
+}
+
 fn refresh_namespace() -> Result<(), Errno> {
+    let _hold = journal_enter()?;
     if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
         return Ok(());
     }
     let _refresh = NAMESPACE_REFRESH.lock().unwrap();
-    let owner = NAMESPACE_VIEW.lock().unwrap().as_ref().and_then(|view| {
-        (view.page.current() != view.generation).then(|| (view.owner.clone(), view.generation))
-    });
-    if let Some((owner, generation)) = owner {
-        let state = owner.read().map_err(namespace_error)?;
-        if state.generation != generation {
-            let next = state.generation;
-            let mounts = vfs().mounts.read().unwrap().clone();
-            let rules = PROPAGATION_RULES.lock().unwrap().clone();
-            let private = PRIVATE_MOUNTS.load(Ordering::Acquire);
-            let previous = {
-                let mut view = NAMESPACE_VIEW.lock().unwrap();
-                let view = view.as_mut().ok_or(errno::ENODEV)?;
-                std::mem::replace(&mut view.records, std::sync::Arc::new(state.mounts.clone()))
-            };
-            // Replay can import shared routes while applying propagation flags.
-            // Authenticate them against this same complete owner generation.
-            if let Err(error) = apply_namespace_state(state) {
-                *vfs().mounts.write().unwrap() = mounts;
-                *PROPAGATION_RULES.lock().unwrap() = rules;
-                PRIVATE_MOUNTS.store(private, Ordering::Release);
-                if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
-                    view.records = previous;
-                }
-                return Err(error);
-            }
+    let pending = {
+        let view = NAMESPACE_VIEW.lock().unwrap();
+        view.as_ref().map(|view| {
+            (
+                view.owner.clone(),
+                view.generation,
+                view.page.current() != view.generation,
+                std::sync::Arc::clone(&view.records),
+            )
+        })
+    };
+    let Some((owner, generation, generation_moved, records)) = pending else {
+        return Ok(());
+    };
+    if !generation_moved && !ext4_journal_diverged(&records) {
+        return Ok(());
+    }
+    let state = owner.read().map_err(namespace_error)?;
+    if state.generation != generation || ext4_journal_diverged(&state.mounts) {
+        let next = state.generation;
+        let mounts = vfs().mounts.read().unwrap().clone();
+        let rules = PROPAGATION_RULES.lock().unwrap().clone();
+        let private = PRIVATE_MOUNTS.load(Ordering::Acquire);
+        let previous = {
+            let mut view = NAMESPACE_VIEW.lock().unwrap();
+            let view = view.as_mut().ok_or(errno::ENODEV)?;
+            std::mem::replace(&mut view.records, std::sync::Arc::new(state.mounts.clone()))
+        };
+        // Replay can import shared routes while applying propagation flags.
+        // Authenticate them against this same complete owner generation.
+        if let Err(error) = apply_namespace_state(state) {
+            *vfs().mounts.write().unwrap() = mounts;
+            *PROPAGATION_RULES.lock().unwrap() = rules;
+            PRIVATE_MOUNTS.store(private, Ordering::Release);
             if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
-                if view.owner.id() == owner.id() {
-                    view.generation = next;
-                }
+                view.records = previous;
+            }
+            return Err(error);
+        }
+        if let Some(view) = NAMESPACE_VIEW.lock().unwrap().as_mut() {
+            if view.owner.id() == owner.id() {
+                view.generation = next;
             }
         }
     }
     Ok(())
 }
 pub fn mount_namespace_id() -> Option<String> {
-    NAMESPACE_VIEW
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|view| view.owner.id().to_owned())
+    let _hold = journal_enter().ok()?;
+    mount_namespace_id_locked()
 }
 
 pub(crate) fn publish_process_namespace() -> Result<(), Errno> {
@@ -1099,7 +1990,7 @@ struct Vfs {
     /// Whether a path map is in use (the image is then read-only).
     mapped: bool,
     /// The device of the root when it is a read-only mount (the image's).
-    read_only_dev: Option<i32>,
+    read_only_dev: Option<libc::dev_t>,
     /// Longest guest prefix first; among equal prefixes the latest mount.
     mounts: MountTable,
     /// Directory holding the path map (the guest-init runtime directory).
@@ -1111,31 +2002,83 @@ struct Vfs {
 /// at the first lookup after a change) and a count of its changes:
 /// lookups ask visibility for every path, and the table changes far less
 /// often.
-struct MountTable(RwLock<Table>);
+struct MountTable;
 struct Table {
     mounts: Vec<Mount>,
     visible: OnceLock<Vec<bool>>,
     generation: u64,
+    /// Identity of the mounts a proc mount file's poll last published.
+    /// `mounts_poll` reports one priority edge per real change, so a write
+    /// that leaves the table the same is not one.
+    poll_stamp: u64,
 }
 impl MountTable {
     fn new(mounts: Vec<Mount>) -> Self {
-        Self(RwLock::new(Table {
+        let poll_stamp = mount_stamp(&mounts);
+        let table = Table {
             mounts,
             visible: OnceLock::new(),
             generation: 0,
-        }))
+            poll_stamp,
+        };
+        if let Some(ns) = BOOT_NS.lock().unwrap().as_ref().cloned() {
+            *ns.table.write().unwrap_or_else(|error| error.into_inner()) = table;
+        } else {
+            *BOOT_TABLE.lock().unwrap() = Some(table);
+        }
+        Self
     }
-    fn read(&self) -> std::sync::LockResult<MountsRead<'_>> {
-        self.0
-            .read()
-            .map(MountsRead)
-            .map_err(|error| std::sync::PoisonError::new(MountsRead(error.into_inner())))
+    fn read(&self) -> std::sync::LockResult<MountsRead<'static>> {
+        let ns = current_mount_namespace();
+        match detach_read(&ns) {
+            Ok(guard) => Ok(MountsRead { guard, _ns: ns }),
+            Err(error) => {
+                let guard = error.into_inner();
+                Err(std::sync::PoisonError::new(MountsRead { guard, _ns: ns }))
+            }
+        }
     }
-    fn write(&self) -> std::sync::LockResult<MountsWrite<'_>> {
-        self.0
-            .write()
-            .map(MountsWrite)
-            .map_err(|error| std::sync::PoisonError::new(MountsWrite(error.into_inner())))
+    fn write(&self) -> std::sync::LockResult<MountsWrite<'static>> {
+        let ns = current_mount_namespace();
+        match detach_write(&ns) {
+            Ok(guard) => Ok(MountsWrite { guard, _ns: ns }),
+            Err(error) => {
+                let guard = error.into_inner();
+                Err(std::sync::PoisonError::new(MountsWrite { guard, _ns: ns }))
+            }
+        }
+    }
+}
+
+fn detach_read(
+    ns: &MountNs,
+) -> std::sync::LockResult<std::sync::RwLockReadGuard<'static, Table>> {
+    match ns.table.read() {
+        // SAFETY: the caller keeps `ns`'s `Arc` alive until the guard drops.
+        Ok(guard) => Ok(unsafe { std::mem::transmute(guard) }),
+        Err(error) => {
+            let guard = error.into_inner();
+            // SAFETY: same as the unpoisoned path.
+            Err(std::sync::PoisonError::new(unsafe {
+                std::mem::transmute(guard)
+            }))
+        }
+    }
+}
+
+fn detach_write(
+    ns: &MountNs,
+) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'static, Table>> {
+    match ns.table.write() {
+        // SAFETY: the caller keeps `ns`'s `Arc` alive until the guard drops.
+        Ok(guard) => Ok(unsafe { std::mem::transmute(guard) }),
+        Err(error) => {
+            let guard = error.into_inner();
+            // SAFETY: same as the unpoisoned path.
+            Err(std::sync::PoisonError::new(unsafe {
+                std::mem::transmute(guard)
+            }))
+        }
     }
 }
 impl Table {
@@ -1146,11 +2089,16 @@ impl Table {
         self.generation += 1;
     }
 }
-struct MountsRead<'a>(std::sync::RwLockReadGuard<'a, Table>);
+struct MountsRead<'a> {
+    // Fields drop in declaration order. Unlock before the `Arc` can free the
+    // `RwLock`.
+    guard: std::sync::RwLockReadGuard<'a, Table>,
+    _ns: Arc<MountNs>,
+}
 impl MountsRead<'_> {
     /// Whether no later mount hides the `index`th.
     fn visible(&self, index: usize) -> bool {
-        let table = &self.0;
+        let table = &*self.guard;
         table.visible.get_or_init(|| {
             table
                 .mounts
@@ -1160,31 +2108,179 @@ impl MountsRead<'_> {
         })[index]
     }
     fn generation(&self) -> u64 {
-        self.0.generation
+        self.guard.generation
     }
 }
 impl std::ops::Deref for MountsRead<'_> {
     type Target = Vec<Mount>;
     fn deref(&self) -> &Vec<Mount> {
-        &self.0.mounts
+        &self.guard.mounts
     }
 }
-struct MountsWrite<'a>(std::sync::RwLockWriteGuard<'a, Table>);
+struct MountsWrite<'a> {
+    // Fields drop in declaration order. Unlock before the `Arc` can free the
+    // `RwLock`.
+    guard: std::sync::RwLockWriteGuard<'a, Table>,
+    _ns: Arc<MountNs>,
+}
 impl std::ops::Deref for MountsWrite<'_> {
     type Target = Vec<Mount>;
     fn deref(&self) -> &Vec<Mount> {
-        &self.0.mounts
+        &self.guard.mounts
     }
 }
 impl std::ops::DerefMut for MountsWrite<'_> {
     fn deref_mut(&mut self) -> &mut Vec<Mount> {
-        &mut self.0.mounts
+        &mut self.guard.mounts
     }
 }
 impl Drop for MountsWrite<'_> {
     fn drop(&mut self) {
-        self.0.changed();
+        let stamp = mount_stamp(&self.guard.mounts);
+        let changed = stamp != self.guard.poll_stamp;
+        self.guard.poll_stamp = stamp;
+        self.guard.changed();
+        if changed {
+            note_mount_table();
+        }
     }
+}
+
+static MOUNT_WAKE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static MOUNT_WAKE_ERRNO: AtomicI32 = AtomicI32::new(0);
+/// Tests force the wake pipe closed. A failure is not remembered: the next
+/// call creates the pipe again.
+#[cfg(test)]
+static FAIL_MOUNT_WAKE: AtomicBool = AtomicBool::new(false);
+
+/// The mount generation of the calling thread's namespace (`ns->event`).
+pub fn mount_event() -> u64 {
+    current_mount_namespace().event.load(Ordering::Acquire)
+}
+
+/// A fork child starts from the parent's generation, so a copied `p->event`
+/// does not become a new edge.
+pub(crate) fn restore_mount_event(event: u64) {
+    current_mount_namespace()
+        .event
+        .store(event, Ordering::Release);
+}
+
+/// Read end of the pipe `note_mount_table` writes. Hidden from the guest.
+/// Negative when the pipe cannot be created; the errno is
+/// [`mount_wake_errno`]. A failed attempt is not cached.
+pub fn mount_wake_fd() -> i32 {
+    match mount_wake() {
+        Ok((read, _)) => read,
+        Err(error) => {
+            MOUNT_WAKE_ERRNO.store(error, Ordering::Release);
+            -1
+        }
+    }
+}
+
+/// Errno from the last failed [`mount_wake_fd`].
+pub fn mount_wake_errno() -> i32 {
+    MOUNT_WAKE_ERRNO.load(Ordering::Acquire)
+}
+
+/// Drop bytes left by a generation a waiter has already observed.
+pub fn drain_mount_wake() {
+    let Ok((fd, _)) = mount_wake() else {
+        return;
+    };
+    let mut buf = [0u8; 64];
+    // SAFETY: our nonblocking pipe, local buffer.
+    unsafe {
+        while libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 {}
+    }
+}
+
+fn mount_wake() -> Result<(i32, i32), i32> {
+    #[cfg(test)]
+    if FAIL_MOUNT_WAKE.load(Ordering::Relaxed) {
+        return Err(crate::errno::EMFILE);
+    }
+    let mut slot = MOUNT_WAKE.lock().unwrap();
+    if let Some(fds) = *slot {
+        return Ok(fds);
+    }
+    let mut fds = [0; 2];
+    // SAFETY: a private pipe, then moved out of the guest fd range.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(crate::errno::last());
+        }
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    let pair = (
+        crate::sys::fdtab::hide(fds[0]),
+        crate::sys::fdtab::hide(fds[1]),
+    );
+    *slot = Some(pair);
+    Ok(pair)
+}
+
+/// Make `mount_wake` fail with `EMFILE` until cleared. The generation still
+/// moves; only the wake pipe is absent.
+#[cfg(test)]
+pub(crate) fn testing_fail_mount_wake(fail: bool) {
+    FAIL_MOUNT_WAKE.store(fail, Ordering::Relaxed);
+}
+
+/// Bump `ns->event` and wake mount-file pollers. Several notes before a
+/// poll are one edge: the file stores the generation it observes. The
+/// generation moves even when the pipe cannot be written.
+fn note_mount_table() {
+    current_mount_namespace()
+        .event
+        .fetch_add(1, Ordering::Release);
+    let Ok((_, fd)) = mount_wake() else {
+        return;
+    };
+    let byte = [1u8];
+    // SAFETY: our nonblocking pipe. A full buffer already has a wake pending.
+    unsafe {
+        libc::write(fd, byte.as_ptr().cast(), 1);
+    }
+}
+
+fn mount_stamp(mounts: &[Mount]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    for mount in mounts {
+        mix(mount.guest.as_bytes());
+        mix(mount.host.as_os_str().as_encoded_bytes());
+        mix(mount.source.as_deref().unwrap_or("").as_bytes());
+        mix(mount.fstype.as_deref().unwrap_or("").as_bytes());
+        mix(mount.bind_source.as_deref().unwrap_or("").as_bytes());
+        mix(&mount.seq.to_le_bytes());
+        let area = match mount.area {
+            Area::Image => 1,
+            Area::Writable => 2,
+            Area::Kernfs => 3,
+            Area::HostDevice => 4,
+            Area::Input => 5,
+        };
+        mix(&[
+            area,
+            u8::from(mount.own),
+            u8::from(mount.shared_fuse),
+            u8::from(mount.projected_fuse),
+            u8::from(mount.fuse.as_ref().is_some_and(|route| route.read_only)),
+        ]);
+    }
+    hash
 }
 
 static VFS: OnceLock<Vfs> = OnceLock::new();
@@ -1581,19 +2677,32 @@ pub fn init(root: &Path, map: Option<&Path>) -> Result<(), String> {
 }
 
 /// The device of the filesystem holding `root`, if it is mounted read-only.
-fn read_only_dev(root: &Path) -> Option<i32> {
+fn read_only_dev(root: &Path) -> Option<libc::dev_t> {
     let c = CString::new(root.as_os_str().as_bytes()).ok()?;
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, local buffers.
-    let ok =
-        unsafe { libc::statfs(c.as_ptr(), &mut fs) == 0 && libc::stat(c.as_ptr(), &mut st) == 0 };
-    (ok && fs.f_flags & libc::MNT_RDONLY as u32 != 0).then_some(st.st_dev)
+    if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        let read_only = unsafe { libc::statfs(c.as_ptr(), &mut fs) == 0 }
+            && fs.f_flags as u64 & libc::MNT_RDONLY as u64 != 0;
+        read_only.then_some(st.st_dev)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let read_only = unsafe { libc::statvfs(c.as_ptr(), &mut fs) == 0 }
+            && fs.f_flag & libc::ST_RDONLY as u64 != 0;
+        read_only.then_some(st.st_dev)
+    }
 }
 
 /// Whether host device `dev` is the read-only volume of the root: nothing
 /// on it can have been changed by a guest.
-pub fn on_read_only_root(dev: i32) -> bool {
+pub fn on_read_only_root(dev: libc::dev_t) -> bool {
     VFS.get().and_then(|v| v.read_only_dev) == Some(dev)
 }
 
@@ -1615,6 +2724,34 @@ fn vfs() -> &'static Vfs {
 
 pub fn root() -> &'static Path {
     &vfs().root
+}
+
+/// Whether `st` is the image directory itself. A mount whose host is that
+/// directory still names this inode; a guest chmod of it is `EROFS` and
+/// its `dev.aim.guest-inode` is not its mode. Children are other inodes.
+pub fn is_image_root_inode(st: &libc::stat) -> bool {
+    let Some(&(dev, ino)) = image_root_identity() else {
+        return false;
+    };
+    dev == st.st_dev && ino == st.st_ino
+}
+
+/// `(st_dev, st_ino)` of the image directory. A failed stat is not cached:
+/// the directory is not replaced once this process has published it.
+fn image_root_identity() -> Option<&'static (libc::dev_t, u64)> {
+    static CACHED: OnceLock<(libc::dev_t, u64)> = OnceLock::new();
+    if let Some(id) = CACHED.get() {
+        return Some(id);
+    }
+    let root = VFS.get()?;
+    let path = CString::new(root.root.as_os_str().as_bytes()).ok()?;
+    let mut root_st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated path, local buffer.
+    if unsafe { libc::lstat(path.as_ptr(), &mut root_st) } != 0 {
+        return None;
+    }
+    let _ = CACHED.set((root_st.st_dev, root_st.st_ino));
+    CACHED.get()
 }
 
 /// The guest-init runtime directory (`<runtime>/fs-attrs`, `sockets`,
@@ -1888,7 +3025,16 @@ fn namespace_backend_points(id: &str) -> Result<Vec<MountPoint>, Errno> {
                     }
                     continue;
                 }
-                let fields = line.split('\t').collect::<Vec<_>>();
+                let propagated = line.strip_prefix("propagated\t");
+                let fields = if let Some(rest) = propagated {
+                    let extra = rest.split('\t').collect::<Vec<_>>();
+                    if extra.len() != 7 {
+                        return Err(errno::EINVAL);
+                    }
+                    vec![extra[2], extra[3], extra[4], extra[5], extra[6]]
+                } else {
+                    line.split('\t').collect::<Vec<_>>()
+                };
                 if fields.len() == 3 && fields[0] == "bind-source" {
                     if let Some(mount) = mounts
                         .iter_mut()
@@ -2022,6 +3168,80 @@ pub fn is_mountpoint(guest: &str) -> bool {
     })
 }
 
+/// Fail when a host directory the guest can create files in is on a
+/// case-folding volume. That is the path map's writable and kernfs
+/// directories (`/data`, `/cache`, and the other writable layers), the
+/// tmpfs backing directory `<runtime>/tmpfs`, socket directories, scratch,
+/// and `$TMPDIR`. A path that does not exist yet is judged by the
+/// directory that will hold it. Call after [`init`].
+pub fn require_case_sensitive_backing() -> Result<(), String> {
+    let v = vfs();
+    let mut entries = Vec::new();
+    if !v.mapped {
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "root".to_string(),
+            path: v.root.clone(),
+        });
+    }
+    let mounts: Vec<(String, PathBuf, bool)> = {
+        let mounts = v.mounts.read().unwrap();
+        mounts
+            .iter()
+            .filter(|m| !m.own && matches!(m.area, Area::Writable | Area::Kernfs))
+            .map(|m| {
+                let role = if m.area == Area::Kernfs {
+                    format!("kernfs {}", m.guest)
+                } else {
+                    format!("writable {}", m.guest)
+                };
+                (role, m.host.clone(), m.guest == "/dev")
+            })
+            .collect()
+    };
+    for (role, host, dev_socket) in mounts {
+        if dev_socket {
+            entries.push(crate::case_volume::VolumeCheck {
+                role: "socket directory".to_string(),
+                path: host.join("socket"),
+            });
+        }
+        entries.push(crate::case_volume::VolumeCheck {
+            role,
+            path: host_backing(&host),
+        });
+    }
+    if let Some(runtime) = v.runtime.as_deref() {
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "tmpfs backing".to_string(),
+            path: runtime.join("tmpfs"),
+        });
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "socket directory".to_string(),
+            path: runtime.join("dev").join("socket"),
+        });
+        entries.push(crate::case_volume::VolumeCheck {
+            role: "scratch".to_string(),
+            path: runtime.join("scratch"),
+        });
+    }
+    entries.push(crate::case_volume::VolumeCheck {
+        role: "TMPDIR".to_string(),
+        path: std::env::temp_dir(),
+    });
+    crate::case_volume::require(&entries)
+}
+
+fn host_backing(host: &Path) -> PathBuf {
+    match std::fs::metadata(host) {
+        Ok(meta) if meta.is_dir() => host.to_path_buf(),
+        Ok(_) => host
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| host.to_path_buf()),
+        Err(_) => host.to_path_buf(),
+    }
+}
+
 /// The host paths the guest writes to: the path map's writable entries,
 /// or the root without a path map. None before [`init`].
 pub fn writable_hosts() -> Option<Vec<PathBuf>> {
@@ -2040,11 +3260,11 @@ pub fn writable_hosts() -> Option<Vec<PathBuf>> {
 }
 
 pub fn cwd() -> String {
-    vfs().cwd.lock().unwrap().clone()
+    current_task().fs.cwd.lock().unwrap().clone()
 }
 
 pub fn set_cwd(guest: String) {
-    *vfs().cwd.lock().unwrap() = guest;
+    *current_task().fs.cwd.lock().unwrap() = guest;
 }
 
 /// The rest of `path` below the mount point `at`, if it is there.
@@ -2063,14 +3283,155 @@ fn hidden(mounts: &[Mount], m: &Mount) -> bool {
         .any(|n| n.seq > m.seq && below(&n.guest, &m.guest).is_some())
 }
 
+/// Sidecar beside an ext4 host directory. The same bytes are an attribute
+/// of the directory. Removing and creating the directory again drops that
+/// attribute; an inode number can be reused, so the bytes are the record.
+/// The attribute is not a directory entry, so a mounted APEX payload does
+/// not contain it.
+pub(crate) fn ext4_stamp_path(host: &Path) -> PathBuf {
+    let mut name = host.file_name().unwrap_or_default().to_os_string();
+    name.push(".stamp");
+    host.with_file_name(name)
+}
+
+/// `dev.aim.ext4-stamp` where the host accepts that name, otherwise
+/// `user.aim.ext4-stamp`. A guest attribute is `dev.aim.xattr.*`, so this
+/// name is not one.
+const EXT4_STAMP_ATTRS: [&CStr; 2] = [c"dev.aim.ext4-stamp", c"user.aim.ext4-stamp"];
+
+fn write_ext4_stamp_attr(host: &Path, text: &[u8]) -> Result<(), Errno> {
+    let path = host_cstring(host.to_path_buf())?;
+    let mut error = errno::EIO;
+    for name in EXT4_STAMP_ATTRS {
+        // SAFETY: path and name are NUL-terminated; `text` is the value.
+        let wrote = unsafe {
+            aim_storage::host::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                text.as_ptr().cast(),
+                text.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        if wrote == 0 {
+            return Ok(());
+        }
+        error = errno::last();
+    }
+    Err(error)
+}
+
+/// The identity bytes on `host`, or `None` when the directory does not
+/// carry them. A read that fails for another reason is `Err`, and the
+/// mount stays.
+fn read_ext4_stamp_attr(host: &Path) -> Result<Option<Vec<u8>>, ()> {
+    let path = host_cstring(host.to_path_buf()).map_err(|_| ())?;
+    let mut buf = [0u8; 64];
+    for (i, name) in EXT4_STAMP_ATTRS.iter().enumerate() {
+        // SAFETY: path and name are NUL-terminated; the buffer is 64 bytes.
+        let n = unsafe {
+            aim_storage::host::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        if n >= 0 {
+            return Ok(Some(buf[..n as usize].to_vec()));
+        }
+        let missing = errno::last() == errno::ENODATA;
+        if i + 1 == EXT4_STAMP_ATTRS.len() {
+            return if missing { Ok(None) } else { Err(()) };
+        }
+    }
+    Ok(None)
+}
+
+/// Remember the directory `host` that an ext4 mount just installed.
+///
+/// A later install must not reuse this path. If something replaces the
+/// directory anyway, the attribute on it is gone and the mount stops
+/// covering the guest path. The record is not a file in that directory.
+pub(crate) fn note_ext4_host(host: &Path) -> Result<(), Errno> {
+    let meta = std::fs::metadata(host).map_err(|error| {
+        errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+    })?;
+    if !meta.is_dir() {
+        return Err(errno::ENOTDIR);
+    }
+    let text = format!("{}\n", std::process::id());
+    write_ext4_stamp_attr(host, text.as_bytes())?;
+    std::fs::write(ext4_stamp_path(host), &text).map_err(|error| {
+        errno::from_darwin(error.raw_os_error().unwrap_or(libc::EIO))
+    })
+}
+
+/// The recorded directory was removed and created again. The path exists,
+/// but it is not the tree this mount installed. A failed read other than
+/// a missing attribute keeps the mount.
+fn ext4_identity_replaced(host: &Path) -> bool {
+    let expected = match std::fs::read(ext4_stamp_path(host)) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    match read_ext4_stamp_attr(host) {
+        Ok(Some(found)) => found != expected,
+        Ok(None) => true,
+        Err(()) => false,
+    }
+}
+
+/// An ext4 mount whose host directory is gone, or no longer the directory
+/// that was installed. The directory is the superblock filled when the
+/// mount was created. A later payload used to remove that directory and
+/// create it again, so the mount still named a path whose `linker64` was
+/// missing and hid the activated tree. A bind of the same host does too.
+/// The entry does not cover the guest path. A directory that is still the
+/// installed one keeps covering the path. `EACCES` does not.
+fn ext4_host_gone(mount: &Mount) -> bool {
+    let stamped = ext4_stamp_path(&mount.host).is_file();
+    let ext4 = mount.fstype.as_deref() == Some("ext4");
+    let bind_of_ext4 = mount.fstype.as_deref() == Some("bind") && stamped;
+    if !ext4 && !bind_of_ext4 {
+        return false;
+    }
+    match std::fs::metadata(&mount.host) {
+        Ok(meta) => !meta.is_dir() || ext4_identity_replaced(&mount.host),
+        // A missing directory does not cover the path. Any other error,
+        // including EACCES, leaves the mount in place so the caller's
+        // open returns that errno.
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether a later mount whose host is still there covers `m`.
+fn covered_by_live(mounts: &[Mount], m: &Mount) -> bool {
+    mounts.iter().any(|n| {
+        n.seq > m.seq && below(&n.guest, &m.guest).is_some() && !ext4_host_gone(n)
+    })
+}
+
 /// The mount that holds the normalized guest path, and the path below it:
-/// the deepest one not hidden. `mounts` is ordered longest mount point
-/// first, the latest first among equal ones.
+/// the deepest one that is not hidden by a mount whose host is still there.
+/// `mounts` is ordered longest mount point first, the latest first among
+/// equal ones. The visible-bit cache is not enough: removing a host
+/// directory does not change the mount generation.
 fn holder<'a, 'p>(mounts: &'a MountsRead<'_>, guest: &'p str) -> Option<(&'a Mount, &'p str)> {
-    mounts
-        .iter()
-        .enumerate()
-        .find_map(|(index, m)| Some((m, below(&m.guest, guest)?)).filter(|_| mounts.visible(index)))
+    mounts.iter().find_map(|m| {
+        let rest = below(&m.guest, guest)?;
+        if ext4_host_gone(m) || covered_by_live(mounts, m) {
+            None
+        } else {
+            Some((m, rest))
+        }
+    })
 }
 
 /// Host path and area of a normalized absolute guest path, without
@@ -2190,6 +3551,7 @@ fn install_mount(
             event.push_str(&format!("bind-source\t{guest}\t{source}\n"));
         }
         namespace_event(&event)?;
+        propagate_created(guest)?;
         if let Some(route) = &route {
             publish_fuse_route(guest, &host, source, Some(route))?;
         } else {
@@ -2260,6 +3622,34 @@ fn install_mount(
     Ok(())
 }
 
+/// The host file of `guest` on the mount that covers it, with that mount's
+/// source and filesystem type.
+///
+/// An ext4 mount's host directory is the superblock installed when the
+/// mount was created. A namespace copy names the same directory. Reading
+/// it does not open the loop or dm device again.
+pub(crate) fn mounted_backend(guest: &str) -> Option<(PathBuf, String, String)> {
+    let mounts = vfs().mounts.read().ok()?;
+    let mount = mounts
+        .iter()
+        .filter(|mount| {
+            mount.own
+                && (mount.guest == guest || below(&mount.guest, guest).is_some())
+                && !ext4_host_gone(mount)
+        })
+        .max_by_key(|mount| (mount.guest.len(), mount.seq))?;
+    let relative = if guest == mount.guest {
+        ""
+    } else {
+        below(&mount.guest, guest)?
+    };
+    Some((
+        mount.host.join(relative),
+        mount.source.clone().unwrap_or_default(),
+        mount.fstype.clone().unwrap_or_default(),
+    ))
+}
+
 /// The filesystem type of the mount that holds the normalized guest path.
 pub fn fstype(guest: &str) -> Option<String> {
     let mounts = VFS.get()?.mounts.read().unwrap();
@@ -2322,6 +3712,251 @@ pub fn remount_fuse(guest: &str, read_only: bool) -> Result<bool, Errno> {
     Ok(true)
 }
 
+/// Path of `child` below the mount point `parent`.
+fn mount_relative<'a>(parent: &str, child: &'a str) -> Option<&'a str> {
+    if parent == "/" {
+        child.strip_prefix('/')
+    } else if child == parent {
+        Some("")
+    } else {
+        child.strip_prefix(parent)?.strip_prefix('/')
+    }
+}
+
+/// Where a mount event at `child` lands on one peer of its parent.
+///
+/// The peer keeps its own path. A bind of `/bootstrap-apex` onto a private
+/// `/apex` joins that mount's peer group. The bind's root is the source
+/// path inside the shared tree, so a later mount on `/apex` is
+/// `/bootstrap-apex` in a peer whose root is `/`, not the peer's own
+/// mountpoint. Using the mountpoint alone makes that copy `/` and hides
+/// the image root.
+fn propagated_guest(
+    parent_guest: &str,
+    parent_root: &str,
+    child: &str,
+    receiver_guest: &str,
+    receiver_root: &str,
+) -> Option<String> {
+    let relative = mount_relative(parent_guest, child)?;
+    let parent_root = if parent_root.is_empty() { "/" } else { parent_root };
+    let receiver_root = if receiver_root.is_empty() { "/" } else { receiver_root };
+    let mut within = parent_root.trim_end_matches('/').to_string();
+    if !relative.is_empty() {
+        if within.is_empty() {
+            within = format!("/{relative}");
+        } else {
+            within = format!("{within}/{relative}");
+        }
+    }
+    if within.is_empty() {
+        within = "/".into();
+    }
+    let below = if receiver_root == "/" {
+        within.trim_start_matches('/').to_string()
+    } else if within == receiver_root {
+        String::new()
+    } else {
+        within
+            .strip_prefix(receiver_root)?
+            .trim_start_matches('/')
+            .to_string()
+    };
+    if below.is_empty() {
+        return Some(receiver_guest.to_string());
+    }
+    if receiver_guest == "/" {
+        Some(format!("/{below}"))
+    } else {
+        Some(format!(
+            "{}/{below}",
+            receiver_guest.trim_end_matches('/')
+        ))
+    }
+}
+
+struct PropCopy {
+    namespace: aim_storage::mount_namespace::Namespace,
+    /// The path of this event on the receiving peer.
+    guest: String,
+    receiver: String,
+    shared: u64,
+    master: u64,
+    same: bool,
+}
+
+/// Peers that receive a mount or unmount at `guest`, including another
+/// peer in this namespace (a bind of a shared mount).
+///
+/// The containing mount is the parent. A shared parent propagates to its
+/// peers and to its slaves. A private or slave parent sends nothing. The
+/// copy's path is the receiver's path plus the path below the parent, not
+/// the source path.
+fn propagation_copies(guest: &str) -> Result<Vec<PropCopy>, Errno> {
+    if REPLAYING_NAMESPACE.with(std::cell::Cell::get) {
+        return Ok(Vec::new());
+    }
+    let Some(owner) = NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.clone())
+    else {
+        return Ok(Vec::new());
+    };
+    let state = owner.read().map_err(namespace_error)?;
+    let Some(record) = state
+        .mounts
+        .iter()
+        .filter(|mount| mount.guest == guest)
+        .max_by_key(|mount| mount.id)
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(parent) = state
+        .mounts
+        .iter()
+        .find(|mount| mount.id == record.parent)
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    if parent.shared == 0 || parent.id == record.id {
+        return Ok(Vec::new());
+    }
+    let runtime = owner.runtime().to_path_buf();
+    let mut namespaces = vec![(owner.clone(), true)];
+    for id in aim_storage::mount_namespace::Namespace::ids(&runtime).map_err(namespace_error)? {
+        if id == owner.id() {
+            continue;
+        }
+        namespaces.push((
+            aim_storage::mount_namespace::Namespace::open(&runtime, &id).map_err(namespace_error)?,
+            false,
+        ));
+    }
+    drop(state);
+    let mut copies = Vec::new();
+    for (namespace, same) in namespaces {
+        let state = if same {
+            owner.read().map_err(namespace_error)?
+        } else {
+            namespace.read().map_err(namespace_error)?
+        };
+        let mut newest: Vec<aim_storage::mount_namespace::MountRecord> = Vec::new();
+        for mount in &state.mounts {
+            if mount.shared != parent.shared && mount.master != parent.shared {
+                continue;
+            }
+            if same && mount.id == parent.id {
+                continue;
+            }
+            if let Some(slot) = newest.iter_mut().find(|kept| kept.guest == mount.guest) {
+                if mount.id > slot.id {
+                    *slot = mount.clone();
+                }
+            } else {
+                newest.push(mount.clone());
+            }
+        }
+        for mount in newest {
+            let Some(dest) = propagated_guest(
+                &parent.guest,
+                &parent.root,
+                guest,
+                &mount.guest,
+                &mount.root,
+            ) else {
+                continue;
+            };
+            if same && dest == guest {
+                continue;
+            }
+            let (shared, master) = if mount.shared == parent.shared {
+                (record.shared, record.master)
+            } else if mount.shared == 0 {
+                (0, record.shared)
+            } else {
+                (
+                    namespace
+                        .propagated_group(record.id, mount.shared)
+                        .map_err(namespace_error)?,
+                    record.shared,
+                )
+            };
+            copies.push(PropCopy {
+                namespace: namespace.clone(),
+                guest: dest,
+                receiver: mount.guest,
+                shared,
+                master,
+                same,
+            });
+        }
+    }
+    Ok(copies)
+}
+
+fn write_propagation(copy: &PropCopy, event: &str) -> Result<(), Errno> {
+    if copy.same {
+        namespace_event(event)
+    } else {
+        copy.namespace.append(event).map_err(namespace_error)?;
+        Ok(())
+    }
+}
+
+/// Copy the mount just created at `guest` into every peer of its parent.
+///
+/// A FUSE route already reaches peers through the shared route table.
+/// A second plain copy at the same path would hide that route. The copy
+/// uses the peer's path: a mount made under `/apex` after that directory
+/// was bound over a shared `/bootstrap-apex` is created at
+/// `/bootstrap-apex` in every peer, including this namespace.
+fn propagate_created(guest: &str) -> Result<(), Errno> {
+    if vfs().mounts.read().unwrap().iter().any(|mount| {
+        mount.guest == guest && mount.own && mount.fuse.is_some()
+    }) {
+        return Ok(());
+    }
+    let copies = propagation_copies(guest)?;
+    if copies.is_empty() {
+        return Ok(());
+    }
+    let owner = NAMESPACE_VIEW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|view| view.owner.clone())
+        .ok_or(errno::ENODEV)?;
+    let state = owner.read().map_err(namespace_error)?;
+    let record = state
+        .mounts
+        .iter()
+        .filter(|mount| mount.guest == guest)
+        .max_by_key(|mount| mount.id)
+        .ok_or(errno::ENOENT)?
+        .clone();
+    drop(state);
+    let mut same = false;
+    for copy in &copies {
+        write_propagation(
+            copy,
+            &format!(
+                "propagated\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                copy.shared, copy.master, record.kind, copy.guest, record.host, record.source,
+                record.fstype
+            ),
+        )?;
+        same |= copy.same;
+    }
+    if same {
+        refresh_namespace()?;
+    }
+    Ok(())
+}
+
 /// Remove the latest mount this process made at `guest`.
 pub fn remove_mount(guest: &str) -> Result<bool, Errno> {
     refresh_namespace()?;
@@ -2335,7 +3970,11 @@ pub fn remove_mount(guest: &str) -> Result<bool, Errno> {
         {
             return Ok(false);
         }
+        let copies = propagation_copies(guest)?;
         namespace_event(&format!("remove\t{guest}"))?;
+        for copy in &copies {
+            write_propagation(copy, &format!("remove\t{}", copy.guest))?;
+        }
         publish_fuse_route(guest, Path::new(""), "", None)?;
         return Ok(true);
     }
@@ -2398,7 +4037,11 @@ pub fn detach_mount(guest: &str) -> Result<bool, Errno> {
             .collect::<Vec<_>>()
     };
     if !REPLAYING_NAMESPACE.with(std::cell::Cell::get) && mount_namespace_id().is_some() {
+        let copies = propagation_copies(guest)?;
         namespace_event(&format!("detach\t{guest}"))?;
+        for copy in &copies {
+            write_propagation(copy, &format!("detach\t{}", copy.guest))?;
+        }
         for mount in detached.iter().filter(|mount| mount.shared_fuse) {
             publish_fuse_route(&mount.guest, Path::new(""), "", None)?;
         }
@@ -2439,7 +4082,19 @@ pub fn move_mount(from: &str, to: &str) -> Result<bool, Errno> {
         if !moved.iter().any(|mount| mount.guest == from) {
             return Ok(false);
         }
+        let copies = propagation_copies(from)?;
         namespace_event(&format!("move\t{from}\t{to}"))?;
+        for copy in &copies {
+            let dest = if copy.guest == from {
+                to.to_string()
+            } else if let Some(rest) = to.strip_prefix(from) {
+                format!("{}{rest}", copy.guest.trim_end_matches('/'))
+            } else {
+                propagated_guest(&copy.receiver, "/", to, &copy.receiver, "/")
+                    .unwrap_or_else(|| to.to_string())
+            };
+            write_propagation(copy, &format!("move\t{}\t{dest}", copy.guest))?;
+        }
         for mount in moved {
             if mount.shared_fuse {
                 publish_fuse_route(&mount.guest, Path::new(""), "", None)?;
@@ -2633,6 +4288,7 @@ pub fn load_own_mounts(text: &str) -> Result<(), Errno> {
                     page,
                     records: Default::default(),
                 });
+                *current_mount_namespace().journal_id.lock().unwrap() = Some(id.to_owned());
                 refresh_namespace()?;
                 publish_process_namespace()?;
                 return Ok(());
@@ -2889,7 +4545,7 @@ fn guest_path_of_fd(fd: i32) -> Result<(String, bool), Errno> {
     }
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return Err(errno::last());
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -2948,6 +4604,19 @@ const IMAGE_LINKS_MAX: usize = 1 << 14;
 /// The target of `host` if it is a symlink, else (where an lstat found it)
 /// its stat: a walk's check of the directory it is then needs no stat of
 /// its own.
+/// `host` is inside an ext4 payload directory. That tree is replaced when
+/// a later payload is mounted; the immutable image root is not.
+fn under_ext4_host(host: &Path) -> bool {
+    let mut cursor = Some(host);
+    while let Some(path) = cursor {
+        if ext4_stamp_path(path).is_file() {
+            return true;
+        }
+        cursor = path.parent().filter(|parent| *parent != path);
+    }
+    false
+}
+
 fn link_target(host: PathBuf, area: Area) -> ImageNode {
     let node = |host: &PathBuf| {
         let Ok(name) = host_cstring(host.clone()) else {
@@ -2962,7 +4631,7 @@ fn link_target(host: PathBuf, area: Area) -> ImageNode {
         }
         (std::fs::read_link(host).ok(), None)
     };
-    if area != Area::Image || !vfs().mapped {
+    if area != Area::Image || !vfs().mapped || under_ext4_host(&host) {
         return node(&host);
     }
     if let Some(known) = IMAGE_LINKS
@@ -4069,7 +5738,7 @@ mod tests {
         let file = std::fs::File::open(&library).unwrap();
         let mut path = [0u8; libc::PATH_MAX as usize];
         assert_eq!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) },
+            unsafe { crate::sys::fgetpath(file.as_raw_fd(), path.as_mut_ptr()) },
             0
         );
         let host = PathBuf::from(std::ffi::OsStr::from_bytes(
@@ -4363,6 +6032,375 @@ mod tests {
         assert!(remove_mount("/data/user/0").unwrap());
         assert!(remove_mount("/data/user").unwrap());
         assert_eq!(lookup("/data/user/0/p").0, data.join("data/p"));
+    }
+
+    /// The ext4 identity is an attribute of the payload directory and a
+    /// sidecar beside it. `/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp`
+    /// is not an entry of that directory. Replacing the directory drops
+    /// the attribute, so the mount stops covering the guest path.
+    #[test]
+    fn an_ext4_payload_does_not_expose_the_identity_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _mount = Unmount("/apex/com.android.apex.cts.shim@1");
+        let host = dir.join("cts-shim-payload");
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&host));
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("payload"), b"shim-payload").unwrap();
+        note_ext4_host(&host).unwrap();
+        let names = std::fs::read_dir(&host)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.iter().any(|name| name == ".aim-ext4-stamp"),
+            "payload directory contains {names:?}"
+        );
+        let sidecar = ext4_stamp_path(&host);
+        assert!(!sidecar.starts_with(&host));
+        let expected = std::fs::read(&sidecar).unwrap();
+        assert_eq!(
+            read_ext4_stamp_attr(&host).unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
+        add_mount(
+            "/apex/com.android.apex.cts.shim@1",
+            host.clone(),
+            Area::Image,
+            "/system/apex/com.android.apex.cts.shim.apex",
+            "ext4",
+        )
+        .unwrap();
+        let stamp = std::ffi::CString::new(
+            "/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp",
+        )
+        .unwrap();
+        let mut stat = [0u8; 256];
+        let mut context: crate::context::GuestContext = unsafe { std::mem::zeroed() };
+        context.x[8] = 79;
+        context.x[0] = LINUX_AT_FDCWD as u64;
+        context.x[1] = stamp.as_ptr() as u64;
+        context.x[2] = stat.as_mut_ptr() as u64;
+        crate::sys::dispatch(&mut context);
+        assert_eq!(context.x[0] as i64, -(errno::ENOENT as i64));
+        let live = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.apex.cts.shim@1/payload",
+            true,
+        )
+        .unwrap();
+        let live_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"shim-payload");
+        std::fs::remove_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("payload"), b"replaced").unwrap();
+        let after = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.apex.cts.shim@1/payload",
+            true,
+        )
+        .unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            !after_host.starts_with(&host),
+            "replaced directory still covered {}",
+            after_host.display()
+        );
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// Bootstrap ext4 at `/apex/com.android.runtime`, then the official
+    /// tree at `/apex/com.android.runtime@1`. `/system/bin/linker64` is the
+    /// image symlink bionic names as `PT_INTERP`. While the bootstrap
+    /// directory is there, the walk reads it. Once that directory is gone,
+    /// the walk follows the tmpfs symlink onto the activated tree. It does
+    /// not keep the removed host path, and it does not invent a directory
+    /// when the activated tree is gone too.
+    #[test]
+    fn a_gone_ext4_host_yields_the_activated_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _apex = Unmount("/apex");
+        let _old = Unmount("/apex/com.android.runtime");
+        let _new = Unmount("/apex/com.android.runtime@1");
+        let image = vfs().root.join("system/bin/linker64");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&image);
+        std::os::unix::fs::symlink("/apex/com.android.runtime/bin/linker64", &image).unwrap();
+        let old_host = dir.join("runtime-old-linker");
+        let new_host = dir.join("runtime-new-linker");
+        let tmp = dir.join("runtime-apex-tmp");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink("com.android.runtime@1", tmp.join("com.android.runtime"))
+            .unwrap();
+        add_mount("/apex", tmp, Area::Writable, "tmpfs", "tmpfs").unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "ext4",
+        )
+        .unwrap();
+        add_mount(
+            "/apex/com.android.runtime@1",
+            new_host.clone(),
+            Area::Image,
+            "/system/apex/com.android.runtime.apex",
+            "ext4",
+        )
+        .unwrap();
+        let live = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let live_host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"bootstrap-linker");
+        std::fs::remove_dir_all(&old_host).unwrap();
+        let after = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            after_host.starts_with(&new_host),
+            "resolve kept {}",
+            after_host.display()
+        );
+        assert_eq!(std::fs::read(&after_host).unwrap(), b"activated-linker");
+        std::fs::remove_dir_all(&new_host).unwrap();
+        let missed = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let missed_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(missed.host.as_bytes()));
+        assert!(
+            std::fs::read(&missed_host).is_err(),
+            "missing interpreter opened {}",
+            missed_host.display()
+        );
+        assert!(!old_host.exists());
+        assert!(!new_host.exists());
+        let _ = std::fs::remove_file(&image);
+    }
+
+    /// The bootstrap directory still exists, but it is not the directory
+    /// that was mounted: it was removed and created again, and `linker64`
+    /// is gone. A bind of that host is the mount a walk would select. Both
+    /// yield the activated tree. The replaced directory is not recreated
+    /// when the activated tree is gone too.
+    #[test]
+    fn a_replaced_ext4_host_yields_the_activated_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_view, dir) = test_view();
+        struct Unmount(&'static str);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                let _ = remove_mount(self.0);
+            }
+        }
+        let _apex = Unmount("/apex");
+        let _old = Unmount("/apex/com.android.runtime");
+        let _bind = Unmount("/apex/com.android.runtime");
+        let _new = Unmount("/apex/com.android.runtime@1");
+        let image = vfs().root.join("system/bin/linker64");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&image);
+        std::os::unix::fs::symlink("/apex/com.android.runtime/bin/linker64", &image).unwrap();
+        let old_host = dir.join("runtime-replaced-linker");
+        let new_host = dir.join("runtime-replaced-activated");
+        let tmp = dir.join("runtime-replaced-tmp");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink("com.android.runtime@1", tmp.join("com.android.runtime"))
+            .unwrap();
+        note_ext4_host(&old_host).unwrap();
+        add_mount("/apex", tmp, Area::Writable, "tmpfs", "tmpfs").unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "ext4",
+        )
+        .unwrap();
+        add_mount(
+            "/apex/com.android.runtime@1",
+            new_host.clone(),
+            Area::Image,
+            "/system/apex/com.android.runtime.apex",
+            "ext4",
+        )
+        .unwrap();
+        let live = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let live_host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(live.host.as_bytes()));
+        assert_eq!(std::fs::read(&live_host).unwrap(), b"bootstrap-linker");
+        std::fs::remove_dir_all(&old_host).unwrap();
+        std::fs::create_dir_all(&old_host).unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-bootstrap",
+            "bind",
+        )
+        .unwrap();
+        let after = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let after_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(after.host.as_bytes()));
+        assert!(
+            after_host.starts_with(&new_host),
+            "resolve kept {}",
+            after_host.display()
+        );
+        assert_eq!(std::fs::read(&after_host).unwrap(), b"activated-linker");
+        std::fs::remove_dir_all(&new_host).unwrap();
+        let missed = resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let missed_host =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(missed.host.as_bytes()));
+        assert!(
+            std::fs::read(&missed_host).is_err(),
+            "missing interpreter opened {}",
+            missed_host.display()
+        );
+        assert!(old_host.exists());
+        assert!(!new_host.exists());
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
+        let _ = std::fs::remove_file(&image);
+    }
+
+    /// A fork snapshot still names the bootstrap ext4 host, and its journal
+    /// generation is already current, which is how `park_saved` leaves a
+    /// namespace. The journal itself has the activated host. The next walk
+    /// follows the journal, not the snapshot.
+    #[test]
+    fn a_pinned_ext4_snapshot_follows_the_journal() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::Ordering;
+        let (_view, dir) = test_view();
+        let runtime = runtime_dir().unwrap().to_path_buf();
+        let id = format!("ext4-pin-{}", std::process::id());
+        let owner = aim_storage::mount_namespace::Namespace::open(&runtime, &id).unwrap();
+        owner
+            .initialize(&format!(
+                "root\t/\t{}\npropagation\t/\tshared\n{}",
+                vfs().root.display(),
+                std::fs::read_to_string(runtime.join("path-map")).unwrap()
+            ))
+            .unwrap();
+        struct Restore {
+            rules: Vec<(String, Propagation)>,
+            private: bool,
+            view: Option<NamespaceView>,
+            mounts: Vec<Mount>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                *NAMESPACE_VIEW.lock().unwrap() = self.view.take();
+                *PROPAGATION_RULES.lock().unwrap() = std::mem::take(&mut self.rules);
+                PRIVATE_MOUNTS.store(self.private, Ordering::Release);
+                *vfs().mounts.write().unwrap() = std::mem::take(&mut self.mounts);
+            }
+        }
+        let restore = Restore {
+            rules: PROPAGATION_RULES.lock().unwrap().clone(),
+            private: PRIVATE_MOUNTS.load(Ordering::Acquire),
+            view: NAMESPACE_VIEW.lock().unwrap().take(),
+            mounts: vfs().mounts.read().unwrap().clone(),
+        };
+        *NAMESPACE_VIEW.lock().unwrap() = Some(NamespaceView {
+            page: owner.generation().unwrap(),
+            owner: owner.clone(),
+            generation: 0,
+            records: Default::default(),
+        });
+        refresh_namespace().unwrap();
+        let old_host = dir.join("pin-old-linker");
+        let new_host = dir.join("pin-new-linker");
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        std::fs::create_dir_all(old_host.join("bin")).unwrap();
+        std::fs::create_dir_all(new_host.join("bin")).unwrap();
+        std::fs::write(old_host.join("bin/linker64"), b"bootstrap-linker").unwrap();
+        std::fs::write(new_host.join("bin/linker64"), b"activated-linker").unwrap();
+        note_ext4_host(&old_host).unwrap();
+        note_ext4_host(&new_host).unwrap();
+        add_mount(
+            "/apex/com.android.runtime",
+            old_host.clone(),
+            Area::Image,
+            "/dev/block/loop-pin-old",
+            "ext4",
+        )
+        .unwrap();
+        let snapshot = vfs().mounts.read().unwrap().clone();
+        owner
+            .append("remove\t/apex/com.android.runtime")
+            .unwrap();
+        owner
+            .append(&format!(
+                "ro\t/apex/com.android.runtime\t{}\t/dev/block/loop-pin-new\text4\n",
+                new_host.display()
+            ))
+            .unwrap();
+        *vfs().mounts.write().unwrap() = snapshot;
+        {
+            let state = owner.read().unwrap();
+            let mut slot = NAMESPACE_VIEW.lock().unwrap();
+            let view = slot.as_mut().unwrap();
+            view.generation = view.page.current();
+            view.records = std::sync::Arc::new(state.mounts);
+        }
+        let found = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap_or_else(|error| panic!("resolve errno={error}"));
+        let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(found.host.as_bytes()));
+        assert!(
+            host.starts_with(&new_host),
+            "pinned snapshot kept {}",
+            host.display()
+        );
+        assert_eq!(std::fs::read(&host).unwrap(), b"activated-linker");
+        let again = resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap();
+        let again = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(again.host.as_bytes()));
+        assert_eq!(again, host);
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&old_host);
+        let _ = std::fs::remove_dir_all(&new_host);
+        let _ = std::fs::remove_file(ext4_stamp_path(&old_host));
+        let _ = std::fs::remove_file(ext4_stamp_path(&new_host));
     }
 }
 

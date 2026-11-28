@@ -137,7 +137,7 @@ impl State {
     fn request_write(&mut self, user: i32) {
         self.writes.insert(user);
         let delay =
-            Duration::from_millis(700 + u64::from(unsafe { libc::arc4random_uniform(600) }));
+            Duration::from_millis(700 + u64::from(unsafe { crate::host_os::arc4random_uniform(600) }));
         self.schedule.request(user, Instant::now(), delay);
         if let Some(wake) = &self.wake {
             wake.notify();

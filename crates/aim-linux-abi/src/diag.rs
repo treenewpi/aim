@@ -2,8 +2,9 @@
 //! The host signal handlers themselves are `sys::signal`'s.
 //!
 //! The layer's own messages ([`diag!`](crate::diag)) go to the diagnostics
-//! descriptor: stderr, or with `--stdio-null` a hidden copy of it, so that
-//! the guest's stdio can be `/dev/null` as init gives services.
+//! descriptor. `--trace` and `--stdio-null` keep that descriptor a duplicate
+//! of the original stderr, so the guest can point fd 2 at `/dev/null` (as
+//! init does) without dropping the syscall trace.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
@@ -44,6 +45,20 @@ pub(crate) fn retain_exec_fd() -> Result<(), crate::errno::Errno> {
         return Err(crate::errno::last());
     }
     Ok(())
+}
+
+/// Duplicate stderr and send layer messages there. The guest can replace
+/// fd 2 (`dup3` onto `/dev/null`, as init does) without taking the syscall
+/// trace with it. The duplicate is the same open file, so the trace stays
+/// in the stderr capture until that replacement, and after it.
+pub fn detach_from_stdio() -> std::io::Result<i32> {
+    // SAFETY: duplicating this process's stderr.
+    let fd = unsafe { libc::fcntl(2, libc::F_DUPFD, crate::sys::fdtab::hidden_base()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    keep_log_fd(fd);
+    Ok(fd)
 }
 
 /// `--stdio-null`: keep stderr as the (hidden, exec-surviving)
@@ -117,7 +132,7 @@ pub fn register_fd_module(start: u64, len: u64, fd: i32, off: u64) {
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
     let name = if let Some(p) = crate::xrt::original_guest_path(fd) {
         p
-    } else if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0 {
+    } else if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } == 0 {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
         let host = std::path::PathBuf::from(String::from_utf8_lossy(&buf[..len]).into_owned());
         crate::vfs::guest_path_of_host(&host).unwrap_or_else(|| host.display().to_string())
@@ -189,14 +204,14 @@ pub unsafe fn report(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_void
     let uc = uc as *mut libc::ucontext_t;
     // SAFETY: SA_SIGINFO handler arguments from the kernel.
     unsafe {
-        let mc = (*uc).uc_mcontext as *const MContext64;
+        let mc = aim_storage::host::mcontext_ptr(uc) as *const MContext64;
         let ss = &(*mc).ss;
         crate::diag!(
             "[linux-abi] fatal signal {} at pc {:#x} ({}), fault addr {:#x}, esr {:#x}",
             sig,
             ss.pc,
             describe(ss.pc),
-            (*info).si_addr as u64,
+            aim_storage::host::si_addr(&*info),
             (*mc).es.esr
         );
         crate::diag!(
@@ -295,8 +310,8 @@ fn frames(mut fp: u64) {
 }
 
 unsafe extern "C" {
-    static mach_task_self_: libc::mach_port_t;
-    fn mach_vm_read_overwrite(t: libc::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
+    static mach_task_self_: crate::mach_port_t;
+    fn mach_vm_read_overwrite(t: crate::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
 }
 
 /// Install the host signal handlers (faults, `brk` sites, guest signals).

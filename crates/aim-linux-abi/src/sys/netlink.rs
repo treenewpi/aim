@@ -429,7 +429,7 @@ fn peer(path: &std::path::Path) -> Result<Option<(u32, u32)>, Errno> {
     let mut b = [0u8; 12];
     // SAFETY: a live pathname and a writable buffer of the supplied size.
     let n = unsafe {
-        libc::getxattr(
+        aim_storage::host::getxattr(
             path.as_ptr(),
             PEER.as_ptr(),
             b.as_mut_ptr().cast(),
@@ -484,7 +484,7 @@ pub fn connect(s: &Socket, dst: Option<(u32, u32)>) -> i64 {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: a live pathname and an initialized attribute buffer.
     errno::check(unsafe {
-        libc::setxattr(
+        aim_storage::host::setxattr(
             path.as_ptr(),
             PEER.as_ptr(),
             b.as_ptr().cast(),

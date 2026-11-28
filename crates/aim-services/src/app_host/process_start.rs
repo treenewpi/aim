@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 pub(super) struct ExitWatch(OwnedFd);
 
+#[cfg(target_os = "macos")]
 impl ExitWatch {
     pub(super) fn new(pid: i32) -> io::Result<Self> {
         if pid <= 0 {
@@ -75,6 +76,55 @@ impl ExitWatch {
             }
             if event.filter != libc::EVFILT_PROC || event.fflags & libc::NOTE_EXIT == 0 {
                 return Err(io::Error::from_raw_os_error(libc::EPROTO));
+            }
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ExitWatch {
+    pub(super) fn new(pid: i32) -> io::Result<Self> {
+        if pid <= 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let identity = aim_storage::process_namespace::ProcessIdentity::running_strict(pid)?;
+        // pidfd is readable when this process exits, including across exec,
+        // and does not attach to a later reuse of the pid.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let watch = Self(unsafe { OwnedFd::from_raw_fd(fd) });
+        if aim_storage::process_namespace::ProcessIdentity::running_strict(pid)? != identity {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(watch)
+    }
+
+    pub(super) fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            let mut pollfd = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            let n = unsafe { libc::poll(&mut pollfd, 1 as _, ms) };
+            if n == 0 {
+                return Ok(false);
+            }
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
             return Ok(true);
         }

@@ -430,6 +430,7 @@ mod tests {
     #[test]
     fn decodes_like_bionic() {
         let ids = IdResolver::builtin();
+        assert_eq!(ids.decode_uid("nobody"), Ok(9999));
         assert_eq!(ids.decode_uid("system"), Ok(1000));
         assert_eq!(ids.decode_uid("mediacodec"), Ok(1046));
         assert_eq!(ids.decode_uid("audioserver"), Ok(1041));

@@ -26,14 +26,44 @@
 //! This crate is `no_std` and holds only the contract: numbers, argument
 //! layouts, the guest-side call ([`guest`], aarch64 Linux/Android only) and
 //! the shape of a host module ([`HostModule`]), plus how host modules reach
-//! system libraries ([`dylib`]) and the guest's clocks ([`clock`]), macOS
-//! only.
+//! system libraries ([`dylib`]) and the guest's clocks ([`clock`]). On
+//! macOS the clocks are the mach timebase. Elsewhere a tick is a nanosecond
+//! from `clock_gettime`.
 
 #![no_std]
 
 #[cfg(target_os = "macos")]
 pub mod clock;
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "macos"))]
+pub mod clock {
+    /// Linux `clock_gettime`. A tick is one nanosecond, so [`ticks_to_ns`]
+    /// is the identity. The macOS module is the mach timebase.
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+    }
+    fn read(clock: i32) -> i64 {
+        let mut time = Timespec { sec: 0, nsec: 0 };
+        unsafe { clock_gettime(clock, &mut time) };
+        time.sec.saturating_mul(1_000_000_000).saturating_add(time.nsec)
+    }
+    pub fn timebase() -> (u32, u32) {
+        (1, 1)
+    }
+    pub fn ticks_to_ns(ticks: u64) -> i64 {
+        ticks as i64
+    }
+    pub fn monotonic_ns() -> i64 {
+        read(1)
+    }
+    pub fn boottime_ns() -> i64 {
+        read(7)
+    }
+}
 pub mod dylib;
 
 /// Version of the calling convention itself (register use, [`FN_VERSION`],
@@ -1663,6 +1693,7 @@ pub mod guest {
         unsafe { aim_hostcall(module, func, args, len) }
     }
 
+    #[cfg(target_arch = "aarch64")]
     core::arch::global_asm!(
         ".pushsection .text.aim_hostcall,\"ax\",@progbits",
         ".globl aim_hostcall",
@@ -1677,4 +1708,8 @@ pub mod guest {
         ".popsection",
     );
     const _: () = assert!(SYSCALL_NR == 0x4843 << 16);
+}
+#[cfg(not(target_arch = "aarch64"))]
+unsafe extern "C" fn aim_hostcall(_module: u32, _func: u32, _args: *mut u8, _len: usize) -> i64 {
+    -38
 }

@@ -38,7 +38,7 @@ struct ProcRegionInfo {
 #[repr(C)]
 struct ProcRegionWithPathInfo {
     info: ProcRegionInfo,
-    vip: libc::vnode_info_path,
+    vip: aim_storage::host::vnode_info_path,
 }
 
 pub struct Region {
@@ -139,7 +139,7 @@ pub fn info_at(addr: u64) -> Option<Info> {
     let size = std::mem::size_of::<ProcRegionInfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes into r.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             libc::getpid(),
             PROC_PIDREGIONINFO,
             addr,
@@ -163,7 +163,7 @@ fn entry_info(addr: u64) -> Option<ProcRegionWithPathInfo> {
     let size = std::mem::size_of::<ProcRegionWithPathInfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes into r.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             libc::getpid(),
             PROC_PIDREGIONPATHINFO,
             addr,

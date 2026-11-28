@@ -107,7 +107,7 @@ impl GraphicsBinder {
         writeln!(
             out,
             "Uptime: {} Realtime: {}",
-            clock_ms(libc::CLOCK_UPTIME_RAW),
+            clock_ms(crate::host_os::CLOCK_UPTIME_RAW),
             clock_ms(libc::CLOCK_MONOTONIC_RAW)
         )?;
         for (_, pid, name, thread) in processes {

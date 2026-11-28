@@ -10,6 +10,8 @@
 //! - [`data`]: the writable data of one data directory, a sparse image;
 //! - [`copy`]: copies between them that keep what the guest sees.
 
+pub mod host;
+
 pub mod copy;
 pub mod data;
 pub mod disk;

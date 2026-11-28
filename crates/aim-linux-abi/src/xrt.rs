@@ -108,7 +108,7 @@ fn set_state(st: FileStat, s: FileState) {
 pub(crate) fn fd_path(fd: i32) -> Option<PathBuf> {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return None;
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(0);

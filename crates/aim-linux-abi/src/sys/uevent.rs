@@ -46,7 +46,7 @@ const ACTIONS: [&str; 8] = [
 /// The device whose `uevent` attribute `guest` is, if the layer models it.
 pub fn attribute(guest: &str) -> Option<Device> {
     let devpath = guest.strip_prefix("/sys")?.strip_suffix("/uevent")?;
-    super::evdev::uevent_device(devpath)
+    super::evdev::uevent_device(devpath).or_else(|| super::loopdev::uevent_device(devpath))
 }
 
 /// Announce `action` for `dev`, with the caller's variables `extra`.

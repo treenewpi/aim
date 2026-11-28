@@ -195,7 +195,7 @@ impl AppHost {
             (count as i32, uids)
         };
         self.process_stats
-            .observe(count, clock_ms(libc::CLOCK_UPTIME_RAW), || {
+            .observe(count, clock_ms(crate::host_os::CLOCK_UPTIME_RAW), || {
                 let collector = self
                     .process_stats
                     .collector

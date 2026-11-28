@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicU32;
 
 use crate::a64::slot;
 
+#[cfg(target_os = "macos")]
 global_asm!(
     include_str!("trampoline.S"),
     ctx = const slot::CTX,
@@ -30,6 +31,7 @@ global_asm!(
     orig = const std::mem::offset_of!(GuestContext, orig_x0),
 );
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn linux_abi_enter_guest(ctx: *const libc::c_void) -> !;
     fn linux_abi_resume(ctx: *const libc::c_void) -> !;
@@ -42,6 +44,32 @@ unsafe extern "C" {
     fn linux_abi_resume_trap() -> !;
     fn linux_abi_text_end();
 }
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_enter_guest(_ctx: *const libc::c_void) -> ! {
+    std::process::abort()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_resume(_ctx: *const libc::c_void) -> ! {
+    std::process::abort()
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) unsafe extern "C" fn linux_abi_syscall_entry() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_lean_check() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_lean_end() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_check() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_recheck() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_tail_end() {}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_resume_trap() -> ! {
+    std::process::abort()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn linux_abi_text_end() {}
 
 /// The process id getpid(2) answers on the lean syscall path without a
 /// Darwin call: the thread group's. Set by the first [`init_thread`], and
@@ -162,10 +190,19 @@ fn claim_slots() {
 }
 
 fn tsd_base() -> *mut u64 {
-    let v: u64;
-    // SAFETY: reading TPIDRRO_EL0 is always permitted at EL0.
-    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) v) };
-    v as *mut u64
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: reading TPIDRRO_EL0 is always permitted at EL0.
+        unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) v) };
+        v as *mut u64
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // TPIDRRO_EL0 is the arm64 Darwin thread pointer. A non-arm64
+        // test host has no such register.
+        std::ptr::null_mut()
+    }
 }
 
 fn slot_ptr(off: u32) -> *mut u64 {

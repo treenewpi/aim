@@ -27,6 +27,12 @@ fn page_up(v: u64) -> u64 {
     (v + PAGE - 1) & !(PAGE - 1)
 }
 
+/// End of the file VMA on bionic's 4 KiB granule, not the host page.
+fn guest_file_end(last: u64) -> u64 {
+    let page = aim_guest_page::GUEST_PAGE;
+    last.wrapping_add(page - 1) & !(page - 1)
+}
+
 #[derive(Debug)]
 pub struct Image {
     pub bias: u64,
@@ -291,8 +297,22 @@ pub fn load_elf(host: &CStr, name: &str) -> Result<Image, String> {
     let stats = map_copied(&file, &h, bias, name)?;
     for p in h.loads.iter().filter(|p| p.p_filesz > 0) {
         let start = page_down(bias + p.p_vaddr);
-        let len = page_up(bias + p.p_vaddr + p.p_filesz) - start;
-        crate::sys::note_copy(start, len, Path::new(path), name, page_down(p.p_offset));
+        // Linux's file VMA ends at the next page after the file bytes.
+        // Bionic's PAGE_END is 4 KiB (`GUEST_PAGE`), so the anonymous
+        // `.bss` it names can start inside the 16 KiB host page. Rounding
+        // that end up to the host page made the `.bss` a file and
+        // `PR_SET_VMA` returned EBADF (init at `0x80004c5000` and
+        // `0x80002f9000`).
+        let file_end = guest_file_end(bias + p.p_vaddr + p.p_filesz);
+        if file_end > start {
+            crate::sys::note_copy(
+                start,
+                file_end - start,
+                Path::new(path),
+                name,
+                page_down(p.p_offset),
+            );
+        }
     }
     finish(&file, h, bias, name, "load-time rewrite".into(), stats)
 }
@@ -780,6 +800,10 @@ pub fn build_stack(inp: &StackInputs) -> Result<u64, String> {
     let auxv: Vec<(u64, u64)> = vec![
         (AT_SYSINFO_EHDR, vdso),
         (AT_HWCAP, hwcap),
+        // ADR 0012 keeps AT_PAGESZ at 16384. This image's bionic
+        // getpagesize and sysconf(_SC_PAGESIZE) are the constant 4096
+        // and do not read this entry. File mmap still accepts a 4 KiB
+        // offset; that granule is not this auxv entry.
         (AT_PAGESZ, PAGE),
         (AT_CLKTCK, 100),
         (AT_PHDR, p.phdr),
@@ -829,4 +853,20 @@ pub fn build_stack(inp: &StackInputs) -> Result<u64, String> {
         env: span(&envs, inp.envp),
     });
     Ok(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_file_vma_ends_on_the_guest_page() {
+        // A file byte inside `0x80004c4000..0x80004c5000` is a 4 KiB file
+        // VMA. The host page continues to `0x80004c8000`. Init named the
+        // anonymous `.bss` at `0x80004c5000`.
+        assert_eq!(guest_file_end(0x8000_4c4a_bc), 0x8000_4c50_00);
+        assert_eq!(guest_file_end(0x8000_2f8a_bc), 0x8000_2f90_00);
+        assert_eq!(page_up(0x8000_4c4a_bc), 0x8000_4c80_00);
+        assert_ne!(page_up(0x8000_4c4a_bc), guest_file_end(0x8000_4c4a_bc));
+    }
 }

@@ -72,6 +72,13 @@ pub enum Kind {
     /// A bpf map, program or type information (`bpf`): an anon inode,
     /// which its object file stands for, with no read, write or seek.
     Bpf,
+    /// A loop or device-mapper open. The major and minor were resolved
+    /// from the path at open; ioctl and stat use those numbers.
+    Dev(Arc<super::loopdev::OpenDev>),
+    /// binderfs `binder-control`. The string is the mount's guest path.
+    BinderControl(String),
+    /// `/dev/hw_random`: reads are `getentropy` of the host.
+    HwRng,
 }
 
 pub(super) struct PathProof(std::os::fd::OwnedFd);
@@ -93,6 +100,9 @@ impl Drop for PathProof {
 pub struct PathDescription {
     pub flags: u64,
     pub reference: Option<aim_binder_host::path_file::CharacterReference>,
+    /// Guest path of a bound socket opened with `O_PATH`. The host
+    /// descriptor is the parent directory, never the socket inode.
+    socket_guest: Option<String>,
     proof: Mutex<Option<Arc<PathProof>>>,
 }
 impl PathDescription {
@@ -100,6 +110,15 @@ impl PathDescription {
         Arc::new(Self {
             flags: flags & !super::fs::O_CLOEXEC,
             reference: None,
+            socket_guest: None,
+            proof: Mutex::new(None),
+        })
+    }
+    pub(super) fn socket(flags: u64, guest: String) -> Arc<Self> {
+        Arc::new(Self {
+            flags: flags & !super::fs::O_CLOEXEC,
+            reference: None,
+            socket_guest: Some(guest),
             proof: Mutex::new(None),
         })
     }
@@ -119,7 +138,7 @@ impl PathDescription {
         let raw = unsafe {
             libc::open(
                 parent.as_ptr(),
-                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                aim_storage::host::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         if raw < 0 {
@@ -141,6 +160,7 @@ impl PathDescription {
             Kind::Path(Arc::new(Self {
                 flags: flags & !super::fs::O_CLOEXEC,
                 reference: Some(reference),
+                socket_guest: None,
                 proof: Mutex::new(None),
             })),
         );
@@ -153,6 +173,14 @@ pub(crate) fn character_reference(
 ) -> Option<aim_binder_host::path_file::CharacterReference> {
     match get(fd) {
         Some(Kind::Path(path)) => path.reference.clone(),
+        _ => None,
+    }
+}
+
+/// Guest path recorded for an `O_PATH` socket handle, when this fd is one.
+pub(super) fn socket_path_guest(fd: i32) -> Option<String> {
+    match get(fd) {
+        Some(Kind::Path(path)) => path.socket_guest.clone(),
         _ => None,
     }
 }
@@ -248,6 +276,7 @@ pub(super) fn install_path(fd: i32) -> Result<(), crate::errno::Errno> {
         Kind::Path(Arc::new(PathDescription {
             flags: adopted.flags as u64,
             reference: adopted.reference,
+            socket_guest: None,
             proof: Mutex::new(Some(proof)),
         })),
     );
@@ -1189,7 +1218,11 @@ pub fn get(fd: i32) -> Option<Kind> {
 
 /// The guest closed `fd` (or is about to replace it with dup2).
 pub fn on_close(fd: i32) {
+    super::loopdev::on_close(fd);
+    super::knob::clear_access(fd);
     clear_regular_access(fd);
+    super::procfs::close_mount_poll(fd);
+    super::procfs::close_mount_namespace(fd);
     super::fuse_client::close(fd);
     super::fasync::on_close(fd);
     if super::fuse_device::is_device(fd) {
@@ -1216,6 +1249,10 @@ pub fn on_dup(old: i32, new: i32) {
     if let Some(k) = get(old) {
         insert(new, k);
     }
+    super::procfs::dup_mount_poll(old, new);
+    super::procfs::dup_mount_namespace(old, new);
+    super::knob::dup_access(old, new);
+    super::loopdev::on_dup(old, new);
 }
 
 /// Recognize an fd that arrived from elsewhere (exec, `SCM_RIGHTS`,
@@ -1388,15 +1425,15 @@ pub fn open_fds() -> Vec<i32> {
     // SAFETY: sizing call, then a buffer of that size.
     unsafe {
         let pid = libc::getpid();
-        let n = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+        let n = crate::hostlibc::proc_pidinfo(pid, crate::hostlibc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
         if n <= 0 {
             return Vec::new();
         }
-        let sz = std::mem::size_of::<libc::proc_fdinfo>();
-        let mut v: Vec<libc::proc_fdinfo> = Vec::with_capacity(n as usize / sz + 16);
-        let n = libc::proc_pidinfo(
+        let sz = std::mem::size_of::<crate::hostlibc::proc_fdinfo>();
+        let mut v: Vec<crate::hostlibc::proc_fdinfo> = Vec::with_capacity(n as usize / sz + 16);
+        let n = crate::hostlibc::proc_pidinfo(
             pid,
-            libc::PROC_PIDLISTFDS,
+            crate::hostlibc::PROC_PIDLISTFDS,
             0,
             v.as_mut_ptr().cast(),
             (v.capacity() * sz) as i32,
@@ -1436,7 +1473,10 @@ pub fn anon_name(fd: i32) -> Option<String> {
             | Kind::ProxyFile
             | Kind::Kmsg(_)
             | Kind::Cgroup(_)
-            | Kind::Binder(_) => {
+            | Kind::Binder(_)
+            | Kind::BinderControl(_)
+            | Kind::HwRng
+            | Kind::Dev(_) => {
                 return None;
             }
         }
@@ -1488,6 +1528,7 @@ pub(super) fn restore_kqueue(fd: i32, source: i32) -> Result<(), crate::errno::E
 
 pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
     let mut records = Vec::new();
+    let mut mount_ids: Vec<*const ()> = Vec::new();
     for (fd, kind) in TABLE.read().unwrap().iter() {
         if !visible(*fd) {
             continue;
@@ -1509,6 +1550,10 @@ pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
                     .unwrap_or(-1)
             )),
             Kind::Path(description) => {
+                if let Some(guest) = &description.socket_guest {
+                    records.push(format!("spath\t{fd}\t{}\t{guest}", description.flags));
+                    continue;
+                }
                 let mut bytes = description.flags.to_le_bytes().to_vec();
                 if let Some(reference) = &description.reference {
                     bytes.extend_from_slice(&reference.encode());
@@ -1528,8 +1573,30 @@ pub(crate) fn regular_exec_text() -> Result<String, crate::errno::Errno> {
                 "signal\t{fd}\t{}",
                 super::signalfd::shared(description).as_raw_fd()
             )),
+            Kind::Content => {
+                let Some(ptr) = super::procfs::mount_poll_ptr(*fd) else {
+                    continue;
+                };
+                let Some((info, seen, filled)) = super::procfs::mount_poll_record(*fd) else {
+                    continue;
+                };
+                let id = match mount_ids.iter().position(|have| *have == ptr) {
+                    Some(id) => id,
+                    None => {
+                        mount_ids.push(ptr);
+                        mount_ids.len() - 1
+                    }
+                };
+                records.push(format!(
+                    "mounts\t{fd}\t{id}\t{}\t{seen}\t{filled}",
+                    u8::from(info)
+                ));
+            }
             _ => {}
         }
+    }
+    if !mount_ids.is_empty() {
+        records.push(format!("mountevent\t{}", crate::vfs::mount_event()));
     }
     Ok(records.join("\n"))
 }
@@ -1587,8 +1654,58 @@ pub(crate) fn prepare_regular_exec() -> Result<ExecWriterFlags, crate::errno::Er
 pub(crate) fn restore_regular_exec(text: &str) -> Result<(), crate::errno::Errno> {
     let mut inherited = Vec::new();
     let mut signals = std::collections::HashMap::new();
+    let mut mounts = super::procfs::MountPollCache::new();
     for line in text.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.first() == Some(&"mountevent") {
+            if fields.len() != 2 {
+                return Err(crate::errno::EINVAL);
+            }
+            let event = fields[1]
+                .parse::<u64>()
+                .map_err(|_| crate::errno::EINVAL)?;
+            crate::vfs::restore_mount_event(event);
+            continue;
+        }
+        if fields.first() == Some(&"mounts") {
+            if fields.len() != 6 {
+                return Err(crate::errno::EINVAL);
+            }
+            let fd = fields[1].parse::<i32>().map_err(|_| crate::errno::EINVAL)?;
+            let id = fields[2].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            let info = match fields[3] {
+                "1" => true,
+                "0" => false,
+                _ => return Err(crate::errno::EINVAL),
+            };
+            let seen = fields[4].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            let filled = fields[5]
+                .parse::<u64>()
+                .map_err(|_| crate::errno::EINVAL)?;
+            require_guest_visible(fd)?;
+            super::procfs::restore_mount_exec(&mut mounts, fd, id, info, seen, filled);
+            insert(fd, Kind::Content);
+            continue;
+        }
+        if fields.first() == Some(&"spath") {
+            if fields.len() != 4 {
+                return Err(crate::errno::EINVAL);
+            }
+            let fd = fields[1].parse::<i32>().map_err(|_| crate::errno::EINVAL)?;
+            let flags = fields[2].parse::<u64>().map_err(|_| crate::errno::EINVAL)?;
+            if flags & super::fs::O_PATH == 0
+                || flags & !(super::fs::O_PATH | 0o40000 | 0o100000) != 0
+                || !fields[3].starts_with('/')
+            {
+                return Err(crate::errno::EINVAL);
+            }
+            require_guest_visible(fd)?;
+            insert(
+                fd,
+                Kind::Path(PathDescription::socket(flags, fields[3].to_owned())),
+            );
+            continue;
+        }
         if fields.len() != 3 {
             return Err(crate::errno::EINVAL);
         }
@@ -1627,6 +1744,7 @@ pub(crate) fn restore_regular_exec(text: &str) -> Result<(), crate::errno::Errno
                 Kind::Path(Arc::new(PathDescription {
                     flags,
                     reference,
+                    socket_guest: None,
                     proof: Mutex::new(None),
                 })),
             );
@@ -1836,7 +1954,7 @@ fn hold_table_top() {
     }
     // SAFETY: a new descriptor of our own, moved to the top.
     let held = unsafe {
-        let fd = libc::kqueue();
+        let fd = crate::hostlibc::kqueue();
         if fd < 0 {
             crate::diag!(
                 "descriptor table top: kqueue errno {}",
@@ -2006,6 +2124,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             Kind::PidFd(a) => Arc::as_ptr(a) as *const (),
             Kind::Knob(a) => Arc::as_ptr(a) as *const (),
             Kind::TracePipe(a) => Arc::as_ptr(a) as *const (),
+            Kind::Dev(a) => Arc::as_ptr(a) as *const (),
             Kind::Memfd(_)
             | Kind::SyncFile
             | Kind::Random
@@ -2013,8 +2132,26 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             | Kind::Bpf
             | Kind::ProxyFile
             | Kind::ProcMem(_)
-            | Kind::Path(_) => std::ptr::null(),
-            Kind::Content | Kind::Evdev(_) | Kind::Binder(_) => continue,
+            | Kind::Path(_)
+            | Kind::BinderControl(_)
+            | Kind::HwRng => std::ptr::null(),
+            // A mount file's cursor and a namespace fd are the open file,
+            // shared by dup. A plain content file is that description too:
+            // the inherited host fd keeps the offset.
+            Kind::Content => {
+                if let Some(ptr) = super::procfs::mount_poll_ptr(*fd) {
+                    ptr
+                } else if let Some(ns) = super::procfs::mount_namespace_of(*fd) {
+                    Arc::as_ptr(&ns) as *const ()
+                } else {
+                    std::ptr::null()
+                }
+            }
+            // The socket is inherited and `evdev::adopt` rebuilds the kind
+            // from the marker on it. A binder file's mach send right is not
+            // in that socket (`docs/fork.md`: the child opens its own
+            // connection), so the kind is not restored without the port.
+            Kind::Evdev(_) | Kind::Binder(_) => continue,
         };
         let (i, new) = match objects.iter().position(|&o| !p.is_null() && o == p) {
             Some(i) => (i, false),
@@ -2106,6 +2243,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 w.opt(path.reference.as_ref(), |w, reference| {
                     w.bytes(&reference.encode())
                 });
+                w.opt(path.socket_guest.as_deref(), |w, guest| w.str(guest));
             }
             Kind::TracePipe(open) => {
                 w.u32(20);
@@ -2118,6 +2256,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
             Kind::Knob(owner) => {
                 w.u32(17);
                 knob::save(owner, w);
+                w.i32(knob::access(fd).unwrap_or(-1));
             }
             Kind::Cgroup(open) => {
                 w.u32(15);
@@ -2127,7 +2266,29 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
                 w.u32(21);
                 pidfd.save(w);
             }
-            Kind::Content | Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
+            Kind::Content => {
+                if super::procfs::mount_poll_ptr(fd).is_some() {
+                    w.u32(23);
+                    super::procfs::save_mount_poll(fd, w);
+                } else if let Some(ns) = super::procfs::mount_namespace_of(fd) {
+                    w.u32(24);
+                    w.u64(crate::vfs::mount_namespace_ino(&ns));
+                } else {
+                    w.u32(25);
+                }
+            }
+            Kind::Dev(dev) => {
+                w.u32(26);
+                w.u32(dev.major);
+                w.u32(dev.minor);
+                w.u64(*dev.pos.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+            Kind::BinderControl(mount) => {
+                w.u32(27);
+                w.str(mount);
+            }
+            Kind::HwRng => w.u32(28),
+            Kind::Evdev(_) | Kind::Binder(_) => unreachable!(),
         }
     });
     // Private targets are installed from the explicit fork receipt before the
@@ -2137,17 +2298,31 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
         w.i32(fd)
     });
     super::fasync::fork_save(w);
+    // The child's mount generation, so a copied `p->event` is not a new edge.
+    w.u64(crate::vfs::mount_event());
 }
 
 pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
     let mut objects: Vec<Kind> = Vec::new();
+    let mut mount_files: Vec<Option<Arc<super::procfs::MountPoll>>> = Vec::new();
+    let mut ns_files: Vec<Option<Arc<crate::vfs::MountNs>>> = Vec::new();
+    let mut pending_mount = None;
+    let mut pending_ns = None;
     let mut inherited_writers = Vec::new();
     let entries = r.seq(|r| {
         let fd = r.i32();
         let i = r.u64() as usize;
         if !r.bool() {
+            if let Some(Some(poll)) = mount_files.get(i) {
+                super::procfs::install_mount_poll(fd, Arc::clone(poll));
+            }
+            if let Some(Some(ns)) = ns_files.get(i) {
+                super::procfs::bind_mount_namespace(fd, Arc::clone(ns));
+            }
             return (fd, objects.get(i).cloned());
         }
+        pending_mount = None;
+        pending_ns = None;
         let k = match r.u32() {
             0 => Kind::Event(event::load_event(r)),
             1 => Kind::Timer(event::load_timer(r)),
@@ -2196,7 +2371,13 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 None => return (fd, None),
             },
             17 => match knob::load(r) {
-                Some(owner) => Kind::Knob(owner),
+                Some(owner) => {
+                    let mode = r.i32();
+                    if mode >= 0 {
+                        knob::set_access(fd, mode);
+                    }
+                    Kind::Knob(owner)
+                }
                 None => return (fd, None),
             },
             10 => {
@@ -2211,9 +2392,11 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                         return (fd, None);
                     }
                 };
+                let socket_guest = r.opt(|r| r.str());
                 Kind::Path(Arc::new(PathDescription {
                     flags,
                     reference,
+                    socket_guest,
                     proof: Mutex::new(None),
                 }))
             }
@@ -2250,9 +2433,37 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                     }
                 }
             }
+            23 => {
+                let poll = super::procfs::load_mount_poll(r);
+                super::procfs::install_mount_poll(fd, Arc::clone(&poll));
+                pending_mount = Some(poll);
+                Kind::Content
+            }
+            24 => {
+                let ino = r.u64();
+                let Some(ns) = crate::vfs::mount_namespace(ino) else {
+                    eprintln!("fork namespace fd {fd} names missing inode {ino}");
+                    r.invalidate();
+                    return (fd, None);
+                };
+                super::procfs::bind_mount_namespace(fd, Arc::clone(&ns));
+                pending_ns = Some(ns);
+                Kind::Content
+            }
+            25 => Kind::Content,
+            26 => {
+                let major = r.u32();
+                let minor = r.u32();
+                let pos = r.u64();
+                Kind::Dev(super::loopdev::restore_open(fd, major, minor, pos))
+            }
+            27 => Kind::BinderControl(r.str()),
+            28 => Kind::HwRng,
             _ => Kind::Memfd((r.u64(), r.u64())),
         };
         objects.push(k.clone());
+        mount_files.push(pending_mount.take());
+        ns_files.push(pending_ns.take());
         (fd, Some(k))
     });
     for (fd, k) in entries {
@@ -2278,6 +2489,11 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
     }
     super::fasync::fork_restore(r);
     for fd in super::fd_visibility::visible() {
+        // An evdev socket survives as the open file. The marker on it is
+        // what exec uses; fork has the same socket and no separate kind.
+        if get(fd).is_none() {
+            super::evdev::adopt(fd);
+        }
         if super::fuse_device::adopt(fd) {
             continue;
         }
@@ -2288,6 +2504,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
             }
         }
     }
+    crate::vfs::restore_mount_event(r.u64());
 }
 
 /// Fork child: hide the parent's hidden fds that came along, beside this
@@ -2413,6 +2630,7 @@ mod tests {
     /// A hidden fd goes high even when the soft RLIMIT_NOFILE is above
     /// what the descriptor table can hold, and stays where `posix_spawn`
     /// can pass it to a fork child.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_hidden_fd_goes_high_and_stays_inheritable() {
         // SAFETY: raising this test process's soft limit to its hard one.
@@ -2423,7 +2641,7 @@ mod tests {
             libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
         }
         // SAFETY: a new kqueue of our own.
-        let kq = unsafe { libc::kqueue() };
+        let kq = unsafe { crate::hostlibc::kqueue() };
         let fd = hide(kq);
         assert!(fd >= hidden_base() && fd < 10240, "{fd}");
         // SAFETY: a file action list of our own, destroyed here.

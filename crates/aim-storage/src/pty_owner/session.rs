@@ -42,14 +42,14 @@ impl Sessions {
     ) -> io::Result<()> {
         self.credentials(parent)?;
         self.credentials(child)?;
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let mut info: crate::host::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as i32;
         if unsafe {
-            libc::proc_pidinfo(
+            crate::host::proc_pidinfo(
                 child.host_pid,
-                libc::PROC_PIDTBSDINFO,
+                crate::host::PROC_PIDTBSDINFO,
                 1,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                (&mut info as *mut crate::host::proc_bsdinfo).cast(),
                 size,
             )
         } != size

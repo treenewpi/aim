@@ -45,7 +45,7 @@ impl SocketQueueRoot {
                     message.msg_iov = &mut iov;
                     message.msg_iovlen = 1;
                     message.msg_control = control.as_mut_ptr().cast();
-                    message.msg_controllen = std::mem::size_of_val(&control) as u32;
+                    message.msg_controllen = std::mem::size_of_val(&control) as _;
                     let count =
                         libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_DONTWAIT);
                     if count < 0 {
@@ -58,7 +58,7 @@ impl SocketQueueRoot {
                         if (*header).cmsg_level == libc::SOL_SOCKET
                             && (*header).cmsg_type == libc::SCM_RIGHTS
                         {
-                            let length = (*header).cmsg_len.saturating_sub(libc::CMSG_LEN(0));
+                            let length = (*header).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as _);
                             for offset in 0..length / 4 {
                                 descriptors.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
                                     libc::CMSG_DATA(header)
@@ -162,11 +162,11 @@ impl SocketQueueRoot {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
-            message.msg_controllen = libc::CMSG_SPACE(4);
+            message.msg_controllen = libc::CMSG_SPACE(4) as _;
             let header = libc::CMSG_FIRSTHDR(&message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(4);
+            (*header).cmsg_len = libc::CMSG_LEN(4) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<i32>(), receiver.as_raw_fd());
             let count = libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_DONTWAIT);
             if count < 0 {

@@ -61,7 +61,10 @@ fn short_address(name: &str) -> io::Result<(libc::sockaddr_un, libc::socklen_t)>
         addr.sun_path[i] = *byte as libc::c_char;
     }
     let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    addr.sun_len = len as u8;
+    #[cfg(target_os = "macos")]
+    {
+        addr.sun_len = len as u8;
+    }
     Ok((addr, len))
 }
 

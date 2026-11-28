@@ -81,7 +81,7 @@ const PAGE: u64 = 16384;
 
 /// `st_flags` of a memfd file (both set). Ashmem's mark has UF_OPAQUE
 /// instead of UF_HIDDEN; guest files have neither.
-const MARK: u32 = libc::UF_NODUMP | libc::UF_HIDDEN;
+const MARK: u32 = aim_storage::host::UF_NODUMP | aim_storage::host::UF_HIDDEN;
 const NAME_ATTR: &CStr = c"dev.aim.memfd";
 const SEAL_ATTR: &str = "dev.aim.memfd.seal.";
 /// One per process (`<prefix><host pid>`) that has had a shared view of
@@ -222,7 +222,7 @@ fn key_of(st: &libc::stat) -> Key {
 }
 
 fn marked(st: &libc::stat) -> bool {
-    st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_flags & (MARK | libc::UF_OPAQUE) == MARK
+    st.st_mode & libc::S_IFMT == libc::S_IFREG && aim_storage::host::file_flags(&st) & (MARK | aim_storage::host::UF_OPAQUE) == MARK
 }
 
 /// fstat of `fd` when it is a memfd.
@@ -251,7 +251,7 @@ fn read_name(fd: i32) -> String {
     let mut buf = [0u8; 256];
     // SAFETY: reading our attribute into a local buffer.
     let n = unsafe {
-        libc::fgetxattr(
+        aim_storage::host::fgetxattr(
             fd,
             NAME_ATTR.as_ptr(),
             buf.as_mut_ptr().cast(),
@@ -305,7 +305,7 @@ fn set_seals(fd: i32, seals: u32) -> i64 {
             continue;
         };
         // SAFETY: writing our attribute from a static value.
-        if unsafe { libc::fsetxattr(fd, n.as_ptr(), c"1".as_ptr().cast(), 1, 0, 0) } < 0 {
+        if unsafe { aim_storage::host::fsetxattr(fd, n.as_ptr(), c"1".as_ptr().cast(), 1, 0, 0) } < 0 {
             return -(errno::last() as i64);
         }
     }
@@ -325,11 +325,11 @@ fn attr_names(fd: i32) -> Vec<String> {
     let mut buf = vec![0u8; 1024];
     loop {
         // SAFETY: listing attributes into our buffer of its length.
-        let n = unsafe { libc::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let n = unsafe { aim_storage::host::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n < 0 && errno::last() == 34 {
             // ERANGE: attributes added since; size it again.
             // SAFETY: sizing call.
-            let size = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0, 0) };
+            let size = unsafe { aim_storage::host::flistxattr(fd, std::ptr::null_mut(), 0, 0) };
             buf.resize(size.max(buf.len() as isize * 2) as usize, 0);
             continue;
         }
@@ -345,14 +345,14 @@ fn attr_names(fd: i32) -> Vec<String> {
 /// Whether host process `pid` exists (one of another user is).
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks.
-    unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM }
+    unsafe { libc::kill(pid, 0) == 0 || *crate::hostlibc::__error() == libc::EPERM }
 }
 
 /// The text an attribute of the file holds, if it has it.
 fn attr_text(fd: i32, name: &CStr) -> Option<String> {
     let mut buf = [0u8; 64];
     // SAFETY: reading our attribute into a local buffer.
-    let n = unsafe { libc::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
+    let n = unsafe { aim_storage::host::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
     String::from_utf8(buf[..usize::try_from(n).ok()?].to_vec()).ok()
 }
 
@@ -365,13 +365,13 @@ fn set_attr(fd: Option<i32>, path: Option<&std::path::Path>, name: &str, value: 
     unsafe {
         match (fd, path) {
             (Some(fd), _) => {
-                libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) == 0
+                aim_storage::host::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) == 0
             }
             (None, Some(path)) => {
                 let Ok(path) = CString::new(path.as_os_str().as_encoded_bytes()) else {
                     return false;
                 };
-                libc::setxattr(
+                aim_storage::host::setxattr(
                     path.as_ptr(),
                     name.as_ptr(),
                     value.as_ptr().cast(),
@@ -392,7 +392,7 @@ fn note_viewer(k: Key, fd: i32) {
         let mut path = [0u8; libc::PATH_MAX as usize];
         // SAFETY: F_GETPATH into a buffer of PATH_MAX bytes.
         let path =
-            (unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } == 0).then(|| {
+            (unsafe { crate::sys::fgetpath(fd, path.as_mut_ptr()) } == 0).then(|| {
                 let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
                 PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end]))
             });
@@ -476,7 +476,7 @@ struct RegionInfo {
 #[repr(C)]
 struct RegionWithPath {
     info: RegionInfo,
-    vip: libc::vnode_info_path,
+    vip: aim_storage::host::vnode_info_path,
 }
 
 /// `PROC_PIDREGIONPATHINFO`.
@@ -490,7 +490,7 @@ fn viewed_writable_by(pid: i32, k: Key, anon: Option<(u64, u64)>) -> bool {
     let object = anon.and_then(|(base, _)| {
         let mut r: RegionWithPath = unsafe { std::mem::zeroed() };
         let n = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, base, (&raw mut r).cast(), size)
+            crate::hostlibc::proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, base, (&raw mut r).cast(), size)
         };
         (n == size && r.info.address <= base && base < r.info.address + r.info.size)
             .then_some(r.info.obj_id)
@@ -500,7 +500,7 @@ fn viewed_writable_by(pid: i32, k: Key, anon: Option<(u64, u64)>) -> bool {
         // SAFETY: zeroed plain data, filled by proc_pidinfo up to its size.
         let mut r: RegionWithPath = unsafe { std::mem::zeroed() };
         let n = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, at, (&raw mut r).cast(), size)
+            crate::hostlibc::proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, at, (&raw mut r).cast(), size)
         };
         if n < size || r.info.address >= super::arena::HI {
             return false;
@@ -540,7 +540,7 @@ fn viewed_writable_elsewhere(fd: i32, k: Key) -> bool {
         if !alive(pid) {
             if let Ok(name) = CString::new(name) {
                 // SAFETY: removing our attribute of our file.
-                unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) };
+                unsafe { aim_storage::host::fremovexattr(fd, name.as_ptr(), 0) };
             }
             continue;
         }
@@ -583,7 +583,7 @@ fn sweep(dir: &std::path::Path, min_age: i64) -> u64 {
                 libc::O_RDONLY
                     | libc::O_NONBLOCK
                     | libc::O_CLOEXEC
-                    | libc::O_EXLOCK
+                    | aim_storage::host::O_EXLOCK
                     | libc::O_NOFOLLOW,
             );
             if fd < 0 {
@@ -591,7 +591,7 @@ fn sweep(dir: &std::path::Path, min_age: i64) -> u64 {
             }
             if let Some(st) = stat_fd(fd)
                 && marked(&st)
-                && now - st.st_birthtime >= min_age
+                && now - aim_storage::host::birth(&st).0 >= min_age
             {
                 let mut named: libc::stat = std::mem::zeroed();
                 if libc::lstat(p.as_ptr(), &mut named) == 0
@@ -687,8 +687,8 @@ pub fn memfd_create(a: [u64; 6]) -> i64 {
     // SAFETY: setting up our own file.
     let r = unsafe {
         if libc::fchmod(fd, mode) < 0
-            || libc::fchflags(fd, MARK) < 0
-            || libc::fsetxattr(
+            || aim_storage::host::fchflags(fd, MARK) < 0
+            || aim_storage::host::fsetxattr(
                 fd,
                 NAME_ATTR.as_ptr(),
                 name.as_ptr().cast(),
@@ -823,7 +823,7 @@ pub fn reopen(fd: i32, host_flags: i32) -> Option<i64> {
     let mut path = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH into a local buffer, then opening that file.
     let new = unsafe {
-        if libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) < 0 {
+        if crate::sys::fgetpath(fd, path.as_mut_ptr()) < 0 {
             return Some(-(errno::last() as i64));
         }
         libc::open(
@@ -983,7 +983,7 @@ pub fn link_name(path: &std::path::Path, dev: u64, ino: u64) -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: reading our attribute into a local buffer.
     let n = unsafe {
-        libc::getxattr(
+        aim_storage::host::getxattr(
             p.as_ptr(),
             NAME_ATTR.as_ptr(),
             buf.as_mut_ptr().cast(),
@@ -1880,8 +1880,8 @@ mod tests {
         let free = std::fs::File::create(d.join("free")).unwrap();
         drop(std::fs::File::create(d.join("unrelated")).unwrap());
         unsafe {
-            libc::fchflags(held.as_raw_fd(), MARK);
-            libc::fchflags(free.as_raw_fd(), MARK);
+            aim_storage::host::fchflags(held.as_raw_fd(), MARK);
+            aim_storage::host::fchflags(free.as_raw_fd(), MARK);
         }
         drop(free);
         use std::os::fd::AsRawFd;

@@ -27,26 +27,34 @@ pub fn properties() -> Vec<(&'static str, String)> {
     of(brand_string().as_deref())
 }
 
-/// `sysctl machdep.cpu.brand_string`.
+/// `sysctl machdep.cpu.brand_string`. Absent where the host has no such
+/// name: the property stays unset rather than being invented.
 fn brand_string() -> Option<String> {
-    let name: &CStr = c"machdep.cpu.brand_string";
-    let mut buf = [0u8; 128];
-    let mut size = buf.len();
-    // SAFETY: a sysctl read into a local buffer of the size given.
-    let r = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if r != 0 {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        let name: &CStr = c"machdep.cpu.brand_string";
+        let mut buf = [0u8; 128];
+        let mut size = buf.len();
+        // SAFETY: a sysctl read into a local buffer of the size given.
+        let r = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 {
+            return None;
+        }
+        let value = CStr::from_bytes_until_nul(&buf[..size]).ok()?;
+        return value.to_str().ok().map(str::to_string);
     }
-    let value = CStr::from_bytes_until_nul(&buf[..size]).ok()?;
-    value.to_str().ok().map(str::to_string)
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]

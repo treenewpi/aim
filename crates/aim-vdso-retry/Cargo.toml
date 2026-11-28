@@ -1,0 +1,10 @@
+[package]
+license.workspace = true
+name = "aim-vdso-retry"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The compat vDSO commpage retry is bounded. This package does not build aim-linux-abi's AIDL dev-dependencies."
+
+[dependencies]
+aim-linux-abi = { path = "../aim-linux-abi" }

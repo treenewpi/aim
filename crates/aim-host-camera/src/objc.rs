@@ -26,11 +26,27 @@ aim_hostcall::dylib! {
 
 pub type Queue = *mut c_void;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> Queue;
     pub fn dispatch_release(object: Queue);
     static _NSConcreteGlobalBlock: [*const c_void; 32];
 }
+
+#[cfg(not(target_os = "macos"))]
+pub unsafe fn dispatch_queue_create(_label: *const c_char, _attr: *const c_void) -> Queue {
+    std::ptr::null_mut()
+}
+#[cfg(not(target_os = "macos"))]
+pub unsafe fn dispatch_release(_object: Queue) {}
+#[cfg(not(target_os = "macos"))]
+struct GlobalBlockClass([*const c_void; 32]);
+#[cfg(not(target_os = "macos"))]
+// SAFETY: the pointer is null and is never written. A non-macOS test host
+// has no libSystem block class.
+unsafe impl Sync for GlobalBlockClass {}
+#[cfg(not(target_os = "macos"))]
+static _NSConcreteGlobalBlock: GlobalBlockClass = GlobalBlockClass([std::ptr::null(); 32]);
 
 pub fn sel(name: &CStr) -> Sel {
     // SAFETY: a NUL-terminated selector name.

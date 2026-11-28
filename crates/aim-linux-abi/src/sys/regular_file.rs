@@ -30,7 +30,7 @@ fn core(error: Error) -> Errno {
 struct Configuration {
     store: Arc<Store>,
     leases: PathBuf,
-    dev: i32,
+    dev: libc::dev_t,
 }
 static CONFIGURATION: OnceLock<Result<Option<Configuration>, Errno>> = OnceLock::new();
 fn configuration() -> Result<Option<&'static Configuration>, Errno> {
@@ -84,7 +84,7 @@ fn load_configuration(runtime: &Path) -> Result<Option<Configuration>, Errno> {
     // Linux's tmpfs, the runtime directory's files cannot have it.
     let dev = {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&path).map_err(io)?.dev() as i32
+        std::fs::metadata(&path).map_err(io)?.dev() as libc::dev_t
     };
     let leases = runtime.join("fs-verity-leases");
     let store = Arc::new(Store::new(&path, &leases).map_err(core)?);
@@ -161,7 +161,7 @@ pub(crate) fn configured_store() -> Result<Option<Arc<Store>>, Errno> {
         .map(|configuration| configuration.map(|configuration| configuration.store.clone()))
 }
 /// Whether files on host device `dev` can have verity.
-pub(super) fn verity_capable(dev: i32) -> Result<bool, Errno> {
+pub(super) fn verity_capable(dev: libc::dev_t) -> Result<bool, Errno> {
     Ok(configuration()?.is_some_and(|configuration| configuration.dev == dev))
 }
 pub(super) fn verity_stat(stat: &libc::stat) -> Result<Option<bool>, Errno> {
@@ -177,9 +177,9 @@ pub(super) fn verity_stat(stat: &libc::stat) -> Result<Option<bool>, Errno> {
     let identity = Identity {
         dev: stat.st_dev as u32 as u64,
         ino: stat.st_ino,
-        generation: stat.st_gen,
-        birth_seconds: stat.st_birthtime,
-        birth_nanoseconds: stat.st_birthtime_nsec,
+        generation: aim_storage::host::generation(stat),
+        birth_seconds: aim_storage::host::birth(stat).0,
+        birth_nanoseconds: aim_storage::host::birth(stat).1,
     };
     configuration
         .store
@@ -690,7 +690,7 @@ mod offset_tests {
             .filter(|&fd| fd != source.as_raw_fd())
             .filter_map(|fd| {
                 let mut buffer = [0u8; libc::PATH_MAX as usize];
-                if unsafe { libc::fcntl(fd, libc::F_GETPATH, buffer.as_mut_ptr()) } < 0 {
+                if unsafe { crate::sys::fgetpath(fd, buffer.as_mut_ptr()) } < 0 {
                     return None;
                 }
                 let end = buffer.iter().position(|&byte| byte == 0).unwrap();

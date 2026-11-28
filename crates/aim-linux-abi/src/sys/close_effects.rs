@@ -98,7 +98,7 @@ pub(crate) fn diagnostic(arguments: std::fmt::Arguments<'_>) {
     if RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 256 {
         return;
     }
-    let saved = unsafe { *libc::__error() };
+    let saved = unsafe { *crate::hostlibc::__error() };
     crate::diag!(
         "[fd-close-owner] pid={} tid={} {}",
         unsafe { libc::getpid() },
@@ -106,7 +106,7 @@ pub(crate) fn diagnostic(arguments: std::fmt::Arguments<'_>) {
         arguments
     );
     unsafe {
-        *libc::__error() = saved;
+        *crate::hostlibc::__error() = saved;
     }
 }
 

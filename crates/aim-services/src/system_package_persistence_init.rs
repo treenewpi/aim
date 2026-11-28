@@ -159,14 +159,7 @@ fn prepare_native(
     }
     fs::create_dir_all(data.join("system")).map_err(io_error)?;
     let path = data.join("system/.aim-native-package-writer");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(io_error)?;
+    let file = open_exclusive(&path).map_err(io_error)?;
     aim_storage::fscrypt::adopt(&path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
     if !metadata.is_file() || fs::symlink_metadata(&path).map_err(io_error)?.ino() != metadata.ino()
@@ -536,6 +529,28 @@ pub fn initialize(
 fn illegal(message: impl Into<String>) -> Exception {
     Exception::new(EX_ILLEGAL_STATE, message)
 }
+fn open_exclusive(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    #[cfg(not(target_os = "macos"))]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
 fn io_error(error: std::io::Error) -> Exception {
     illegal(format!("Native data ownership: {error}"))
 }
@@ -545,14 +560,7 @@ pub(crate) fn epoch_fixture_prepared(data: &std::path::Path) -> Result<Prepared,
     let data = data.canonicalize().map_err(io_error)?;
     fs::create_dir_all(data.join("system")).map_err(io_error)?;
     let path = data.join("system/.aim-native-package-writer");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(io_error)?;
+    let file = open_exclusive(&path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
     let lease = DataLease {
         path,

@@ -138,7 +138,7 @@ static NEXT_TIMER: AtomicU64 = AtomicU64::new(1);
 
 fn new_timer_kq() -> Option<i32> {
     // SAFETY: plain kqueue creation.
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return None;
     }
@@ -165,15 +165,15 @@ fn timer_kq(stale: i32) -> Option<i32> {
     Some(*kq)
 }
 
-fn kevent(kq: i32, ev: &libc::kevent64_s) -> i32 {
+fn kevent(kq: i32, ev: &crate::hostlibc::kevent64_s) -> i32 {
     // SAFETY: one change, no events out.
-    unsafe { libc::kevent64(kq, ev, 1, std::ptr::null_mut(), 0, 0, std::ptr::null()) }
+    unsafe { crate::hostlibc::kevent64(kq, ev, 1, std::ptr::null_mut(), 0, 0, std::ptr::null()) }
 }
 
-fn timer_event(id: u64, flags: u16, fflags: u32, data: i64, udata: u64) -> libc::kevent64_s {
-    libc::kevent64_s {
+fn timer_event(id: u64, flags: u16, fflags: u32, data: i64, udata: u64) -> crate::hostlibc::kevent64_s {
+    crate::hostlibc::kevent64_s {
         ident: id,
-        filter: libc::EVFILT_TIMER,
+        filter: crate::hostlibc::EVFILT_TIMER,
         flags,
         fflags,
         data,
@@ -199,14 +199,14 @@ pub fn timer_id() -> u64 {
 pub fn arm_event(id: u64, udata: u64, deadline: Deadline) -> Option<i32> {
     let rel = deadline.left().max(1);
     let clock = if deadline.base.counts_sleep() {
-        libc::NOTE_MACH_CONTINUOUS_TIME
+        crate::hostlibc::NOTE_MACH_CONTINUOUS_TIME
     } else {
         0
     };
     let ev = timer_event(
         id,
-        libc::EV_ADD | libc::EV_ONESHOT,
-        libc::NOTE_NSECONDS | libc::NOTE_LEEWAY | libc::NOTE_CRITICAL | clock,
+        crate::hostlibc::EV_ADD | crate::hostlibc::EV_ONESHOT,
+        crate::hostlibc::NOTE_NSECONDS | crate::hostlibc::NOTE_LEEWAY | crate::hostlibc::NOTE_CRITICAL | clock,
         rel.min(i64::MAX as u64) as i64,
         udata,
     );
@@ -231,7 +231,7 @@ fn arm(tid: i32, deadline: Deadline) -> Option<(i32, u64)> {
 }
 
 pub fn disarm((kq, id): (i32, u64)) {
-    kevent(kq, &timer_event(id, libc::EV_DELETE, 0, 0, 0));
+    kevent(kq, &timer_event(id, crate::hostlibc::EV_DELETE, 0, 0, 0));
 }
 
 fn timer_loop(kq: i32) {
@@ -239,17 +239,17 @@ fn timer_loop(kq: i32) {
     // it for a process-directed one; it runs at the highest QoS so that a
     // busy host delays expiries as little as possible.
     unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-        let mut all: libc::sigset_t = 0;
+        crate::hostlibc::pthread_set_qos_class_self_np(crate::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        let mut all = crate::hostlibc::empty_sigset();
         libc::sigfillset(&mut all);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
     // SAFETY: an all-zero kevent64_s is valid.
-    let mut evs: [libc::kevent64_s; 16] = unsafe { std::mem::zeroed() };
+    let mut evs: [crate::hostlibc::kevent64_s; 16] = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: waiting for events into a local buffer.
         let n = unsafe {
-            libc::kevent64(
+            crate::hostlibc::kevent64(
                 kq,
                 std::ptr::null(),
                 0,

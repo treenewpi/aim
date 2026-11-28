@@ -285,7 +285,7 @@ pub fn address_in(
 pub(super) fn random_secret() -> Ipv6Addr {
     let mut b = [0u8; 16];
     // SAFETY: filling our buffer.
-    unsafe { libc::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
+    unsafe { aim_storage::host::arc4random_buf(b.as_mut_ptr().cast(), b.len()) };
     Ipv6Addr::from(b)
 }
 
@@ -870,7 +870,7 @@ fn desync(d: &mut Devices, i: usize) -> u32 {
 
 fn rand_u32() -> u32 {
     // SAFETY: trivial.
-    unsafe { libc::arc4random() }
+    unsafe { aim_storage::host::arc4random() }
 }
 
 fn same64(a: &IpAddr, b: &IpAddr) -> bool {
@@ -942,7 +942,7 @@ fn create_temp(d: &mut Devices, i: usize, public: &Addr, now: u64, ev: &mut Vec<
     let ip = loop {
         let mut iid = [0u8; 8];
         // SAFETY: filling our buffer.
-        unsafe { libc::arc4random_buf(iid.as_mut_ptr().cast(), iid.len()) };
+        unsafe { aim_storage::host::arc4random_buf(iid.as_mut_ptr().cast(), iid.len()) };
         let mut a = p.octets();
         a[8..].copy_from_slice(&iid);
         let ip = Ipv6Addr::from(a);

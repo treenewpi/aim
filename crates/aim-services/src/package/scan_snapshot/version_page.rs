@@ -15,7 +15,7 @@ unsafe impl Sync for VersionPage {}
 impl VersionPage {
     pub(crate) fn new(version: u64) -> std::io::Result<Self> {
         let name = CString::new(format!("/aim-pm-{:x}-{:x}", std::process::id(), unsafe {
-            libc::arc4random()
+            crate::host_os::arc4random()
         }))
         .unwrap();
         let fd = unsafe {

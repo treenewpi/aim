@@ -4,7 +4,10 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 
 /// Both flags distinguish an ashmem region from ordinary guest files.
+#[cfg(target_os = "macos")]
 pub const MARK: u32 = libc::UF_NODUMP | libc::UF_OPAQUE;
+#[cfg(not(target_os = "macos"))]
+pub const MARK: u32 = 0x0000_0001 | 0x0000_0008;
 pub const XATTR: &core::ffi::CStr = c"dev.aim.ashmem";
 
 /// A region's state besides its size.
@@ -103,9 +106,22 @@ pub fn read_only_region(name: &[u8]) -> io::Result<std::fs::File> {
     }
     .encode();
     // SAFETY: writes the shared metadata from its live encoded buffer.
-    if unsafe { libc::fsetxattr(fd, XATTR.as_ptr(), state.as_ptr().cast(), state.len(), 0, 0) } < 0
-        || unsafe { libc::fchflags(file.as_raw_fd(), MARK) } < 0
-    {
+    // Darwin fsetxattr takes a position and options; Linux does not.
+    let wrote = unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            libc::fsetxattr(fd, XATTR.as_ptr(), state.as_ptr().cast(), state.len(), 0, 0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            libc::fsetxattr(fd, XATTR.as_ptr(), state.as_ptr().cast(), state.len(), 0)
+        }
+    };
+    if wrote < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::fchflags(file.as_raw_fd(), MARK) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(file)

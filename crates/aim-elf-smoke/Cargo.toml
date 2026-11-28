@@ -1,0 +1,11 @@
+[package]
+license.workspace = true
+name = "aim-elf-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Synthetic Linux AArch64 ELF smoke for linux-run, with no Android image or NDK"
+
+[[bin]]
+name = "elf-smoke"
+path = "src/bin/elf-smoke.rs"

@@ -88,7 +88,7 @@ pub(crate) fn watch() -> io::Result<()> {
         .spawn(move || {
             // SAFETY: host worker threads must not receive guest signals.
             unsafe {
-                let mut all: libc::sigset_t = 0;
+                let mut all = crate::hostlibc::empty_sigset();
                 libc::sigfillset(&mut all);
                 libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
             }

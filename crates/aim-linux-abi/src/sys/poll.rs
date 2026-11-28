@@ -218,6 +218,14 @@ fn kept(pin: Option<&super::fdtab::Pinned>, fd: i32) -> Option<super::net::Kept>
 /// host descriptor's Darwin poll `h`: a socket's as `tcp_poll`,
 /// `unix_poll`, `datagram_poll` and `sock_poll` report it.
 fn guest_revents(fd: i32, pin: Option<&super::fdtab::Pinned>, h: &libc::pollfd, asked: i16) -> i16 {
+    if let Some(raw) = super::procfs::mount_poll_bits(fd) {
+        let mut reported = from_host(raw, asked);
+        // The observation that sees `ns->event` advances `p->event`.
+        if reported & (POLLERR | POLLPRI) != 0 && !super::procfs::take_mount_edge(fd) {
+            reported &= !(POLLERR | POLLPRI);
+        }
+        return reported;
+    }
     let kept = kept(pin, h.fd);
     let reported = |kept: &super::net::Kept| kept.events as i16 & (asked | POLLHUP | POLLERR);
     // `TCP_CLOSE`: none of the host's readiness.
@@ -299,7 +307,7 @@ impl Hangups {
             Some(hangups) => hangups,
             None => {
                 // SAFETY: a new kqueue, owned from here.
-                let kq = unsafe { libc::kqueue() };
+                let kq = unsafe { crate::hostlibc::kqueue() };
                 if kq < 0 {
                     return Err(errno::last());
                 }
@@ -312,18 +320,18 @@ impl Hangups {
             }
         };
         this.entries.push(index);
-        let change = libc::kevent {
+        let change = crate::hostlibc::kevent {
             ident: fd as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
-            fflags: libc::NOTE_LOWAT,
+            filter: crate::hostlibc::EVFILT_READ,
+            flags: crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR | crate::hostlibc::EV_RECEIPT,
+            fflags: crate::hostlibc::NOTE_LOWAT,
             data: isize::MAX,
             udata: std::ptr::null_mut(),
         };
         // SAFETY: one change, its receipt into a local event.
-        let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut receipt: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
         let n = unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 this.kq.as_raw_fd(),
                 &change,
                 1,
@@ -351,9 +359,9 @@ impl Hangups {
         };
         loop {
             // SAFETY: an event array we own.
-            let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+            let mut events: [crate::hostlibc::kevent; 16] = unsafe { std::mem::zeroed() };
             let n = unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     self.kq.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -366,7 +374,7 @@ impl Hangups {
                 return Err(errno::last());
             }
             for event in &events[..n as usize] {
-                if event.flags & libc::EV_EOF == 0 {
+                if event.flags & crate::hostlibc::EV_EOF == 0 {
                     continue;
                 }
                 for &index in &self.entries {
@@ -463,7 +471,7 @@ fn host_poll(fds: &mut [libc::pollfd], ms: i32, mask: u64) -> i64 {
     let n = unsafe {
         libc::poll(
             fds.as_mut_ptr(),
-            fds.len() as u32,
+            fds.len() as _,
             if fuse_ready { 0 } else { ms },
         )
     };
@@ -473,6 +481,16 @@ fn host_poll(fds: &mut [libc::pollfd], ms: i32, mask: u64) -> i64 {
 }
 #[cfg(test)]
 thread_local! {pub(super) static BEFORE_WAIT:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};}
+
+/// A blocking mount wait with no wake pipe returns the pipe errno. A zero
+/// timeout does not: it reports only the generation `mounts_poll` sees.
+fn mount_wait_error(any_mount: bool, ready: bool, left: i32) -> Option<i64> {
+    if any_mount && !ready && left != 0 && super::procfs::mount_wake_fd() < 0 {
+        Some(-(super::procfs::mount_wake_errno() as i64))
+    } else {
+        None
+    }
+}
 
 pub fn ppoll(a: [u64; 6]) -> i64 {
     let (fds, nfds, ts, mask) = (a[0], a[1], a[2], a[3]);
@@ -559,6 +577,13 @@ pub fn ppoll(a: [u64; 6]) -> i64 {
                     revents: 0,
                 }
             }
+            // `mounts_poll` is not the vnode's readiness. A regular-file
+            // poll would report POLLIN at once, or nothing for POLLPRI.
+            None if super::procfs::is_mount_poll(entry.fd) => libc::pollfd {
+                fd,
+                events: 0,
+                revents: 0,
+            },
             None => libc::pollfd {
                 fd,
                 events: to_host(entry.events),
@@ -581,6 +606,14 @@ pub fn ppoll(a: [u64; 6]) -> i64 {
         });
     }
     host.extend(hangups.as_ref().map(Hangups::pollfd));
+    let any_mount = guest.iter().any(|entry| super::procfs::is_mount_poll(entry.fd));
+    if any_mount && let wake @ 0.. = super::procfs::mount_wake_fd() {
+        host.push(libc::pollfd {
+            fd: wake,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
     let polling = match watch_signals(&pins, &mut host) {
         Ok(polling) => polling,
         Err(error) => return -(error as i64),
@@ -607,6 +640,18 @@ pub fn ppoll(a: [u64; 6]) -> i64 {
         if let Some(polling) = &polling {
             polling.sync();
         }
+        if any_mount {
+            super::procfs::drain_mount_wake();
+        }
+        let mounts_ready = any_mount
+            && guest.iter().any(|entry| {
+                super::procfs::mount_poll_bits(entry.fd).is_some_and(|bits| {
+                    bits & (entry.events | POLLERR | POLLHUP | POLLNVAL) != 0
+                })
+            });
+        if let Some(error) = mount_wait_error(any_mount, mounts_ready, left) {
+            return error;
+        }
         // Darwin poll waits for a socket's pending error only through a
         // read or write event (filt_soread, filt_sowrite), which
         // `sock_poll` reports whatever was asked, and never reports an
@@ -623,7 +668,11 @@ pub fn ppoll(a: [u64; 6]) -> i64 {
                 || kept(pin.as_ref(), h.fd)
                     .is_some_and(|kept| kept.events as i16 & (g.events | POLLHUP | POLLERR) != 0)
         });
-        let n = host_poll(&mut host, if invalid || errored { 0 } else { left }, mask);
+        let n = host_poll(
+            &mut host,
+            if invalid || errored || mounts_ready { 0 } else { left },
+            mask,
+        );
         if n < 0 {
             return n;
         }
@@ -701,6 +750,7 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
     let mut ptys = Vec::new();
     let mut guest_fds = Vec::new();
     let mut pipes = Vec::new();
+    let mut asked_mount = Vec::new();
     for fd in 0..nfds {
         let mut ev = 0;
         for (s, w) in input_sets.iter().zip(wanted) {
@@ -731,12 +781,17 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
                 super::binder::poll(host_fd);
             }
             let pipe = pipe(host_fd, pin.kind());
+            let asked = ev;
             ev = to_host(asked_events(pin.kind(), pipe, ev));
+            if super::procfs::is_mount_poll(fd as i32) {
+                ev = 0;
+            }
             host.push(libc::pollfd {
                 fd: host_fd,
                 events: ev,
                 revents: 0,
             });
+            asked_mount.push(asked);
             guest_fds.push(fd);
             pipes.push(pipe);
             pins.push(if pty.is_none() { Some(pin) } else { None });
@@ -749,6 +804,16 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
         };
         host.push(libc::pollfd {
             fd: notification.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let any_mount = guest_fds
+        .iter()
+        .any(|fd| super::procfs::is_mount_poll(*fd as i32));
+    if any_mount && let wake @ 0.. = super::procfs::mount_wake_fd() {
+        host.push(libc::pollfd {
+            fd: wake,
             events: libc::POLLIN,
             revents: 0,
         });
@@ -779,6 +844,17 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
         if let Some(polling) = &polling {
             polling.sync();
         }
+        if any_mount {
+            super::procfs::drain_mount_wake();
+        }
+        let mounts_ready = any_mount
+            && guest_fds.iter().zip(&asked_mount).any(|(&fd, &asked)| {
+                super::procfs::mount_poll_bits(fd as i32)
+                    .is_some_and(|bits| bits & (asked | POLLERR | POLLHUP) != 0)
+            });
+        if let Some(error) = mount_wait_error(any_mount, mounts_ready, left) {
+            return error;
+        }
         // Darwin never reports what a socket polls from state this layer
         // keeps, nor an error a recvmmsg kept, for the sets asked:
         // POLLIN_SET (IN, HUP, ERR) and POLLOUT_SET (OUT, ERR), not
@@ -792,7 +868,11 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
                     || write && events & (POLLOUT | POLLERR) != 0
             })
         });
-        let n = host_poll(&mut host, if unconnected { 0 } else { left }, mask);
+        let n = host_poll(
+            &mut host,
+            if unconnected || mounts_ready { 0 } else { left },
+            mask,
+        );
         if n < 0 {
             return n;
         }
@@ -820,16 +900,18 @@ pub fn pselect6(a: [u64; 6]) -> i64 {
         }
         let mut output_sets = vec![vec![0u8; nfds.div_ceil(64) * 8]; 3];
         let mut count = 0;
-        for ((p, &fd), pin) in host.iter().zip(&guest_fds).zip(&pins) {
+        for (((p, &fd), pin), &asked) in host.iter().zip(&guest_fds).zip(&pins).zip(&asked_mount) {
             // POLLIN_SET, POLLOUT_SET and POLLEX_SET of what poll reports.
-            let revents = guest_revents(fd as i32, pin.as_ref(), p, p.events);
+            // A mount file's host events are zero so the vnode is not polled;
+            // the sets the caller passed are `asked`.
+            let revents = guest_revents(fd as i32, pin.as_ref(), p, asked);
             let hits = [
                 revents & (POLLIN | POLLHUP | POLLERR) != 0,
                 revents & (POLLOUT | POLLERR) != 0,
                 revents & POLLPRI != 0,
             ];
             for (index, ((s, w), hit)) in sets.iter().zip(wanted).zip(hits).enumerate() {
-                if *s != 0 && p.events & w != 0 && hit {
+                if *s != 0 && asked & w != 0 && hit {
                     // SAFETY: guest fd_set word covering fd.
                     output_sets[index][fd / 8] |= 1 << (fd % 8);
                     count += 1;

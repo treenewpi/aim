@@ -49,7 +49,7 @@ fn trace_ctl(epfd: i32, op: u64, fd: i32, interest: Option<Interest>) {
         );
     }
 }
-fn trace_wait(epfd: i32, kevs: &[libc::kevent], out: &[(i32, u32, u64)]) {
+fn trace_wait(epfd: i32, kevs: &[crate::hostlibc::kevent], out: &[(i32, u32, u64)]) {
     if !trace_receipt(&TRACE_WAIT) {
         return;
     }
@@ -134,6 +134,10 @@ struct Interest {
     /// until the socket leaves `TCP_CLOSE`. Some(0) once an edge-triggered
     /// interest in a bpf map was reported ([`polled_maps`]).
     reported: Option<u32>,
+    /// An edge-triggered mount file has not yet delivered the `EPOLLIN`
+    /// `mounts_poll` always reports. Level-triggered interests stay fresh:
+    /// `ep_send_events` puts them back on the ready list.
+    mount_fresh: bool,
 }
 
 impl Interest {
@@ -196,6 +200,7 @@ fn pty_ctl(
             disabled: false,
             seen: 0,
             reported: None,
+            mount_fresh: true,
         })
     };
     let mut retired = None;
@@ -298,33 +303,33 @@ fn pty_changes(
     tag: u64,
     old: Option<&Interest>,
     new: Option<&Interest>,
-) -> Vec<libc::kevent> {
+) -> Vec<crate::hostlibc::kevent> {
     use std::os::fd::AsRawFd;
     let data = watch.observation.data().as_raw_fd();
     let mut changes = changes(data, None, old, new);
     if let Some(notification) = watch.observation.notification() {
         let fd = notification.as_raw_fd();
         if old.is_some() {
-            changes.push(kev(fd, libc::EVFILT_READ, libc::EV_DELETE));
+            changes.push(kev(fd, crate::hostlibc::EVFILT_READ, crate::hostlibc::EV_DELETE));
         }
         if let Some(interest) = new {
-            let flags = libc::EV_ADD
+            let flags = crate::hostlibc::EV_ADD
                 | if interest.disabled {
-                    libc::EV_DISABLE
+                    crate::hostlibc::EV_DISABLE
                 } else {
-                    libc::EV_ENABLE
+                    crate::hostlibc::EV_ENABLE
                 }
                 | if interest.events & EPOLLET != 0 {
-                    libc::EV_CLEAR
+                    crate::hostlibc::EV_CLEAR
                 } else {
                     0
                 }
                 | if interest.events & EPOLLONESHOT != 0 {
-                    libc::EV_DISPATCH
+                    aim_storage::host::EV_DISPATCH
                 } else {
                     0
                 };
-            changes.push(kev(fd, libc::EVFILT_READ, flags));
+            changes.push(kev(fd, crate::hostlibc::EVFILT_READ, flags));
         }
     }
     for change in &mut changes {
@@ -333,11 +338,11 @@ fn pty_changes(
     changes
 }
 
-fn kev(fd: i32, filter: i16, flags: u16) -> libc::kevent {
-    libc::kevent {
+fn kev(fd: i32, filter: i16, flags: u16) -> crate::hostlibc::kevent {
+    crate::hostlibc::kevent {
         ident: fd as usize,
         filter,
-        flags: flags | libc::EV_RECEIPT,
+        flags: flags | crate::hostlibc::EV_RECEIPT,
         fflags: 0,
         data: 0,
         udata: std::ptr::null_mut(),
@@ -346,7 +351,7 @@ fn kev(fd: i32, filter: i16, flags: u16) -> libc::kevent {
 
 /// Apply `changes` to `kq`; the first error other than a missing knote on
 /// delete, as a negative Linux errno.
-fn apply(kq: i32, changes: &[libc::kevent]) -> i64 {
+fn apply(kq: i32, changes: &[crate::hostlibc::kevent]) -> i64 {
     if changes.is_empty() {
         return 0;
     }
@@ -357,7 +362,7 @@ fn apply(kq: i32, changes: &[libc::kevent]) -> i64 {
     };
     // SAFETY: change and receipt arrays of equal length.
     let n = unsafe {
-        libc::kevent(
+        crate::hostlibc::kevent(
             kq,
             changes.as_ptr(),
             changes.len() as i32,
@@ -370,8 +375,8 @@ fn apply(kq: i32, changes: &[libc::kevent]) -> i64 {
         return -(errno::last() as i64);
     }
     for (c, r) in changes.iter().zip(&out[..n as usize]) {
-        if r.flags & libc::EV_ERROR != 0 && r.data != 0 {
-            if c.flags & libc::EV_DELETE != 0 && r.data == libc::ENOENT as isize {
+        if r.flags & crate::hostlibc::EV_ERROR != 0 && r.data != 0 {
+            if c.flags & crate::hostlibc::EV_DELETE != 0 && r.data == libc::ENOENT as isize {
                 continue;
             }
             return -(errno::from_darwin(r.data as i32) as i64);
@@ -389,39 +394,40 @@ fn changes(
     reap: Option<i32>,
     old: Option<&Interest>,
     new: Option<&Interest>,
-) -> Vec<libc::kevent> {
+) -> Vec<crate::hostlibc::kevent> {
     // A bpf map's file is regular, which a knote always finds readable:
     // its knotes stay disabled, dropping with the fd, and its readiness is
-    // the map's poll, read each wait ([`polled_maps`]).
-    let map = matches!(fdtab::get(fd), Some(Kind::Bpf));
+    // the map's poll, read each wait ([`polled_maps`]). A proc mount file
+    // is the same kind of regular file: `mounts_poll` is not the vnode.
+    let map = matches!(fdtab::get(fd), Some(Kind::Bpf)) || super::procfs::is_mount_poll(fd);
     let mut v = Vec::new();
     for (filter, want) in [
         (
-            libc::EVFILT_READ,
+            crate::hostlibc::EVFILT_READ,
             Interest::read_knote as fn(&Interest) -> bool,
         ),
-        (libc::EVFILT_WRITE, Interest::wants_write),
+        (crate::hostlibc::EVFILT_WRITE, Interest::wants_write),
     ] {
         if old.is_some_and(want) {
-            v.push(kev(fd, filter, libc::EV_DELETE));
+            v.push(kev(fd, filter, crate::hostlibc::EV_DELETE));
         }
         if let Some(n) = new.filter(|n| want(n)) {
-            let hangup = filter == libc::EVFILT_READ && n.hangup_only();
-            let mut f = libc::EV_ADD;
-            f |= if n.disabled || map || filter == libc::EVFILT_READ && !n.wants_read() && !hangup {
-                libc::EV_DISABLE
+            let hangup = filter == crate::hostlibc::EVFILT_READ && n.hangup_only();
+            let mut f = crate::hostlibc::EV_ADD;
+            f |= if n.disabled || map || filter == crate::hostlibc::EVFILT_READ && !n.wants_read() && !hangup {
+                crate::hostlibc::EV_DISABLE
             } else {
-                libc::EV_ENABLE
+                crate::hostlibc::EV_ENABLE
             };
             if n.events & EPOLLET != 0 || hangup {
-                f |= libc::EV_CLEAR;
+                f |= crate::hostlibc::EV_CLEAR;
             }
             if n.events & EPOLLONESHOT != 0 {
-                f |= libc::EV_DISPATCH;
+                f |= aim_storage::host::EV_DISPATCH;
             }
             let mut k = kev(fd, filter, f);
             if hangup {
-                k.fflags = libc::NOTE_LOWAT;
+                k.fflags = crate::hostlibc::NOTE_LOWAT;
                 k.data = isize::MAX;
             }
             v.push(k);
@@ -431,22 +437,22 @@ fn changes(
     // readable from the exit on.
     if let Some(reap) = reap {
         if old.is_some() {
-            v.push(kev(reap, libc::EVFILT_READ, libc::EV_DELETE));
+            v.push(kev(reap, crate::hostlibc::EVFILT_READ, crate::hostlibc::EV_DELETE));
         }
         if let Some(n) = new {
-            let mut f = libc::EV_ADD;
+            let mut f = crate::hostlibc::EV_ADD;
             f |= if n.disabled {
-                libc::EV_DISABLE
+                crate::hostlibc::EV_DISABLE
             } else {
-                libc::EV_ENABLE
+                crate::hostlibc::EV_ENABLE
             };
             if n.events & EPOLLET != 0 {
-                f |= libc::EV_CLEAR;
+                f |= crate::hostlibc::EV_CLEAR;
             }
             if n.events & EPOLLONESHOT != 0 {
-                f |= libc::EV_DISPATCH;
+                f |= aim_storage::host::EV_DISPATCH;
             }
-            v.push(kev(reap, libc::EVFILT_READ, f));
+            v.push(kev(reap, crate::hostlibc::EVFILT_READ, f));
         }
     }
     v
@@ -456,9 +462,9 @@ fn changes(
 /// action flags only reports whether the knote exists.
 fn registered(kq: i32, fd: i32, i: &Interest) -> bool {
     let filter = if i.read_knote() {
-        libc::EVFILT_READ
+        crate::hostlibc::EVFILT_READ
     } else {
-        libc::EVFILT_WRITE
+        crate::hostlibc::EVFILT_WRITE
     };
     apply(kq, &[kev(fd, filter, 0)]) == 0
 }
@@ -481,7 +487,7 @@ pub fn epoll_create1(a: [u64; 6]) -> i64 {
         return -(EINVAL as i64);
     }
     // SAFETY: plain kqueue.
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return -(errno::last() as i64);
     }
@@ -526,8 +532,11 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
     }
     let kind = fdtab::get(fd);
     // A bpf object's file is regular; a map's polls (`bpf_map_poll`).
+    // `/proc/mounts` is a regular file too, and `mounts_poll` is why
+    // `file_can_poll` accepts it. Another regular file stays EPERM.
     let map = matches!(kind, Some(Kind::Bpf)) && super::bpf::poll(fd).is_some();
-    if !map && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
+    let mounts = super::procfs::is_mount_poll(fd);
+    if !map && !mounts && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
         return -(EPERM as i64);
     }
     let new = if op != EPOLL_CTL_DEL {
@@ -539,6 +548,7 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
             disabled: false,
             seen: 0,
             reported: None,
+            mount_fresh: true,
         })
     } else {
         None
@@ -622,21 +632,28 @@ pub fn epoll_ctl(a: [u64; 6]) -> i64 {
     drop(reaps);
     drop(interest);
     drop((alias, stale));
+    if new.is_some() && super::procfs::is_mount_poll(fd) {
+        // `ep_insert` and `ep_modify` call `vfs_poll`. `mounts_poll` stores
+        // `ns->event` before `ep_item_poll` masks, so a change between open
+        // and this ctl is consumed. `ep_send_events` polls again and does
+        // not deliver that edge.
+        let _ = super::procfs::take_mount_edge(fd);
+    }
     trace_ctl(epfd, op, fd, new.or(old));
     0
 }
 
 /// Linux epoll event bits for one kevent of an interest.
-fn bits(k: &libc::kevent, i: &Interest) -> u32 {
+fn bits(k: &crate::hostlibc::kevent, i: &Interest) -> u32 {
     if let Some(events) = super::fuse_device::readiness(k.ident as i32) {
         return match events {
             Ok(events) => (events as u32) & (i.events | EPOLLERR | EPOLLHUP),
             Err(_) => EPOLLERR,
         };
     }
-    let eof = k.flags & libc::EV_EOF != 0;
+    let eof = k.flags & crate::hostlibc::EV_EOF != 0;
     let mut b = 0;
-    if k.flags & libc::EV_ERROR != 0 {
+    if k.flags & crate::hostlibc::EV_ERROR != 0 {
         return EPOLLERR;
     }
     // A pipe end whose other end is gone, which Darwin marks with EOF for
@@ -652,7 +669,7 @@ fn bits(k: &libc::kevent, i: &Interest) -> u32 {
     match pipe {
         Some(super::poll::PipeEnd::Read) => {
             return EPOLLHUP
-                | if k.filter == libc::EVFILT_READ && k.data > 0 {
+                | if k.filter == crate::hostlibc::EVFILT_READ && k.data > 0 {
                     i.events & (EPOLLIN | EPOLLRDNORM)
                 } else {
                     0
@@ -667,16 +684,16 @@ fn bits(k: &libc::kevent, i: &Interest) -> u32 {
         .then(|| {
             super::tcp_shutdown::shutdown(
                 k.ident as i32,
-                k.filter == libc::EVFILT_READ,
-                k.filter == libc::EVFILT_WRITE,
+                k.filter == crate::hostlibc::EVFILT_READ,
+                k.filter == crate::hostlibc::EVFILT_WRITE,
             )
             .or_else(|| super::net::shut_directions(k.ident as i32))
         })
         .flatten();
     if let Some(shut) = shut {
-        if k.filter == libc::EVFILT_READ {
+        if k.filter == crate::hostlibc::EVFILT_READ {
             b |= i.events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP);
-        } else if k.filter == libc::EVFILT_WRITE {
+        } else if k.filter == crate::hostlibc::EVFILT_WRITE {
             b |= i.events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
         }
         if shut.hangup() {
@@ -685,7 +702,7 @@ fn bits(k: &libc::kevent, i: &Interest) -> u32 {
         if k.fflags != 0 {
             b |= EPOLLERR;
         }
-    } else if k.filter == libc::EVFILT_READ {
+    } else if k.filter == crate::hostlibc::EVFILT_READ {
         b |= i.events & (EPOLLIN | EPOLLRDNORM);
         if eof {
             b |= EPOLLHUP | (i.events & EPOLLRDHUP);
@@ -716,7 +733,7 @@ fn bits(k: &libc::kevent, i: &Interest) -> u32 {
         if b & EPOLLIN != 0 && super::wait::pidfd_reaped(k.ident as i32) {
             b |= EPOLLHUP;
         }
-    } else if k.filter == libc::EVFILT_WRITE {
+    } else if k.filter == crate::hostlibc::EVFILT_WRITE {
         b |= i.events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
         if eof {
             b |= if k.fflags != 0 { EPOLLERR } else { EPOLLHUP };
@@ -839,6 +856,43 @@ fn polled_maps(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
         .collect()
 }
 
+/// Armed interests in a proc mount file whose `mounts_poll` reports
+/// something this interest asked for. The edge is not consumed here; the
+/// waiter that delivers it advances `p->event`. `EPOLLIN` is always ready.
+/// An edge-triggered interest reports that current state once, then only
+/// when a new generation arrives (`ep_send_events` does not requeue
+/// `EPOLLET`).
+fn polled_mounts(ep: &Epoll, epfd: i32) -> Vec<(i32, u32)> {
+    let interests: Vec<(i32, Interest)> = ep
+        .interest
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, interest)| !interest.disabled)
+        .map(|(fd, interest)| (*fd, *interest))
+        .collect();
+    interests
+        .into_iter()
+        .filter_map(|(fd, interest)| {
+            let raw = super::procfs::mount_poll_bits(fd)? as u32;
+            let mut events = raw & (interest.events | EPOLLERR | EPOLLHUP);
+            if interest.events & EPOLLET != 0
+                && events & (EPOLLERR | EPOLLPRI) == 0
+                && !interest.mount_fresh
+            {
+                events &= !(EPOLLIN | EPOLLRDNORM);
+            }
+            (events != 0 && registered(epfd, fd, &interest)).then_some((fd, events))
+        })
+        .collect()
+}
+
+fn watches_mounts(ep: &Epoll) -> bool {
+    ep.interest.lock().unwrap().iter().any(|(fd, interest)| {
+        !interest.disabled && super::procfs::is_mount_poll(*fd)
+    })
+}
+
 /// Milliseconds for poll(2), rounded up, -1 for none.
 fn poll_ms(timeout: Option<libc::timespec>) -> i32 {
     timeout.map_or(-1, |t| {
@@ -867,7 +921,7 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
     // one event and the fds past `maxevents` are re-armed, not lost.
     let knotes = 2 * ep.interest.lock().unwrap().len() + 3 * ep.ptys.lock().unwrap().len();
     let fetch = knotes.max(maxevents as usize).min(i32::MAX as usize);
-    let mut kevs: Vec<libc::kevent> = Vec::with_capacity(fetch);
+    let mut kevs: Vec<crate::hostlibc::kevent> = Vec::with_capacity(fetch);
     let deadline = timeout.map(|t| now_ns() + t.tv_sec * 1_000_000_000 + t.tv_nsec);
     let zero = libc::timespec {
         tv_sec: 0,
@@ -886,7 +940,22 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         let signals = signal_interests(&ep);
         let kept = kept_interests(&ep);
         let maps = polled_maps(&ep, epfd);
-        let wait = if kept.is_empty() && maps.is_empty() {
+        let mount_wait = watches_mounts(&ep);
+        if mount_wait {
+            // A byte only wakes. The generation is what `mounts_poll` reads,
+            // so draining a byte already observed does not drop an edge.
+            super::procfs::drain_mount_wake();
+        }
+        let mounts = polled_mounts(&ep, epfd);
+        let block = left.is_none_or(|t| t.tv_sec != 0 || t.tv_nsec != 0);
+        if mount_wait && mounts.is_empty() && block && super::procfs::mount_wake_fd() < 0 {
+            // A blocking wait with no wake pipe would sleep through a later
+            // generation. The generation is the event; this does not invent
+            // one. A zero timeout still falls through and reports only what
+            // `mounts_poll` says now.
+            return -(super::procfs::mount_wake_errno() as i64);
+        }
+        let wait = if kept.is_empty() && maps.is_empty() && mounts.is_empty() {
             left
         } else {
             Some(zero)
@@ -905,7 +974,7 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         };
         // SAFETY: output array with capacity `fetch`.
         let mut fetch_events = |wait: Option<&libc::timespec>| unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 epfd,
                 std::ptr::null(),
                 0,
@@ -916,31 +985,40 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         };
         let old_mask = user_try!(super::poll::swap_sigmask(mask));
         // With signalfds the wait is on the kqueue and the wake token, then
-        // the kqueue is read without waiting.
-        let (n, woke) = match &polling {
-            None => {
-                let n = fetch_events(wait.as_ref());
-                (n, n != 0)
-            }
-            Some(polling) => {
+        // the kqueue is read without waiting. A mount file has no vnode
+        // knote that means `mounts_poll`, so the same wait also watches the
+        // namespace wake pipe.
+        let wake = (mount_wait && mounts.is_empty()).then(super::procfs::mount_wake_fd);
+        let (n, woke) = if polling.is_none() && wake.is_none_or(|fd| fd < 0) {
+            let n = fetch_events(wait.as_ref());
+            (n, n != 0)
+        } else {
+            if let Some(polling) = &polling {
                 polling.sync();
-                let mut fds = [
-                    libc::pollfd {
-                        fd: epfd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: polling.fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                // SAFETY: a pollfd array we own.
-                match unsafe { libc::poll(fds.as_mut_ptr(), 2, poll_ms(wait)) } {
-                    woke if woke <= 0 => (woke, woke != 0),
-                    _ => (fetch_events(Some(&zero)), true),
-                }
+            }
+            let mut fds = vec![libc::pollfd {
+                fd: epfd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            if let Some(polling) = &polling {
+                fds.push(libc::pollfd {
+                    fd: polling.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if let Some(fd) = wake.filter(|fd| *fd >= 0) {
+                fds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            // SAFETY: a pollfd array we own.
+            match unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_ms(wait)) } {
+                woke if woke <= 0 => (woke, woke != 0),
+                _ => (fetch_events(Some(&zero)), true),
             }
         };
         let err = errno::last();
@@ -950,13 +1028,22 @@ fn wait(epfd: i32, events: u64, maxevents: i32, timeout: Option<libc::timespec>,
         }
         // SAFETY: the kernel filled n entries.
         unsafe { kevs.set_len(n as usize) };
-        let (found, rearm) = ready(&ep, &kevs, maxevents as usize, &signals, &kept, &maps);
+        let (found, rearm) = ready(
+            &ep,
+            &kevs,
+            maxevents as usize,
+            &signals,
+            &kept,
+            &maps,
+            &mounts,
+        );
         apply(epfd, &rearm);
         // An inotify fd that woke the wait with nothing to read, or an
         // unconnected socket another waiter reported or a change removed
-        // since it was found: wait on.
+        // since it was found: wait on. A mount wake with no new edge does
+        // the same.
         if !found.is_empty()
-            || !woke && kept.is_empty() && maps.is_empty()
+            || !woke && kept.is_empty() && maps.is_empty() && mounts.is_empty()
             || left.is_some_and(|t| t.tv_sec == 0 && t.tv_nsec == 0)
         {
             break found;
@@ -986,12 +1073,13 @@ fn now_ns() -> i64 {
 /// their poll does.
 fn ready(
     ep: &Epoll,
-    kevs: &[libc::kevent],
+    kevs: &[crate::hostlibc::kevent],
     limit: usize,
     signals: &[(i32, Arc<super::signalfd::SignalFd>, u64)],
     kept: &[(i32, super::net::Kept)],
     maps: &[(i32, u32)],
-) -> (Vec<(i32, u32, u64)>, Vec<libc::kevent>) {
+    mounts: &[(i32, u32)],
+) -> (Vec<(i32, u32, u64)>, Vec<crate::hostlibc::kevent>) {
     let mut out: Vec<(i32, u32, u64)> = Vec::with_capacity(kevs.len().min(limit));
     let mut rearm = Vec::new();
     let mut rearmed = Vec::new();
@@ -1034,7 +1122,7 @@ fn ready(
             EPOLLHUP | i.events & (EPOLLIN | EPOLLRDNORM)
         } else {
             // The pidfd was closed, which dropped its own knote.
-            rearm.push(kev(ident, k.filter, libc::EV_DELETE));
+            rearm.push(kev(ident, k.filter, crate::hostlibc::EV_DELETE));
             continue;
         };
         let mut b = fired;
@@ -1048,7 +1136,7 @@ fn ready(
             // A dispatched knote that fired for nothing (a hangup-only one
             // on a full buffer, an AF_UNIX datagram peer's close) waits on.
             if i.events & EPOLLONESHOT != 0 && !i.disabled {
-                rearm.push(kev(ident, k.filter, libc::EV_ENABLE));
+                rearm.push(kev(ident, k.filter, crate::hostlibc::EV_ENABLE));
             }
             continue;
         }
@@ -1070,22 +1158,22 @@ fn ready(
         }
         if i.events & EPOLLONESHOT != 0 {
             i.disabled = true;
-            let other = if k.filter == libc::EVFILT_READ {
-                libc::EVFILT_WRITE
+            let other = if k.filter == crate::hostlibc::EVFILT_READ {
+                crate::hostlibc::EVFILT_WRITE
             } else {
-                libc::EVFILT_READ
+                crate::hostlibc::EVFILT_READ
             };
-            if (other == libc::EVFILT_READ && i.wants_read())
-                || (other == libc::EVFILT_WRITE && i.wants_write())
+            if (other == crate::hostlibc::EVFILT_READ && i.wants_read())
+                || (other == crate::hostlibc::EVFILT_WRITE && i.wants_write())
             {
-                rearm.push(kev(fd, other, libc::EV_DISABLE));
+                rearm.push(kev(fd, other, crate::hostlibc::EV_DISABLE));
             }
             if reap {
                 if i.wants_read() {
-                    rearm.push(kev(fd, libc::EVFILT_READ, libc::EV_DISABLE));
+                    rearm.push(kev(fd, crate::hostlibc::EVFILT_READ, crate::hostlibc::EV_DISABLE));
                 }
             } else if let Some(reap) = reaps.get(&fd) {
-                rearm.push(kev(reap.fd(), libc::EVFILT_READ, libc::EV_DISABLE));
+                rearm.push(kev(reap.fd(), crate::hostlibc::EVFILT_READ, crate::hostlibc::EV_DISABLE));
             }
         } else if i.hangup_only() && i.events & EPOLLET == 0 {
             rearm.extend(changes(
@@ -1114,7 +1202,7 @@ fn ready(
         i.seen = notified;
         if i.events & EPOLLONESHOT != 0 {
             i.disabled = true;
-            rearm.push(kev(*fd, libc::EVFILT_READ, libc::EV_DISABLE));
+            rearm.push(kev(*fd, crate::hostlibc::EVFILT_READ, crate::hostlibc::EV_DISABLE));
         }
         out.push((*fd, EPOLLIN, i.data));
     }
@@ -1151,6 +1239,30 @@ fn ready(
         // Its knotes stay disabled ([`changes`]).
         if i.events & EPOLLONESHOT != 0 {
             i.disabled = true;
+        }
+        out.push((fd, b, i.data));
+    }
+    for &(fd, peeked) in mounts {
+        let Some(i) = interest.get_mut(&fd) else {
+            continue;
+        };
+        if i.disabled || out.len() == limit || !super::procfs::is_mount_poll(fd) {
+            continue;
+        }
+        let mut b = peeked;
+        // `mounts_poll` stores the generation it observed. Only the waiter
+        // that delivers the edge does; a full ready list leaves it pending.
+        if b & (EPOLLERR | EPOLLPRI) != 0 && !super::procfs::take_mount_edge(fd) {
+            b &= !(EPOLLERR | EPOLLPRI);
+        }
+        if b == 0 {
+            continue;
+        }
+        if i.events & EPOLLONESHOT != 0 {
+            i.disabled = true;
+        }
+        if i.events & EPOLLET != 0 {
+            i.mount_fresh = false;
         }
         out.push((fd, b, i.data));
     }
@@ -1258,6 +1370,7 @@ pub(super) fn save(ep: &Epoll, w: &mut super::fork_state::Writer) {
         w.u32(i.events);
         w.u64(i.data);
         w.bool(i.disabled);
+        w.bool(i.mount_fresh);
     });
     drop(interest);
     let ptys = ep.ptys.lock().unwrap();
@@ -1280,6 +1393,7 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Arc<Epoll> {
                 events: r.u32(),
                 data: r.u64(),
                 disabled: r.bool(),
+                mount_fresh: r.bool(),
                 seen: 0,
                 reported: None,
             },
@@ -1295,6 +1409,7 @@ pub(super) fn load(r: &mut super::fork_state::Reader) -> Arc<Epoll> {
             disabled: r.bool(),
             seen: 0,
             reported: None,
+            mount_fresh: true,
         };
         let watch = super::pty_owner::Watch::restore(r);
         let valid = match (identity, watch) {
@@ -1354,7 +1469,7 @@ fn rebuild(epolls: Vec<(i32, Arc<Epoll>)>) -> Result<(), errno::Errno> {
         unsafe {
             let kq = match src {
                 Some(s) => s,
-                None => libc::kqueue(),
+                None => crate::hostlibc::kqueue(),
             };
             if kq < 0 {
                 return Err(errno::last());

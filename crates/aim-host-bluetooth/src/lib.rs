@@ -279,18 +279,31 @@ fn recv(buf: &mut [u8]) -> Result<(u32, usize), i32> {
 /// so it is stable per Mac and never a real device's address.
 fn local_address() -> Addr {
     let mut uuid = [0u8; 16];
-    let timeout = libc::timespec {
-        tv_sec: 1,
-        tv_nsec: 0,
-    };
-    // SAFETY: a 16-byte buffer, as gethostuuid requires.
-    unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &timeout) };
+    #[cfg(target_os = "macos")]
+    {
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: a 16-byte buffer, as gethostuuid requires.
+        unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &timeout) };
+    }
     Addr::derive(&uuid, false)
 }
 
 pub(crate) fn random(buf: &mut [u8]) {
     // SAFETY: fills our buffer.
-    unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len())
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            buf.fill(0);
+        }
+    }
 }
 
 #[cfg(test)]

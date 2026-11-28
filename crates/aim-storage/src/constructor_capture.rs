@@ -170,17 +170,17 @@ fn xattrs(path: &Path) -> Result<Vec<u8>, String> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let path = CString::new(path.as_os_str().as_bytes()).map_err(error)?;
     let size =
-        unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
+        unsafe { crate::host::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, crate::host::XATTR_NOFOLLOW) };
     if size < 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
     let mut names = vec![0; size as usize];
     let count = unsafe {
-        libc::listxattr(
+        crate::host::listxattr(
             path.as_ptr(),
             names.as_mut_ptr().cast(),
             names.len(),
-            libc::XATTR_NOFOLLOW,
+            crate::host::XATTR_NOFOLLOW,
         )
     };
     if count < 0 {
@@ -196,13 +196,13 @@ fn xattrs(path: &Path) -> Result<Vec<u8>, String> {
     for name in names {
         let name = CString::new(name).map_err(error)?;
         let size = unsafe {
-            libc::getxattr(
+            crate::host::getxattr(
                 path.as_ptr(),
                 name.as_ptr(),
                 std::ptr::null_mut(),
                 0,
                 0,
-                libc::XATTR_NOFOLLOW,
+                crate::host::XATTR_NOFOLLOW,
             )
         };
         if size < 0 {
@@ -210,13 +210,13 @@ fn xattrs(path: &Path) -> Result<Vec<u8>, String> {
         }
         let mut value = vec![0; size as usize];
         let count = unsafe {
-            libc::getxattr(
+            crate::host::getxattr(
                 path.as_ptr(),
                 name.as_ptr(),
                 value.as_mut_ptr().cast(),
                 value.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                crate::host::XATTR_NOFOLLOW,
             )
         };
         if count < 0 {

@@ -68,14 +68,26 @@ const ENOSYS: i64 = -(errno::ENOSYS as i64);
 static RESOLVED: [AtomicUsize; table::ENTRIES.len()] =
     [const { AtomicUsize::new(0) }; table::ENTRIES.len()];
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe extern "C" {
     /// `trampoline` below.
     fn darwin_vulkan_forward(f: usize, regs: *const u64, stack: *const u64, words: u64) -> u64;
 }
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+unsafe extern "C" fn darwin_vulkan_forward(
+    _f: usize,
+    _regs: *const u64,
+    _stack: *const u64,
+    _words: u64,
+) -> u64 {
+    0
+}
+
 // Load x0-x7 and d0-d7 from `regs` (16 values), copy `words` stack words to
 // the bottom of a 16-byte aligned area, and call `f`. The GLES module has
 // the same trampoline (crates/aim-host-gpu).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 std::arch::global_asm!(
     ".globl _darwin_vulkan_forward",
     ".p2align 2",

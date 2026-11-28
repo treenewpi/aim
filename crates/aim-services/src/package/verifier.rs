@@ -8,7 +8,7 @@ impl Identity {
     pub fn generate() -> Self {
         let mut value = 0u64;
         unsafe {
-            libc::arc4random_buf((&mut value as *mut u64).cast(), std::mem::size_of::<u64>());
+            crate::host_os::arc4random_buf((&mut value as *mut u64).cast(), std::mem::size_of::<u64>());
         }
         Self(value)
     }

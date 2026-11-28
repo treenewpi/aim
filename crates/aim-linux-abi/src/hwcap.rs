@@ -14,7 +14,7 @@ fn feature(name: &str) -> bool {
     let mut len = std::mem::size_of::<i32>();
     // SAFETY: sysctlbyname with a correctly sized i32 buffer.
     let r = unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c.as_ptr(),
             (&mut v as *mut i32).cast(),
             &mut len,

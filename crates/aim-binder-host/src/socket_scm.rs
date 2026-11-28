@@ -180,7 +180,7 @@ impl Service {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mut nonce = [0; 16];
         unsafe {
-            libc::arc4random_buf(nonce.as_mut_ptr().cast(), nonce.len());
+            aim_storage::host::arc4random_buf(nonce.as_mut_ptr().cast(), nonce.len());
         }
         let directory = std::env::temp_dir().join(format!(
             "aim-scm-{}-{}",
@@ -249,7 +249,7 @@ impl Service {
                             let mut peer_uid = 0;
                             let mut peer_gid = 0;
                             if unsafe {
-                                libc::getpeereid(server.as_raw_fd(), &mut peer_uid, &mut peer_gid)
+                                aim_storage::host::getpeereid(server.as_raw_fd(), &mut peer_uid, &mut peer_gid)
                             } < 0
                                 || peer_uid != uid
                             {
@@ -369,7 +369,7 @@ pub fn authenticate(channel: i32, endpoint: &Endpoint) -> io::Result<()> {
     }
     let mut uid = 0;
     let mut gid = 0;
-    if unsafe { libc::getpeereid(channel, &mut uid, &mut gid) } < 0 {
+    if unsafe { aim_storage::host::getpeereid(channel, &mut uid, &mut gid) } < 0 {
         return Err(io::Error::last_os_error());
     }
     if peer != endpoint.process.host_pid || uid != endpoint.uid || !endpoint.process.is_live() {

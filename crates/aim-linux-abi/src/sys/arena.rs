@@ -31,9 +31,14 @@ pub fn contains(addr: u64, len: u64) -> bool {
     addr >= LO && addr.checked_add(len).is_some_and(|end| end <= HI)
 }
 
-/// The placement hint for a non-fixed guest mapping of `len` bytes: the
-/// guest's own hint when it lies in the range, else `LO`.
+/// The placement hint for a non-fixed guest mapping of `len` bytes.
+///
+/// The guest's hint is used when it lies in the range, otherwise `LO`.
+/// A hint inside a host page moves to the next host page. A non-fixed
+/// mapping does not start in another mapping's leftover 4 KiB slices.
+/// Sharing a host page is only for a guest `MAP_FIXED`.
 pub fn hint(addr: u64, len: u64) -> u64 {
+    let addr = aim_guest_page::host_exclusive_hint(addr);
     if addr != 0 && contains(addr, len) {
         addr
     } else {
@@ -93,5 +98,6 @@ mod tests {
         assert_eq!(hint(HI, 16384), LO);
         assert_eq!(hint(0x1_0000_0000, 16384), LO);
         assert_eq!(hint(LO + 16384, 16384), LO + 16384);
+        assert_eq!(hint(LO + 4096, 16384), LO + 16384);
     }
 }

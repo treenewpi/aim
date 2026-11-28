@@ -247,7 +247,7 @@ pub fn node(tail: &str) -> Option<Node> {
         )
     };
     Some(match tail {
-        "" => dirs(&["ipv4", "ipv6"]),
+        "" => dirs(&["core", "ipv4", "ipv6"]),
         "ipv4" | "ipv6" => dirs(&["conf", "neigh"]),
         "ipv4/conf" | "ipv6/conf" => Node::Dir(device_dirs(true)),
         "ipv4/neigh" | "ipv6/neigh" => Node::Dir(device_dirs(false)),

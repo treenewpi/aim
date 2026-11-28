@@ -27,6 +27,7 @@
 //! Freezing is not supported: `BINDER_FREEZE` and `BINDER_GET_FROZEN_INFO`
 //! fail with `EINVAL`, as on a kernel without the cgroup freezer.
 
+pub mod absence;
 mod alloc;
 mod driver;
 mod host;

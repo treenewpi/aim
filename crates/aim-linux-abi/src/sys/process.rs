@@ -126,8 +126,8 @@ fn priority_range(policy: i32) -> Option<(i32, i32)> {
 /// SCHED_IDLE; Darwin runs that at utility QoS, the lowest nice value and
 /// SCHED_IDLE at background QoS (`PRIO_DARWIN_BG`: efficiency cores,
 /// throttled I/O), and everything else at the default.
-pub fn host_qos(nice: i32, policy: i32) -> libc::qos_class_t {
-    use libc::qos_class_t::*;
+pub fn host_qos(nice: i32, policy: i32) -> crate::qos_class_t {
+    use crate::qos_class_t::*;
     match policy {
         SCHED_IDLE => QOS_CLASS_BACKGROUND,
         SCHED_BATCH => QOS_CLASS_UTILITY,
@@ -154,20 +154,20 @@ fn timeshare_priority(nice: i32) -> i32 {
 fn task_priority() -> Result<i32, errno::Errno> {
     // SAFETY: proc_pidinfo into a local struct of the size given.
     unsafe {
-        let mut info: libc::proc_taskinfo = std::mem::zeroed();
-        let size = size_of::<libc::proc_taskinfo>() as i32;
+        let mut info: crate::hostlibc::proc_taskinfo = std::mem::zeroed();
+        let size = size_of::<crate::hostlibc::proc_taskinfo>() as i32;
         if errno::retry_host(|| {
-            *libc::__error() = 0;
-            let n = libc::proc_pidinfo(
+            *crate::hostlibc::__error() = 0;
+            let n = crate::hostlibc::proc_pidinfo(
                 libc::getpid(),
-                libc::PROC_PIDTASKINFO,
+                crate::hostlibc::PROC_PIDTASKINFO,
                 0,
                 (&raw mut info).cast(),
                 size,
             );
             if n == 0 {
-                if *libc::__error() == 0 {
-                    *libc::__error() = libc::EIO;
+                if *crate::hostlibc::__error() == 0 {
+                    *crate::hostlibc::__error() = libc::EIO;
                 }
                 -1
             } else {
@@ -206,14 +206,14 @@ fn retry_pthread(mut call: impl FnMut() -> i32) -> i32 {
     }
 }
 
-fn apply_host_qos(qos: libc::qos_class_t) -> Result<(), errno::Errno> {
-    let mut current = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+fn apply_host_qos(qos: crate::qos_class_t) -> Result<(), errno::Errno> {
+    let mut current = crate::qos_class_t::QOS_CLASS_UNSPECIFIED;
     let mut relative = 0;
     // libpthread reads the calling pthread's requested QoS from its TSD.
     // Compare both fields, not an effective QoS elevated by an override.
     // This also observes policy changes made by native code on this thread.
     let result = retry_pthread(|| unsafe {
-        libc::pthread_get_qos_class_np(libc::pthread_self(), &mut current, &mut relative)
+        crate::hostlibc::pthread_get_qos_class_np(libc::pthread_self(), &mut current, &mut relative)
     });
     if result != 0 {
         return Err(errno::from_darwin(result));
@@ -223,7 +223,7 @@ fn apply_host_qos(qos: libc::qos_class_t) -> Result<(), errno::Errno> {
     }
     // The public self setter updates both the kernel policy and libpthread's
     // TSD; a raw Mach policy call would leave the latter inconsistent.
-    let result = retry_pthread(|| unsafe { libc::pthread_set_qos_class_self_np(qos, 0) });
+    let result = retry_pthread(|| unsafe { crate::hostlibc::pthread_set_qos_class_self_np(qos, 0) });
     if result == 0 {
         Ok(())
     } else {
@@ -321,10 +321,10 @@ pub fn apply_host_sched(nice: i32, policy: i32) -> Result<(), crate::errno::Errn
     // QoS policy and returns EIDRM if both APIs are mixed.
     errno::retry_host(|| unsafe {
         libc::setpriority(
-            libc::PRIO_DARWIN_THREAD,
+            aim_storage::host::PRIO_DARWIN_THREAD as _,
             0,
             if ceiling == 9 {
-                libc::PRIO_DARWIN_BG
+                aim_storage::host::PRIO_DARWIN_BG
             } else {
                 0
             },
@@ -506,18 +506,18 @@ pub fn sched_getaffinity(a: [u64; 6]) -> i64 {
 
 const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 
-fn rlimit_to_host(res: u64) -> Option<i32> {
+fn rlimit_to_host(res: u64) -> Option<u32> {
     Some(match res {
-        0 => libc::RLIMIT_CPU,
-        1 => libc::RLIMIT_FSIZE,
-        2 => libc::RLIMIT_DATA,
-        3 => libc::RLIMIT_STACK,
-        4 => libc::RLIMIT_CORE,
-        5 => libc::RLIMIT_RSS,
-        6 => libc::RLIMIT_NPROC,
-        7 => libc::RLIMIT_NOFILE,
-        8 => libc::RLIMIT_MEMLOCK,
-        9 => libc::RLIMIT_AS,
+        0 => libc::RLIMIT_CPU as _,
+        1 => libc::RLIMIT_FSIZE as _,
+        2 => libc::RLIMIT_DATA as _,
+        3 => libc::RLIMIT_STACK as _,
+        4 => libc::RLIMIT_CORE as _,
+        5 => libc::RLIMIT_RSS as _,
+        6 => libc::RLIMIT_NPROC as _,
+        7 => libc::RLIMIT_NOFILE as _,
+        8 => libc::RLIMIT_MEMLOCK as _,
+        9 => libc::RLIMIT_AS as _,
         _ => return None,
     })
 }
@@ -559,7 +559,7 @@ pub fn prlimit(nr: u64, a: [u64; 6]) -> i64 {
     };
     // SAFETY: local buffers and guest rlimit64 pointers.
     unsafe {
-        if libc::getrlimit(hres, &mut cur) < 0 {
+        if libc::getrlimit(hres as _, &mut cur) < 0 {
             return -(errno::last() as i64);
         }
         if old != 0 {
@@ -575,7 +575,7 @@ pub fn prlimit(nr: u64, a: [u64; 6]) -> i64 {
                 rlim_cur: lim_to_host(c),
                 rlim_max: lim_to_host(m),
             };
-            if libc::setrlimit(hres, &l) < 0 {
+            if libc::setrlimit(hres as _, &l) < 0 {
                 return -(errno::last() as i64);
             }
         }

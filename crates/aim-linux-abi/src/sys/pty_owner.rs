@@ -157,7 +157,7 @@ impl Description {
         use std::os::fd::{FromRawFd, OwnedFd};
         let observation = self.watch()?.observation;
         let queue = PrivateFd::allocate(|| {
-            let fd = unsafe { libc::kqueue() };
+            let fd = unsafe { crate::hostlibc::kqueue() };
             if fd < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -165,24 +165,24 @@ impl Description {
             }
         })
         .map_err(failure)?;
-        let mut changes: [libc::kevent; 3] = unsafe { std::mem::zeroed() };
+        let mut changes: [crate::hostlibc::kevent; 3] = unsafe { std::mem::zeroed() };
         changes[0].ident = observation.data().as_raw_fd() as usize;
         changes[0].filter = if write {
-            libc::EVFILT_WRITE
+            crate::hostlibc::EVFILT_WRITE
         } else {
-            libc::EVFILT_READ
+            crate::hostlibc::EVFILT_READ
         };
-        changes[0].flags = libc::EV_ADD;
-        changes[0].fflags = libc::NOTE_LOWAT;
+        changes[0].flags = crate::hostlibc::EV_ADD;
+        changes[0].fflags = crate::hostlibc::NOTE_LOWAT;
         changes[0].data = 1;
         changes[1].ident = observation.notification().ok_or(errno::EIO)?.as_raw_fd() as usize;
-        changes[1].filter = libc::EVFILT_READ;
-        changes[1].flags = libc::EV_ADD;
+        changes[1].filter = crate::hostlibc::EVFILT_READ;
+        changes[1].flags = crate::hostlibc::EV_ADD;
         changes[2].ident = 0;
-        changes[2].filter = libc::EVFILT_USER;
-        changes[2].flags = libc::EV_ADD | libc::EV_CLEAR;
+        changes[2].filter = crate::hostlibc::EVFILT_USER;
+        changes[2].flags = crate::hostlibc::EV_ADD | crate::hostlibc::EV_CLEAR;
         if unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 queue.as_raw_fd(),
                 changes.as_ptr(),
                 3,
@@ -203,13 +203,13 @@ impl Description {
             tv_sec: duration.as_secs() as _,
             tv_nsec: duration.subsec_nanos() as _,
         });
-        let mut events: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+        let mut events: [crate::hostlibc::kevent; 2] = unsafe { std::mem::zeroed() };
         let wake = || unsafe {
-            let saved = *libc::__error();
-            let mut event: libc::kevent = std::mem::zeroed();
-            event.filter = libc::EVFILT_USER;
-            event.fflags = libc::NOTE_TRIGGER;
-            libc::kevent(
+            let saved = *crate::hostlibc::__error();
+            let mut event: crate::hostlibc::kevent = std::mem::zeroed();
+            event.filter = crate::hostlibc::EVFILT_USER;
+            event.fflags = crate::hostlibc::NOTE_TRIGGER;
+            crate::hostlibc::kevent(
                 queue.as_raw_fd(),
                 &event,
                 1,
@@ -217,11 +217,11 @@ impl Description {
                 0,
                 std::ptr::null(),
             );
-            *libc::__error() = saved;
+            *crate::hostlibc::__error() = saved;
         };
         let result = super::signal::interruptible(&wake, || {
             let count = unsafe {
-                libc::kevent(
+                crate::hostlibc::kevent(
                     queue.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -234,10 +234,10 @@ impl Description {
                 return Err(errno::last());
             }
             for event in &events[..count as usize] {
-                if event.flags & libc::EV_ERROR != 0 {
+                if event.flags & crate::hostlibc::EV_ERROR != 0 {
                     return Err(errno::from_darwin(event.data as i32));
                 }
-                if event.filter == libc::EVFILT_USER {
+                if event.filter == crate::hostlibc::EVFILT_USER {
                     return Err(errno::EINTR);
                 }
             }
@@ -429,18 +429,36 @@ struct Owner {
     client: Arc<Client>,
     _child: Option<std::process::Child>,
 }
-static OWNER: std::sync::OnceLock<Result<Owner, Errno>> = std::sync::OnceLock::new();
+/// A started owner, or the errno of the last attempt. A failure is not a
+/// guest-path `ENOENT`: `inherit_child` does not fail `clone` with it.
+static OWNER: std::sync::Mutex<Option<Result<Owner, Errno>>> = std::sync::Mutex::new(None);
+fn owner_slot() -> std::sync::MutexGuard<'static, Option<Result<Owner, Errno>>> {
+    OWNER.lock().unwrap_or_else(|error| error.into_inner())
+}
 fn configured_client() -> Result<Option<Arc<Client>>, Errno> {
-    OWNER
-        .get_or_init(start_owner)
-        .as_ref()
-        .map(|owner| Some(owner.client.clone()))
-        .map_err(|error| *error)
+    let mut slot = owner_slot();
+    if let Some(owner) = slot.as_ref() {
+        return owner
+            .as_ref()
+            .map(|owner| Some(owner.client.clone()))
+            .map_err(|error| *error);
+    }
+    match start_owner() {
+        Ok(owner) => {
+            let client = owner.client.clone();
+            *slot = Some(Ok(owner));
+            Ok(Some(client))
+        }
+        Err(error) => {
+            *slot = Some(Err(error));
+            Err(error)
+        }
+    }
 }
 /// The owner of the guest's devpts instance if there is one already: a
 /// guest with no owner has no pairs, and naming one starts none.
 fn existing_client() -> Result<Option<Arc<Client>>, Errno> {
-    if let Some(owner) = OWNER.get() {
+    if let Some(owner) = owner_slot().as_ref() {
         return owner
             .as_ref()
             .map(|owner| Some(owner.client.clone()))
@@ -449,7 +467,7 @@ fn existing_client() -> Result<Option<Arc<Client>>, Errno> {
     let Some(owner) = existing_owner()? else {
         return Ok(None);
     };
-    let _ = OWNER.set(Ok(owner));
+    *owner_slot() = Some(Ok(owner));
     configured_client()
 }
 fn existing_owner() -> Result<Option<Owner>, Errno> {
@@ -515,7 +533,22 @@ fn start_owner() -> Result<Owner, Errno> {
     let executable = std::env::current_exe()
         .map_err(failure)?
         .with_file_name("aim-pty-holder");
-    let mut child = std::process::Command::new(executable)
+    // `Command` uses `posix_spawn`. A missing helper, or a host cwd that
+    // Darwin cannot open, is `ENOENT` on the helper path. That is not the
+    // guest's `/dev/ptmx`.
+    if let Err(error) = std::fs::symlink_metadata(&executable) {
+        crate::diag!(
+            "[linux-abi] /dev/ptmx: host helper {} ({error})",
+            executable.display()
+        );
+        return Err(if error.kind() == io::ErrorKind::NotFound {
+            errno::ENODEV
+        } else {
+            failure(error)
+        });
+    }
+    super::fork::spawn::repair_host_cwd(executable.parent());
+    let mut child = std::process::Command::new(&executable)
         .arg("--service-name")
         .arg(&name)
         .arg("--runtime")
@@ -526,7 +559,19 @@ fn start_owner() -> Result<Owner, Errno> {
         .arg(&locator)
         .stdin(std::process::Stdio::null())
         .spawn()
-        .map_err(failure)?;
+        .map_err(|error| {
+            crate::diag!(
+                "[linux-abi] /dev/ptmx: spawn {} failed ({error})",
+                executable.display()
+            );
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOENT)
+            {
+                errno::ENODEV
+            } else {
+                failure(error)
+            }
+        })?;
     let result = (|| {
         let process = aim_storage::process_namespace::ProcessIdentity::running(child.id() as i32)
             .map_err(failure)?;
@@ -635,13 +680,56 @@ pub(super) fn publish(description: Arc<Description>, flags: u64) -> Result<i32, 
     };
     result
 }
-pub(super) fn inherit_child(pid: i32) -> Result<(), Errno> {
-    let Some(owner) = OWNER.get() else {
-        return Ok(());
+#[cfg(test)]
+pub(super) fn with_owner_down(body: impl FnOnce()) {
+    let previous = {
+        let mut slot = owner_slot();
+        let previous = slot.take();
+        *slot = Some(Err(errno::ENOENT));
+        previous
     };
-    let owner = owner.as_ref().map_err(|error| *error)?;
-    let child = aim_storage::process_namespace::ProcessIdentity::running(pid).map_err(failure)?;
-    owner.client.inherit_child(child).map_err(failure)
+    body();
+    *owner_slot() = previous;
+}
+
+pub(super) fn inherit_child(pid: i32) -> Result<(), Errno> {
+    let client = {
+        let slot = owner_slot();
+        match slot.as_ref() {
+            None => return Ok(()),
+            // The helper's errno was already traced at start. `clone` has
+            // no guest path; a down owner means there is nothing to inherit.
+            Some(Err(error)) => {
+                crate::diag!(
+                    "[linux-abi] fork: pty owner is not running (errno {error}); not a guest path"
+                );
+                return Ok(());
+            }
+            Some(Ok(owner)) => owner.client.clone(),
+        }
+    };
+    let child = aim_storage::process_namespace::ProcessIdentity::running(pid).map_err(|error| {
+        let errno = failure(error);
+        if errno == errno::ENOENT {
+            crate::diag!(
+                "[linux-abi] fork: pty inherit of pid {pid} returned ENOENT (host path, not a guest path)"
+            );
+            errno::EIO
+        } else {
+            errno
+        }
+    })?;
+    client.inherit_child(child).map_err(|error| {
+        let errno = failure(error);
+        if errno == errno::ENOENT {
+            crate::diag!(
+                "[linux-abi] fork: pty inherit of pid {pid} returned ENOENT (host path, not a guest path)"
+            );
+            errno::EIO
+        } else {
+            errno
+        }
+    })
 }
 pub(super) fn restore(carrier: BorrowedFd<'_>) -> Result<Arc<Description>, Errno> {
     let client = configured_client()?.ok_or(errno::ENODEV)?;

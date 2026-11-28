@@ -83,12 +83,12 @@ fn volumes() -> &'static [Volume] {
 }
 
 fn reserved_blocks(s: &libc::statfs) -> u64 {
-    RESERVE.div_ceil(u64::from(s.f_bsize.max(1)))
+    RESERVE.div_ceil(s.f_bsize.max(1) as u64)
 }
 
 /// Bytes the guest may still write to the volume of `s`.
 fn room(s: &libc::statfs) -> u64 {
-    s.f_bavail.saturating_sub(reserved_blocks(s)) * u64::from(s.f_bsize)
+    s.f_bavail.saturating_sub(reserved_blocks(s)) * s.f_bsize as u64
 }
 
 /// The guest's view of a host volume: the reserve is not free.

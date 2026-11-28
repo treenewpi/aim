@@ -82,7 +82,10 @@ struct Waiter {
 }
 
 struct Bucket {
+    #[cfg(target_os = "macos")]
     lock: UnsafeCell<libc::os_unfair_lock>,
+    #[cfg(not(target_os = "macos"))]
+    lock: std::sync::Mutex<()>,
     head: UnsafeCell<*mut Waiter>,
 }
 
@@ -92,7 +95,10 @@ unsafe impl Sync for Bucket {}
 const NBUCKETS: usize = 256;
 static BUCKETS: [Bucket; NBUCKETS] = [const {
     Bucket {
+        #[cfg(target_os = "macos")]
         lock: UnsafeCell::new(libc::OS_UNFAIR_LOCK_INIT),
+        #[cfg(not(target_os = "macos"))]
+        lock: std::sync::Mutex::new(()),
         head: UnsafeCell::new(std::ptr::null_mut()),
     }
 }; NBUCKETS];
@@ -102,13 +108,24 @@ fn bucket(addr: u64) -> &'static Bucket {
 }
 
 /// Holds one or two bucket locks (two in address order, for requeue).
+#[cfg(target_os = "macos")]
 struct Locked(&'static Bucket, Option<&'static Bucket>);
+#[cfg(not(target_os = "macos"))]
+struct Locked(
+    std::sync::MutexGuard<'static, ()>,
+    Option<std::sync::MutexGuard<'static, ()>>,
+);
 
 impl Locked {
     fn one(b: &'static Bucket) -> Self {
-        // SAFETY: a static lock.
-        unsafe { libc::os_unfair_lock_lock(b.lock.get()) };
-        Locked(b, None)
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: a static lock.
+            unsafe { libc::os_unfair_lock_lock(b.lock.get()) };
+            Locked(b, None)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Locked(b.lock.lock().unwrap_or_else(|e| e.into_inner()), None)
     }
 
     fn two(a: &'static Bucket, b: &'static Bucket) -> Self {
@@ -120,19 +137,28 @@ impl Locked {
         } else {
             (b, a)
         };
-        // SAFETY: static locks, taken in address order.
-        unsafe {
-            libc::os_unfair_lock_lock(lo.lock.get());
-            libc::os_unfair_lock_lock(hi.lock.get());
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: static locks, taken in address order.
+            unsafe {
+                libc::os_unfair_lock_lock(lo.lock.get());
+                libc::os_unfair_lock_lock(hi.lock.get());
+            }
+            Locked(lo, Some(hi))
         }
-        Locked(lo, Some(hi))
+        #[cfg(not(target_os = "macos"))]
+        Locked(
+            lo.lock.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(hi.lock.lock().unwrap_or_else(|e| e.into_inner())),
+        )
     }
 }
 
 impl Drop for Locked {
     fn drop(&mut self) {
-        // SAFETY: locks taken in `one`/`two`.
+        #[cfg(target_os = "macos")]
         unsafe {
+            // SAFETY: locks taken in `one`/`two`.
             if let Some(h) = self.1 {
                 libc::os_unfair_lock_unlock(h.lock.get());
             }
@@ -495,7 +521,7 @@ fn shared_wait(addr: u64, val: u32, deadline: Option<Deadline>) -> i64 {
     }
     let th = thread::current();
     // SAFETY: this thread's own port.
-    let port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+    let port = unsafe { crate::hostlibc::pthread_mach_thread_np(libc::pthread_self()) };
     let armed = AtomicBool::new(false);
     // The window between arming and entering the kernel wait takes no
     // lock, so this ends as soon as the waiter runs on.
@@ -838,7 +864,7 @@ mod tests {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 // SAFETY: this thread's own port.
-                tx.send(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
+                tx.send(unsafe { crate::hostlibc::pthread_mach_thread_np(libc::pthread_self()) })
                     .unwrap();
                 futex([word_addr, FUTEX_WAIT_BITSET, 0, deadline, 0, bits])
             })

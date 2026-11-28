@@ -40,7 +40,7 @@ fn sweep(dir: &std::path::Path) {
         unsafe {
             let fd = libc::open(
                 p.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_EXLOCK,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | aim_storage::host::O_EXLOCK,
             );
             if fd >= 0 {
                 libc::unlink(p.as_ptr());
@@ -77,7 +77,7 @@ pub fn open(dir: &Resolved, excl: bool, hflags: i32, mode: u64) -> i64 {
     let Ok(host) = CString::new(host_dir.join(&name).into_os_string().into_encoded_bytes()) else {
         return -(EINVAL as i64);
     };
-    let hflags = hflags | libc::O_CREAT | libc::O_EXCL | libc::O_SHLOCK;
+    let hflags = hflags | libc::O_CREAT | libc::O_EXCL | aim_storage::host::O_SHLOCK;
     // SAFETY: a new file in the resolved directory.
     let fd = unsafe { libc::open(host.as_ptr(), hflags, mode as libc::c_uint) };
     if fd < 0 {
@@ -109,7 +109,7 @@ pub fn open(dir: &Resolved, excl: bool, hflags: i32, mode: u64) -> i64 {
 pub fn link_fd(fd: i32, new: &Resolved) -> i64 {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return -(errno::last() as i64);
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -121,7 +121,7 @@ pub fn link_fd(fd: i32, new: &Resolved) -> i64 {
     // SAFETY: host paths.
     errno::check(unsafe {
         if is_hidden(name) {
-            libc::renamex_np(old.as_ptr(), new.host.as_ptr(), libc::RENAME_EXCL)
+            aim_storage::host::renamex_np(old.as_ptr(), new.host.as_ptr(), aim_storage::host::RENAME_EXCL)
         } else {
             libc::link(old.as_ptr(), new.host.as_ptr())
         }

@@ -122,9 +122,9 @@ impl Thread {
                 priority: AtomicI32::new(0),
                 host_stale: AtomicBool::new(false),
                 cgroup_min: AtomicI32::new(0),
-                cgroup_max: AtomicI32::new(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as i32),
+                cgroup_max: AtomicI32::new(crate::qos_class_t::QOS_CLASS_USER_INTERACTIVE as i32),
                 cgroup_fair_max: AtomicI32::new(
-                    libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as i32,
+                    crate::qos_class_t::QOS_CLASS_USER_INTERACTIVE as i32,
                 ),
                 cgroup_io: AtomicI32::new(0),
             },
@@ -217,14 +217,14 @@ pub fn with_guest_threads_quiescent<T>(operation: impl FnOnce() -> T) -> Result<
         }
     }
     with_table(|table| {
-        let current = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        let current = unsafe { crate::hostlibc::pthread_mach_thread_np(libc::pthread_self()) };
         let mut ports = Vec::with_capacity(table.len());
         for thread in table.values() {
             let pthread = thread.pthread.load(SeqCst);
             if pthread == 0 {
                 return Err(crate::errno::EAGAIN);
             }
-            let port = unsafe { libc::pthread_mach_thread_np(pthread as libc::pthread_t) };
+            let port = unsafe { crate::hostlibc::pthread_mach_thread_np(pthread as libc::pthread_t) };
             if port == 0 {
                 return Err(crate::errno::ESRCH);
             }
@@ -273,7 +273,7 @@ fn sample_cpu_times(th: &Thread) -> Option<(u64, u64)> {
     }
     // SAFETY: the caller holds the table lock.
     let (user, system) =
-        super::clock::thread_times(unsafe { libc::pthread_mach_thread_np(p as libc::pthread_t) })?;
+        super::clock::thread_times(unsafe { crate::hostlibc::pthread_mach_thread_np(p as libc::pthread_t) })?;
     let user = th.cpu_user.fetch_max(user, SeqCst).max(user);
     let total = if is_current(th) {
         super::clock::calling_thread_ns()
@@ -308,7 +308,7 @@ pub(super) fn process_cpu_times() -> Option<(u64, u64)> {
 /// running (on a core or waiting for one), under the table lock, so none
 /// can finish exiting meanwhile. A thread whose state cannot be read
 /// counts as running.
-pub fn each_running_other(mut f: impl FnMut(libc::mach_port_t)) {
+pub fn each_running_other(mut f: impl FnMut(crate::mach_port_t)) {
     with_table(|t| {
         for th in t.values() {
             let p = th.pthread.load(SeqCst);
@@ -318,16 +318,16 @@ pub fn each_running_other(mut f: impl FnMut(libc::mach_port_t)) {
             // SAFETY: the pthread is alive while it is in the table (whose
             // lock is held); THREAD_BASIC_INFO into a local of its size.
             let (port, running) = unsafe {
-                let port = libc::pthread_mach_thread_np(p as libc::pthread_t);
-                let mut info: libc::thread_basic_info = std::mem::zeroed();
-                let mut count = libc::THREAD_BASIC_INFO_COUNT;
-                let kr = libc::thread_info(
+                let port = crate::hostlibc::pthread_mach_thread_np(p as libc::pthread_t);
+                let mut info: crate::hostlibc::thread_basic_info = std::mem::zeroed();
+                let mut count = crate::hostlibc::THREAD_BASIC_INFO_COUNT;
+                let kr = crate::hostlibc::thread_info(
                     port,
-                    libc::THREAD_BASIC_INFO as u32,
-                    (&mut info as *mut libc::thread_basic_info).cast(),
+                    crate::hostlibc::THREAD_BASIC_INFO as u32,
+                    (&mut info as *mut crate::hostlibc::thread_basic_info).cast(),
                     &mut count,
                 );
-                (port, kr != 0 || info.run_state == libc::TH_STATE_RUNNING)
+                (port, kr != 0 || info.run_state == crate::hostlibc::TH_STATE_RUNNING)
             };
             if running {
                 f(port);
@@ -397,7 +397,7 @@ pub fn set_name_of(tid: i32, name: [u8; 16]) -> bool {
         let len = name.iter().position(|&b| b == 0).unwrap_or(15);
         if let Ok(c) = std::ffi::CString::new(&name[..len]) {
             // SAFETY: naming the calling thread.
-            unsafe { libc::pthread_setname_np(c.as_ptr()) };
+            unsafe { aim_storage::host::set_thread_name(c.as_ptr()) };
         }
     }
     true
@@ -423,7 +423,7 @@ fn host_id(p: usize) -> u64 {
     let mut id = 0u64;
     if p != 0 {
         // SAFETY: a live pthread of this process.
-        unsafe { libc::pthread_threadid_np(p as libc::pthread_t, &mut id) };
+        unsafe { aim_storage::host::pthread_threadid_np(p as libc::pthread_t, &mut id) };
     }
     id
 }
@@ -487,6 +487,7 @@ pub fn register_current(ctx: *mut GuestContext, stacks: HostStacks) {
     th.pthread
         .store(unsafe { libc::pthread_self() } as usize, SeqCst);
     super::procrec::running(th.tid, host_id(th.pthread.load(SeqCst)));
+    crate::vfs::note_leader(th.tid);
     // SAFETY: `ctx` is the caller's fresh context.
     unsafe {
         (*ctx).tid = th.tid as u64;
@@ -592,6 +593,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
         }
     };
     let tid = th.tid;
+    crate::vfs::bind_spawned_thread(tid, flags & CLONE_FS != 0);
     if let Err(error) = super::cgroup::thread_created(parent.tid, tid) {
         with_table_mut(|t| {
             super::procrec::gone(tid);
@@ -599,6 +601,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
             super::cred::forget_nice(tid);
         });
         super::cgroup::thread_gone(tid);
+        crate::vfs::unbind_thread(tid);
         // SAFETY: the child context has not been handed to a pthread.
         drop(unsafe { Box::from_raw(child_ctx) });
         return -(error as i64);
@@ -653,6 +656,7 @@ fn spawn(ctx: &GuestContext, flags: u64, newsp: u64, ptid: u64, tls: u64, ctid: 
         });
         super::cgroup::thread_gone(tid);
         super::ptrace::forget(tid);
+        crate::vfs::unbind_thread(tid);
         // SAFETY: the child never started; reclaim what it would own.
         unsafe {
             drop(Box::from_raw(boot));
@@ -681,6 +685,7 @@ extern "C" fn thread_start(arg: *mut libc::c_void) -> *mut libc::c_void {
         th.pthread.store(libc::pthread_self() as usize, SeqCst);
     }
     super::procrec::running(th.tid, host_id(th.pthread.load(SeqCst)));
+    crate::vfs::adopt_thread_task(th.tid);
     if let Err(error) = super::cgroup::refresh_own() {
         eprintln!("cgroup thread start: errno {error}");
         std::process::abort();
@@ -701,7 +706,7 @@ pub fn exit(a: [u64; 6]) -> ! {
     // No host signal handler may run on this thread from here on.
     // SAFETY: blocking signals for the calling thread.
     unsafe {
-        let mut all: libc::sigset_t = 0;
+        let mut all = crate::hostlibc::empty_sigset();
         libc::sigfillset(&mut all);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
@@ -710,6 +715,7 @@ pub fn exit(a: [u64; 6]) -> ! {
     super::run_deferred_unmaps();
     super::futex::exit_robust_list(th.robust_list.load(SeqCst), th.tid);
     let main = th.tid == pid();
+    crate::vfs::unbind_thread(th.tid);
     // Out of the table before a joiner wakes: its tid is gone for tgkill.
     let left = with_table_mut(|t| {
         let (user, system) = sample_cpu_times(th).expect("exiting thread CPU time");

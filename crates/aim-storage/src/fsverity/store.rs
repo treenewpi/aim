@@ -31,7 +31,7 @@ impl Metadata {
         if flags < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_EVTONLY != 0 {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & crate::host::O_EVTONLY != 0 {
             return Err(Error::Linux(EINVAL));
         }
         Self::from_file(file, &binding(identity))

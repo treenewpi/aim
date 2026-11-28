@@ -59,19 +59,37 @@ unsafe fn call(func: u32, args: u64, len: u64) -> i64 {
 pub const POLL: Duration = Duration::from_millis(250);
 
 fn sysctl<T: Default>(name: &CStr) -> Option<T> {
-    let mut value = T::default();
-    let mut size = size_of::<T>();
-    // SAFETY: a sysctl read into a local of the size given.
-    let r = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            (&raw mut value).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (r == 0 && size == size_of::<T>()).then_some(value)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut value = T::default();
+        let mut size = size_of::<T>();
+        // SAFETY: a sysctl read into a local of the size given.
+        let r = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut value).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (r == 0 && size == size_of::<T>()).then_some(value)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct VmPages {
+    free_count: u32,
+    speculative_count: u32,
+    external_page_count: u32,
+    purgeable_count: u32,
+    inactive_count: u32,
 }
 
 /// One of [`level`].
@@ -87,10 +105,15 @@ fn pressure_level() -> u32 {
 pub fn read() -> Memory {
     let level = pressure_level();
     // SAFETY: an all-zero vm_statistics64 is valid.
+    #[cfg(target_os = "macos")]
     let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    #[cfg(not(target_os = "macos"))]
+    let vm = VmPages::default();
+    #[cfg(target_os = "macos")]
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: HOST_VM_INFO64 into a vm_statistics64 of `count` words.
     #[allow(deprecated)]
+    #[cfg(target_os = "macos")]
     let ok = unsafe {
         libc::host_statistics64(
             libc::mach_host_self(),
@@ -99,6 +122,8 @@ pub fn read() -> Memory {
             &mut count,
         )
     } == 0;
+    #[cfg(not(target_os = "macos"))]
+    let ok = false;
     // SAFETY: plain sysconf.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     let bytes = |pages: u32| pages as u64 * page;
@@ -124,10 +149,15 @@ pub fn read() -> Memory {
 /// pages, in bytes.
 pub fn available() -> u64 {
     // SAFETY: an all-zero vm_statistics64 is valid.
+    #[cfg(target_os = "macos")]
     let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    #[cfg(not(target_os = "macos"))]
+    let vm = VmPages::default();
+    #[cfg(target_os = "macos")]
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: HOST_VM_INFO64 into a vm_statistics64 of `count` words.
     #[allow(deprecated)]
+    #[cfg(target_os = "macos")]
     let ok = unsafe {
         libc::host_statistics64(
             libc::mach_host_self(),
@@ -136,6 +166,8 @@ pub fn available() -> u64 {
             &mut count,
         )
     } == 0;
+    #[cfg(not(target_os = "macos"))]
+    let ok = false;
     // SAFETY: plain sysconf.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     if ok {
@@ -249,8 +281,9 @@ pub fn notify() {
 fn watch_level() {
     // SAFETY: plain call on this thread, which takes no guest signals.
     unsafe {
+        #[cfg(target_os = "macos")]
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
-        let mut all: libc::sigset_t = 0;
+        let mut all: libc::sigset_t = std::mem::zeroed();
         libc::sigfillset(&mut all);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }

@@ -117,8 +117,8 @@ pub fn authenticate(
     if unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
+            crate::host::SOL_LOCAL,
+            crate::host::LOCAL_PEERPID,
             (&mut pid as *mut i32).cast(),
             &mut length,
         )
@@ -127,7 +127,7 @@ pub fn authenticate(
         return Err(io::Error::last_os_error());
     }
     let (mut uid, mut gid) = (0, 0);
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+    if unsafe { crate::host::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
         return Err(io::Error::last_os_error());
     }
     if uid != unsafe { libc::geteuid() } {
@@ -172,7 +172,7 @@ impl Channel {
             libc::setsockopt(
                 stream.as_raw_fd(),
                 libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
+                crate::host::SO_NOSIGPIPE,
                 (&enabled as *const i32).cast(),
                 std::mem::size_of::<i32>() as _,
             )
@@ -795,7 +795,10 @@ pub fn connect(
             return Err(error(libc::ENAMETOOLONG));
         }
         address.sun_family = libc::AF_UNIX as _;
-        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as _;
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as _;
+        }
         for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
             *slot = *byte as _;
         }
@@ -970,14 +973,14 @@ impl Server {
                     .processes
                     .get(&done.generation)
                     .ok_or_else(|| error(libc::ESRCH))?;
-                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let mut info: crate::host::proc_bsdinfo = unsafe { std::mem::zeroed() };
                 let size = std::mem::size_of_val(&info) as i32;
                 if unsafe {
-                    libc::proc_pidinfo(
+                    crate::host::proc_pidinfo(
                         process.host_pid,
-                        libc::PROC_PIDTBSDINFO,
+                        crate::host::PROC_PIDTBSDINFO,
                         1,
-                        (&mut info as *mut libc::proc_bsdinfo).cast(),
+                        (&mut info as *mut crate::host::proc_bsdinfo).cast(),
                         size,
                     )
                 } != size
@@ -2539,15 +2542,15 @@ impl Server {
                     .processes
                     .get(&done.generation)
                     .ok_or_else(|| error(libc::ESRCH))?;
-                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let mut info: crate::host::proc_bsdinfo = unsafe { std::mem::zeroed() };
                 let size = std::mem::size_of_val(&info) as i32;
                 if !process.is_live()
                     || unsafe {
-                        libc::proc_pidinfo(
+                        crate::host::proc_pidinfo(
                             process.host_pid,
-                            libc::PROC_PIDTBSDINFO,
+                            crate::host::PROC_PIDTBSDINFO,
                             1,
-                            (&mut info as *mut libc::proc_bsdinfo).cast(),
+                            (&mut info as *mut crate::host::proc_bsdinfo).cast(),
                             size,
                         )
                     } != size

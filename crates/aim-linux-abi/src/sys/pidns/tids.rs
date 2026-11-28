@@ -192,7 +192,7 @@ fn alive(owner: ProcessIdentity) -> io::Result<bool> {
         return Ok(false);
     }
     match ProcessIdentity::metadata_strict(owner.host_pid) {
-        Ok(info) => Ok(info.pbi_status != libc::SZOMB
+        Ok(info) => Ok(info.pbi_status != crate::hostlibc::SZOMB
             && info.pbi_start_tvsec == owner.start_seconds
             && info.pbi_start_tvusec == owner.start_microseconds),
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),

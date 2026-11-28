@@ -31,14 +31,14 @@ unsafe extern "C" {
 pub mod vm {
     //! The few Mach VM calls the layer needs.
     unsafe extern "C" {
-        pub static mach_task_self_: libc::mach_port_t;
+        pub static mach_task_self_: crate::mach_port_t;
         pub fn mach_vm_remap(
-            target: libc::mach_port_t,
+            target: crate::mach_port_t,
             address: *mut u64,
             size: u64,
             mask: u64,
             flags: i32,
-            src_task: libc::mach_port_t,
+            src_task: crate::mach_port_t,
             src_address: u64,
             copy: i32,
             cur: *mut i32,
@@ -46,20 +46,20 @@ pub mod vm {
             inheritance: u32,
         ) -> i32;
         pub fn mach_vm_protect(
-            task: libc::mach_port_t,
+            task: crate::mach_port_t,
             address: u64,
             size: u64,
             set_maximum: i32,
             prot: i32,
         ) -> i32;
-        pub fn mach_vm_deallocate(task: libc::mach_port_t, address: u64, size: u64) -> i32;
+        pub fn mach_vm_deallocate(task: crate::mach_port_t, address: u64, size: u64) -> i32;
         pub fn mach_vm_map(
-            task: libc::mach_port_t,
+            task: crate::mach_port_t,
             address: *mut u64,
             size: u64,
             mask: u64,
             flags: i32,
-            object: libc::mach_port_t,
+            object: crate::mach_port_t,
             offset: u64,
             copy: i32,
             cur: i32,
@@ -67,13 +67,13 @@ pub mod vm {
             inheritance: u32,
         ) -> i32;
         pub fn mach_vm_region(
-            task: libc::mach_port_t,
+            task: crate::mach_port_t,
             address: *mut u64,
             size: *mut u64,
             flavor: i32,
             info: *mut i32,
             count: *mut u32,
-            object_name: *mut libc::mach_port_t,
+            object_name: *mut crate::mach_port_t,
         ) -> i32;
     }
     pub const VM_FLAGS_FIXED: i32 = 0;
@@ -82,7 +82,7 @@ pub mod vm {
     pub const VM_INHERIT_COPY: u32 = 1;
     pub const VM_REGION_BASIC_INFO_64: i32 = 9;
 
-    pub fn task() -> libc::mach_port_t {
+    pub fn task() -> crate::mach_port_t {
         // SAFETY: reading the task port global.
         unsafe { mach_task_self_ }
     }
@@ -90,24 +90,69 @@ pub mod vm {
     /// Protection, max protection and "shared" of the region containing (or
     /// following) `addr`, with its bounds.
     pub fn region(addr: u64) -> Option<(u64, u64, i32, bool)> {
-        let mut a = addr;
-        let mut size = 0u64;
-        let mut info = [0i32; 9];
-        let mut count = 9u32;
-        let mut obj = 0;
-        // SAFETY: VM_REGION_BASIC_INFO_64 into a 9-int buffer.
-        let kr = unsafe {
-            mach_vm_region(
-                task(),
-                &mut a,
-                &mut size,
-                VM_REGION_BASIC_INFO_64,
-                info.as_mut_ptr(),
-                &mut count,
-                &mut obj,
-            )
-        };
-        (kr == 0).then_some((a, a + size, info[0], info[3] != 0))
+        #[cfg(not(target_os = "macos"))]
+        {
+            return host_region(addr);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut a = addr;
+            let mut size = 0u64;
+            let mut info = [0i32; 9];
+            let mut count = 9u32;
+            let mut obj = 0;
+            // SAFETY: VM_REGION_BASIC_INFO_64 into a 9-int buffer.
+            let kr = unsafe {
+                mach_vm_region(
+                    task(),
+                    &mut a,
+                    &mut size,
+                    VM_REGION_BASIC_INFO_64,
+                    info.as_mut_ptr(),
+                    &mut count,
+                    &mut obj,
+                )
+            };
+            (kr == 0).then_some((a, a + size, info[0], info[3] != 0))
+        }
+    }
+
+    /// The process mapping that contains `addr`. Linux has no Mach region
+    /// query; `/proc/self/maps` is the same answer for a host pointer.
+    #[cfg(not(target_os = "macos"))]
+    fn host_region(addr: u64) -> Option<(u64, u64, i32, bool)> {
+        let text = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(start, 16),
+                u64::from_str_radix(end, 16),
+            ) else {
+                continue;
+            };
+            if addr < start || addr >= end {
+                continue;
+            }
+            let bytes = perms.as_bytes();
+            let mut prot = 0;
+            if bytes.first() == Some(&b'r') {
+                prot |= libc::PROT_READ;
+            }
+            if bytes.get(1) == Some(&b'w') {
+                prot |= libc::PROT_WRITE;
+            }
+            if bytes.get(2) == Some(&b'x') {
+                prot |= libc::PROT_EXEC;
+            }
+            return Some((start, end, prot, bytes.get(3) == Some(&b's')));
+        }
+        None
     }
 
     /// Map a second, shared view of `[src, src+len)` and give it `prot`.
@@ -515,7 +560,7 @@ struct MContext64 {
 pub unsafe fn handle_brk(uc: *mut libc::ucontext_t) -> bool {
     // SAFETY: Darwin arm64 ucontext layout.
     unsafe {
-        let mc = (*uc).uc_mcontext as *mut MContext64;
+        let mc = aim_storage::host::mcontext_ptr(uc) as *mut MContext64;
         let ss = &mut (*mc).ss;
         let insn = (ss.pc as *const u32).read();
         if insn & 0xffe0_001f != 0xd420_0000 {
@@ -530,7 +575,12 @@ pub unsafe fn handle_brk(uc: *mut libc::ucontext_t) -> bool {
         };
         let rt = (imm & 0x1f) as usize;
         let tsd: u64;
+        #[cfg(target_arch = "aarch64")]
         std::arch::asm!("mrs {}, tpidrro_el0", out(reg) tsd);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            tsd = 0;
+        }
         let slot = |off: u32| (tsd + off as u64) as *mut u64;
         let get = |ss: &ThreadState64, r: usize| match r {
             0..=28 => ss.x[r],

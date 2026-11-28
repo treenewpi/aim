@@ -505,7 +505,7 @@ mod tests {
             l_start: 0,
             l_len: 0,
             l_pid: 0,
-            l_type: libc::F_WRLCK,
+            l_type: libc::F_WRLCK as _,
             l_whence: libc::SEEK_SET as i16,
         };
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) };
@@ -517,7 +517,7 @@ mod tests {
             false
         } else {
             let unlock = libc::flock {
-                l_type: libc::F_UNLCK,
+                l_type: libc::F_UNLCK as _,
                 ..lock
             };
             assert_eq!(

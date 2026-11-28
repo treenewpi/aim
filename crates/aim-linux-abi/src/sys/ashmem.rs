@@ -72,7 +72,7 @@ pub fn open(guest: &str, flags: u64) -> Option<i64> {
             return Some(-(errno::last() as i64));
         }
         libc::unlink(tmpl.as_ptr().cast());
-        if libc::fchflags(fd, MARK) < 0 {
+        if aim_storage::host::fchflags(fd, MARK) < 0 {
             let e = errno::last();
             libc::close(fd);
             return Some(-(e as i64));
@@ -91,7 +91,7 @@ pub fn open(guest: &str, flags: u64) -> Option<i64> {
 
 /// Whether a host stat describes an ashmem file.
 fn marked(st: &libc::stat) -> bool {
-    st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_nlink == 0 && st.st_flags & MARK == MARK
+    st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_nlink == 0 && aim_storage::host::file_flags(&st) & MARK == MARK
 }
 
 fn stat_of(fd: i32) -> Option<libc::stat> {
@@ -103,8 +103,8 @@ fn stat_of(fd: i32) -> Option<libc::stat> {
 /// The filesystem the device node is on: that of the region files, so the
 /// node and every region fd agree, as on Linux, where both are the node
 /// (Chromium's ashmem check compares their `st_dev`).
-fn node_dev() -> i32 {
-    static DEV: OnceLock<i32> = OnceLock::new();
+fn node_dev() -> libc::dev_t {
+    static DEV: OnceLock<libc::dev_t> = OnceLock::new();
     *DEV.get_or_init(|| {
         let dir = std::env::temp_dir().into_os_string().into_encoded_bytes();
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -123,7 +123,7 @@ pub fn as_device(st: &mut libc::stat) -> bool {
     }
     st.st_dev = node_dev();
     st.st_mode = libc::S_IFCHR | 0o666;
-    st.st_rdev = RDEV;
+    st.st_rdev = RDEV as _;
     st.st_nlink = 1;
     st.st_size = 0;
     st.st_blocks = 0;
@@ -140,8 +140,25 @@ pub fn stat(guest: &str) -> Option<libc::stat> {
     }
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     st.st_mode = libc::S_IFREG;
-    st.st_flags = MARK;
-    as_device(&mut st);
+    #[cfg(target_os = "macos")]
+    {
+        st.st_flags = MARK;
+    }
+    if !as_device(&mut st) {
+        // Linux cannot store the Darwin file flags this node is recognized
+        // by. The path is the device, so the stat is still the device's.
+        #[cfg(not(target_os = "macos"))]
+        {
+            st.st_dev = node_dev();
+            st.st_mode = libc::S_IFCHR | 0o666;
+            st.st_rdev = RDEV as _;
+            st.st_nlink = 1;
+            st.st_size = 0;
+            st.st_blocks = 0;
+            st.st_uid = 0;
+            st.st_gid = 0;
+        }
+    }
     Some(st)
 }
 
@@ -224,7 +241,7 @@ fn load(fd: i32) -> State {
     let mut buf = vec![0u8; 4096];
     // SAFETY: reading our attribute into a local buffer.
     let n =
-        unsafe { libc::fgetxattr(fd, XATTR.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
+        unsafe { aim_storage::host::fgetxattr(fd, XATTR.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
     if n <= 0 {
         return State::default();
     }
@@ -234,7 +251,7 @@ fn load(fd: i32) -> State {
 fn store(fd: i32, s: &State) -> i64 {
     let v = s.encode();
     // SAFETY: writing our attribute from a local buffer.
-    let r = unsafe { libc::fsetxattr(fd, XATTR.as_ptr(), v.as_ptr().cast(), v.len(), 0, 0) };
+    let r = unsafe { aim_storage::host::fsetxattr(fd, XATTR.as_ptr(), v.as_ptr().cast(), v.len(), 0, 0) };
     if r < 0 { -(errno::last() as i64) } else { 0 }
 }
 
@@ -444,7 +461,7 @@ mod tests {
         let mut st = stat_of(fd).unwrap();
         assert!(as_device(&mut st));
         assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR);
-        assert_eq!(st.st_rdev, RDEV);
+        assert_eq!(st.st_rdev, RDEV as libc::dev_t);
         assert_eq!(ioctl(fd, GET_SIZE, 0), Some(bytes.len() as i64));
         assert_eq!(ioctl(fd, GET_PROT_MASK, 0), Some(1));
         assert_eq!(ioctl(fd, SET_PROT_MASK, 3), Some(-(EINVAL as i64)));

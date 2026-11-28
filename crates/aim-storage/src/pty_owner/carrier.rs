@@ -25,6 +25,7 @@ struct Message {
     fd: i32,
     eof: u32,
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_msg(
         message: *mut u8,
@@ -35,6 +36,18 @@ unsafe extern "C" {
         timeout: u32,
         notify: u32,
     ) -> i32;
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn mach_msg(
+    _message: *mut u8,
+    _options: i32,
+    _send_size: u32,
+    _receive_size: u32,
+    _name: u32,
+    _timeout: u32,
+    _notify: u32,
+) -> i32 {
+    libc::ENOTSUP
 }
 struct Shared {
     queue: PrivateFd,
@@ -49,23 +62,23 @@ pub(super) struct Bridge {
 impl Bridge {
     pub(super) fn new(sender: SendRight) -> io::Result<Self> {
         let queue = PrivateFd::allocate(|| {
-            let fd = unsafe { libc::kqueue() };
+            let fd = unsafe { crate::host::kqueue() };
             if fd < 0 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
         })?;
-        let event = libc::kevent {
+        let event = crate::host::kevent {
             ident: 1,
-            filter: libc::EVFILT_USER,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
+            filter: crate::host::EVFILT_USER,
+            flags: crate::host::EV_ADD | crate::host::EV_CLEAR,
             fflags: 0,
             data: 0,
             udata: std::ptr::null_mut(),
         };
         if unsafe {
-            libc::kevent(
+            crate::host::kevent(
                 queue.as_raw_fd(),
                 &event,
                 1,
@@ -94,21 +107,21 @@ impl Bridge {
     }
     pub(super) fn register(&self, fd: i32, tag: u64) -> io::Result<()> {
         self.healthy()?;
-        let event = libc::kevent {
+        let event = crate::host::kevent {
             ident: fd as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_ONESHOT | libc::EV_RECEIPT,
+            filter: crate::host::EVFILT_READ,
+            flags: crate::host::EV_ADD | crate::host::EV_ONESHOT | crate::host::EV_RECEIPT,
             fflags: 0,
             data: 0,
             udata: tag as *mut _,
         };
-        let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut receipt: crate::host::kevent = unsafe { std::mem::zeroed() };
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         let count = unsafe {
-            libc::kevent(
+            crate::host::kevent(
                 self.shared.queue.as_raw_fd(),
                 &event,
                 1,
@@ -120,7 +133,7 @@ impl Bridge {
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        if count != 1 || receipt.flags & libc::EV_ERROR == 0 {
+        if count != 1 || receipt.flags & crate::host::EV_ERROR == 0 {
             return Err(io::Error::from_raw_os_error(libc::EPROTO));
         }
         if receipt.data != 0 {
@@ -136,21 +149,21 @@ impl Bridge {
     }
     pub(super) fn watch_process(&self, pid: i32) -> io::Result<()> {
         self.healthy()?;
-        let event = libc::kevent {
+        let event = crate::host::kevent {
             ident: pid as usize,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT | libc::EV_RECEIPT,
-            fflags: libc::NOTE_EXIT,
+            filter: crate::host::EVFILT_PROC,
+            flags: crate::host::EV_ADD | crate::host::EV_ONESHOT | crate::host::EV_RECEIPT,
+            fflags: crate::host::NOTE_EXIT,
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut receipt: crate::host::kevent = unsafe { std::mem::zeroed() };
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         let count = unsafe {
-            libc::kevent(
+            crate::host::kevent(
                 self.shared.queue.as_raw_fd(),
                 &event,
                 1,
@@ -162,7 +175,7 @@ impl Bridge {
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        if count != 1 || receipt.flags & libc::EV_ERROR == 0 {
+        if count != 1 || receipt.flags & crate::host::EV_ERROR == 0 {
             return Err(io::Error::from_raw_os_error(libc::EPROTO));
         }
         if receipt.data != 0 {
@@ -172,16 +185,16 @@ impl Bridge {
     }
     pub(super) fn stop(&mut self) {
         self.shared.stopping.store(true, Ordering::Release);
-        let event = libc::kevent {
+        let event = crate::host::kevent {
             ident: 1,
-            filter: libc::EVFILT_USER,
+            filter: crate::host::EVFILT_USER,
             flags: 0,
-            fflags: libc::NOTE_TRIGGER,
+            fflags: crate::host::NOTE_TRIGGER,
             data: 0,
             udata: std::ptr::null_mut(),
         };
         unsafe {
-            libc::kevent(
+            crate::host::kevent(
                 self.shared.queue.as_raw_fd(),
                 &event,
                 1,
@@ -203,9 +216,9 @@ impl Bridge {
 impl Shared {
     fn run(&self) {
         let result = (|| loop {
-            let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+            let mut events: [crate::host::kevent; 16] = unsafe { std::mem::zeroed() };
             let count = unsafe {
-                libc::kevent(
+                crate::host::kevent(
                     self.queue.as_raw_fd(),
                     std::ptr::null(),
                     0,
@@ -222,10 +235,10 @@ impl Shared {
                 return Err(error);
             }
             for event in &events[..count as usize] {
-                if self.stopping.load(Ordering::Acquire) || event.filter == libc::EVFILT_USER {
+                if self.stopping.load(Ordering::Acquire) || event.filter == crate::host::EVFILT_USER {
                     return Ok(());
                 }
-                if event.flags & libc::EV_ERROR != 0 {
+                if event.flags & crate::host::EV_ERROR != 0 {
                     return Err(io::Error::from_raw_os_error(event.data as i32));
                 }
                 let mut message = Message {
@@ -238,9 +251,9 @@ impl Shared {
                     tag: event.udata as u64,
                     fd: event.ident as i32,
                     eof: u32::from(
-                        event.flags & libc::EV_EOF != 0
-                            || event.filter == libc::EVFILT_PROC
-                                && event.fflags & libc::NOTE_EXIT != 0,
+                        event.flags & crate::host::EV_EOF != 0
+                            || event.filter == crate::host::EVFILT_PROC
+                                && event.fflags & crate::host::NOTE_EXIT != 0,
                     ),
                 };
                 if unsafe { mach_msg((&mut message as *mut Message).cast(), 1, 40, 0, 0, 0, 0) }

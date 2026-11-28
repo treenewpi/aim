@@ -9,7 +9,23 @@ syscall layer.
 
 `crates/aim-binder-host` runs one driver for all guest processes in a
 daemon and connects each guest's syscall layer to it (#168). The syscall
-layer exposes the device nodes (#167). With both, the original
+layer exposes the device nodes (#167). Original init mounts binderfs
+(`mount` fstype `binder`, option `stats=global`). `/vendor/bin/binder_alloc`
+issues `BINDER_CTL_ADD` (`0xc1086201`) on `binder-control`. The
+argument is `struct binderfs_device`: `char name[256]`, then `__u32
+major`, then `__u32 minor`. That creates `binder`, `hwbinder` and
+`vndbinder` in that mount. The ioctl copies all 264 bytes in and, after
+the add, copies them back with major and minor written. `EINVAL` is only
+a name with no NUL in the first 255 bytes, or a `/` before that NUL. An
+existing context is `EEXIST`. A name this driver has no
+context for is `ENODEV`. A name that was not allocated is `ENOENT`.
+Init's `/dev/binder` is a symlink to `/dev/binderfs/binder` (and the
+same for `hwbinder` and `vndbinder`); opening the symlink reaches the
+node.
+Opening an allocated node with no binder host is `ENODEV`. `/dev/binder`,
+`/dev/hwbinder` and `/dev/vndbinder` are those three contexts when
+`--binder` is set, which is how the standalone servicemanager steps open
+them. The init probe starts `aim-binderd` and passes that name. With both, the original
 `servicemanager` of the pinned image serves the original `service` and `cmd`
 clients in other processes.
 
@@ -107,6 +123,47 @@ a library that any host process can embed; `aim-binderd --service NAME`
 runs it alone. The `client` module is what the syscall layer calls
 (`crates/aim-linux-abi/src/sys/binder.rs`, enabled by
 `linux-run --binder NAME`). The daemon is found by its bootstrap name.
+A synthetic static PIE (`aim-elf-smoke`'s binder guest, not an Android
+library) is the current guest-syscall check: two `linux-run` processes
+open `/dev/binder`, mmap the receive buffer and `ioctl` through this
+path. The check parses leave lines. The open leave is
+`openat(-100, "/dev/binder", 0x80002, 0x0) = <fd>`, because the tracer
+prints the directory fd (`AT_FDCWD`) first; a path substring is not a
+pass. The original `servicemanager` and `service` binaries from the
+pinned reDroid layer run on that path
+(`bionic-smoke --prepare-servicemanager`, then `aim-binder-proc android`).
+The staged root adds a generated `servicemanager.ready=true` property
+area so the original client can leave `WaitForProperty` and open
+`/dev/binder`. That value is the test root, not a property service.
+`bionic-smoke --prepare-property` stages a different root and serves
+`/dev/socket/property_service` with file-backed areas. It does not seed
+`servicemanager.ready`. That command is a separate Mac measurement; it
+does not replace the fixture this binder command still uses.
+`aim-binder-proc integrated` uses a third root that drops the fixture.
+Original servicemanager's `SetProperty` is what publishes
+`servicemanager.ready` there, and the original client has to be waiting
+before that set. The server removes `dev/__properties__` on the way
+out, and the next integrated run reclaims only an area marked by
+`property-area-owner-root`. The `android` and `libbinder` commands stay
+on the seeded root.
+The vDSO's commpage timebase retry is bounded and then takes the
+`clock_gettime` syscall. With no context manager the original
+`service` keeps transacting: the driver returns `BR_DEAD_REPLY` in the
+read buffer and the client sleeps. The harness records that and stops
+the client. It does not treat the wait as a successful lookup.
+`aim-binder-proc libbinder` then runs a generated probe,
+`system/bin/libbinder-ping`, which calls the original `libbinder_ndk.so`
+to `addService` and to transact. The probe is not an image file and not
+the synthetic PIE. A second guest prints the Parcel result and both
+pids. Its stdout is a pipe, so the probe flushes before `exit_group`;
+a `BR_REPLY` with an empty stdout is not that result. After the server
+exits, the original `service check` reports the name missing.
+A Linux staging of those files is not the run, and neither is a Linux
+VM or container on the Mac. Acceptance is the Mac command in
+[mac-min-smoke.md](mac-min-smoke.md) on Apple Silicon XNU: host
+platform and page size, the exact commit, the commands, pids, exit
+codes, original stdout and stderr, and the transaction text from the
+original `service` client.
 
 - **Open.** `openat("/dev/binder")` creates a Unix socket pair. The guest's
   fd is one end, and the other end goes to the daemon as a fileport. The
@@ -341,7 +398,13 @@ Across processes:
   data, an fd and a security context, readiness and its drain, the reply,
   and release on the last close, seen as `BR_DEAD_BINDER`.
   `tests/latency.rs` times a small call and reply through the daemon and
-  the caller's CPU time per call.
+  the caller's CPU time per call. The file's tests share the process fd
+  table. A received file is installed with `dup2` only while that number
+  still holds the caller's placeholder, and a read that cannot place the
+  transaction's files returns `EMFILE` instead of success. That is the
+  in-process client, not a second process and not Android. A blocking
+  ioctl in this file exits 101 after 15s rather than waiting forever.
+  Commands for a Mac retest are in [mac-min-smoke.md](mac-min-smoke.md).
 - **`cargo test -p aim-linux-abi --release --test servicemanager --
   --nocapture`** runs the pinned image and is skipped when it is absent. The
   test plays the minimum of init: property areas and the property service

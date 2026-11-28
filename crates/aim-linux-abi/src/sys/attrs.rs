@@ -18,8 +18,10 @@
 //! Precedence: the guest attribute (its unrecorded fields are root's and
 //! the host permission bits); without one, the table, then an image file's
 //! original owner and mode (the `dev.aim.android-inode` attribute
-//! android-image-extract writes), then root:root with the host permission
-//! bits. Without a path map nothing is recorded.
+//! android-image-extract writes), then that file's `fs_config` uid and gid
+//! when the extract kept the mode and dropped the attribute, then root:root
+//! with the host permission bits. The `fs_config` record does not replace
+//! the host mode. Without a path map nothing is recorded.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -104,16 +106,16 @@ pub(super) fn get(host: Host, name: &CStr, b: &mut [u8]) -> Option<usize> {
     // SAFETY: host path or fd, local buffer.
     let n = unsafe {
         match host {
-            Host::Image(p) | Host::Path(p) => libc::getxattr(
+            Host::Image(p) | Host::Path(p) => aim_storage::host::getxattr(
                 p.as_ptr(),
                 name.as_ptr(),
                 b.as_mut_ptr().cast(),
                 b.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                aim_storage::host::XATTR_NOFOLLOW,
             ),
             Host::Fd(fd) => {
-                libc::fgetxattr(fd, name.as_ptr(), b.as_mut_ptr().cast(), b.len(), 0, 0)
+                aim_storage::host::fgetxattr(fd, name.as_ptr(), b.as_mut_ptr().cast(), b.len(), 0, 0)
             }
         }
     };
@@ -132,9 +134,16 @@ fn guest_attr(host: Host) -> Option<Attr> {
 /// The owner and mode an image file had in the original image
 /// (`tools/android-image-extract/src/inode_metadata.rs`).
 fn original(host: Host) -> Option<Attr> {
-    let mut b = [0u8; 20];
-    let n = get(host, INODE, &mut b)?;
-    decode_original(&b[..n])
+    // The image extractor writes `dev.aim.android-inode`. An ext4 payload
+    // writes the same record, or `user.aim.android-inode` where that name
+    // is the one the host accepts.
+    for name in [INODE, c"user.aim.android-inode"] {
+        let mut b = [0u8; 20];
+        if let Some(n) = get(host, name, &mut b) {
+            return decode_original(&b[..n]);
+        }
+    }
+    None
 }
 
 /// "DARI", version 1, then uid, gid and mode as little-endian words.
@@ -162,15 +171,15 @@ fn set_guest(host: Host, a: Attr) -> Result<bool, crate::errno::Errno> {
 pub(super) fn set(host: Host, name: &CStr, b: &[u8]) -> Result<bool, crate::errno::Errno> {
     change(host, || unsafe {
         match host {
-            Host::Path(p) => libc::setxattr(
+            Host::Path(p) => aim_storage::host::setxattr(
                 p.as_ptr(),
                 name.as_ptr(),
                 b.as_ptr().cast(),
                 b.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                aim_storage::host::XATTR_NOFOLLOW,
             ),
-            Host::Fd(fd) => libc::fsetxattr(fd, name.as_ptr(), b.as_ptr().cast(), b.len(), 0, 0),
+            Host::Fd(fd) => aim_storage::host::fsetxattr(fd, name.as_ptr(), b.as_ptr().cast(), b.len(), 0, 0),
             Host::Image(_) => unreachable!(),
         }
     })
@@ -180,8 +189,8 @@ pub(super) fn set(host: Host, name: &CStr, b: &[u8]) -> Result<bool, crate::errn
 pub(super) fn remove(host: Host, name: &CStr) -> Result<bool, crate::errno::Errno> {
     let result = change(host, || unsafe {
         match host {
-            Host::Path(p) => libc::removexattr(p.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW),
-            Host::Fd(fd) => libc::fremovexattr(fd, name.as_ptr(), 0),
+            Host::Path(p) => aim_storage::host::removexattr(p.as_ptr(), name.as_ptr(), aim_storage::host::XATTR_NOFOLLOW),
+            Host::Fd(fd) => aim_storage::host::fremovexattr(fd, name.as_ptr(), 0),
             Host::Image(_) => unreachable!(),
         }
     });
@@ -191,8 +200,19 @@ pub(super) fn remove(host: Host, name: &CStr) -> Result<bool, crate::errno::Errn
     }
 }
 
+fn host_is_image_root(host: Host) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let got = unsafe {
+        match host {
+            Host::Path(p) | Host::Image(p) => libc::lstat(p.as_ptr(), &mut st),
+            Host::Fd(fd) => libc::fstat(fd, &mut st),
+        }
+    };
+    got == 0 && vfs::is_image_root_inode(&st)
+}
+
 fn change(host: Host, call: impl Fn() -> i32) -> Result<bool, crate::errno::Errno> {
-    if matches!(host, Host::Image(_)) {
+    if matches!(host, Host::Image(_)) || host_is_image_root(host) {
         return Ok(false);
     }
     let set = || {
@@ -343,7 +363,7 @@ fn table_lookup_key(key: &str) -> Attr {
 fn device_key(st: &libc::stat) -> String {
     format!(
         "/@devfs/{}/{}/{}/{}/{}",
-        st.st_dev, st.st_ino, st.st_gen, st.st_birthtime, st.st_birthtime_nsec
+        st.st_dev, st.st_ino, aim_storage::host::generation(st), aim_storage::host::birth(st).0, aim_storage::host::birth(st).1
     )
 }
 /// Only actual PTY allocation creates a devfs owner binding. Other character
@@ -407,7 +427,15 @@ struct Known {
 /// Reading an attribute costs about 15 µs on the development Mac, 10 to 30
 /// times a stat, so each process keeps what it read, by (dev, ino), and a
 /// fork child starts with its parent's (an app with what zygote read).
-static INODES: Mutex<Option<HashMap<(i32, u64), Known>>> = Mutex::new(None);
+static INODES: Mutex<Option<HashMap<(libc::dev_t, u64), Known>>> = Mutex::new(None);
+
+/// Drop the process's inode-attribute cache. A test that adds an xattr
+/// in the same timestamp second as the stat that cached its absence
+/// would otherwise keep that absence.
+#[cfg(test)]
+pub(super) fn forget_inodes() {
+    *INODES.lock().unwrap() = None;
+}
 const INODES_MAX: usize = 1 << 16;
 
 /// Fork: the attributes read so far. They stay valid in the child as they
@@ -420,7 +448,7 @@ pub(super) fn fork_save(w: &mut super::fork_state::Writer) {
     let inodes = INODES.lock().unwrap();
     let mut b = Vec::with_capacity(inodes.as_ref().map_or(0, |m| m.len()) * RECORD);
     for (&(dev, ino), k) in inodes.iter().flatten() {
-        b.extend_from_slice(&dev.to_le_bytes());
+        b.extend_from_slice(&(dev as u32).to_le_bytes());
         b.extend_from_slice(&ino.to_le_bytes());
         b.extend_from_slice(&k.ctime.0.to_le_bytes());
         b.extend_from_slice(&k.ctime.1.to_le_bytes());
@@ -442,7 +470,7 @@ pub(super) fn fork_restore(r: &mut super::fork_state::Reader) {
                 (present & bit != 0).then(|| decode(&b[at..at + 20]).unwrap_or_default())
             };
             let key = (
-                i32::from_le_bytes(b[..4].try_into().unwrap()),
+                i32::from_le_bytes(b[..4].try_into().unwrap()) as libc::dev_t,
                 word(&b[4..12]) as u64,
             );
             let k = Known {
@@ -504,20 +532,39 @@ fn lookup_stat(host: Host, guest: impl FnOnce() -> String, st: &libc::stat) -> A
             return device;
         }
     }
+    // The image directory is the read-only root even when a mount at `/`
+    // names it as a writable host. A mode-only guest-inode there is a
+    // chmod that should have been EROFS; it must not hide android-inode
+    // or replace the host mode.
+    if vfs::is_image_root_inode(st) {
+        return original(host).unwrap_or_default();
+    }
     let (inode, original) = inode_attrs(host, st);
     if let Some(a) = inode {
         return a;
     }
+    let guest_path = guest();
+    // The extract keeps an image file's mode and drops its owner. The
+    // published uid and gid are the android-inode, or, when that was not
+    // copied, the image's fs_config record. The host mode stays.
+    let base = if let Some(original) = original {
+        Some(original)
+    } else if matches!(host, Host::Image(_)) {
+        let directory = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        super::fs_config::published(&guest_path, directory)
+    } else {
+        None
+    };
     // chown and chmod answer EROFS on the image before recording anything,
     // so its files have their original attributes and no table entry.
     if vfs::on_read_only_root(st.st_dev) {
-        return original.unwrap_or_default();
+        return base.unwrap_or_default();
     }
-    let a = table_lookup(&guest());
+    let a = table_lookup(&guest_path);
     if a.complete() {
         return a;
     }
-    original.map_or(a, |o| a.over(o))
+    base.map_or(a, |o| a.over(o))
 }
 
 /// The recorded owner and mode of `host`.
@@ -544,7 +591,7 @@ pub fn apply(host: Host, guest: impl FnOnce() -> String, st: &mut libc::stat) {
     st.st_uid = a.uid.unwrap_or(0);
     st.st_gid = a.gid.unwrap_or(0);
     if let Some(m) = a.mode {
-        st.st_mode = (st.st_mode & libc::S_IFMT) | (m as u16 & 0o7777);
+        st.st_mode = (st.st_mode & libc::S_IFMT) | (m as libc::mode_t & 0o7777);
     }
 }
 
@@ -554,7 +601,7 @@ pub fn recording() -> bool {
 }
 
 thread_local! {
-    static HELD_INODE_LOCKS: std::cell::RefCell<Vec<(i32,u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static HELD_INODE_LOCKS: std::cell::RefCell<Vec<(libc::dev_t, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn host_stat(host: Host) -> Result<libc::stat, crate::errno::Errno> {
@@ -575,7 +622,7 @@ fn host_stat(host: Host) -> Result<libc::stat, crate::errno::Errno> {
 /// The inode locks this process holds, by (device, inode): a lock byte is
 /// held by the process's one open lock file, so its threads exclude each
 /// other here.
-static LOCKED: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+static LOCKED: Mutex<Vec<(libc::dev_t, u64)>> = Mutex::new(Vec::new());
 static UNLOCKED: std::sync::Condvar = std::sync::Condvar::new();
 
 /// `<runtime>/inode-locks/<device>`, made and opened once per process and
@@ -584,10 +631,10 @@ static UNLOCKED: std::sync::Condvar = std::sync::Condvar::new();
 /// and goes with that process. A failed open (no free descriptor, say) is
 /// tried again by the next lock.
 fn inode_lock_file(
-    device: i32,
+    device: libc::dev_t,
 ) -> Result<std::sync::Arc<aim_storage::private_fd::PrivateFile>, crate::errno::Errno> {
     use std::sync::Arc;
-    static FILES: Mutex<Vec<(i32, Arc<aim_storage::private_fd::PrivateFile>)>> =
+    static FILES: Mutex<Vec<(libc::dev_t, Arc<aim_storage::private_fd::PrivateFile>)>> =
         Mutex::new(Vec::new());
     let mut files = FILES.lock().unwrap();
     if let Some((_, file)) = files.iter().find(|(known, _)| *known == device) {
@@ -612,15 +659,21 @@ fn inode_lock_file(
 }
 
 /// Takes (F_WRLCK) or drops (F_UNLCK) the lock byte of inode `inode`.
-fn inode_lock_byte(fd: i32, inode: u64, kind: i16) -> Result<(), crate::errno::Errno> {
+fn inode_lock_byte(fd: i32, inode: u64, kind: impl Into<i32>) -> Result<(), crate::errno::Errno> {
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
-    range.l_type = kind;
+    range.l_type = kind.into() as _;
     range.l_whence = libc::SEEK_SET as i16;
     range.l_start = i64::try_from(inode).map_err(|_| crate::errno::from_darwin(libc::EOVERFLOW))?;
     range.l_len = 1;
     loop {
+        // The host's open-file-description lock. Darwin's command is 91;
+        // Linux's F_OFD_SETLKW is 38, and 91 is EINVAL there.
+        #[cfg(target_os = "macos")]
+        let cmd = super::fs::DARWIN_F_OFD_SETLKW;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = libc::F_OFD_SETLKW;
         // SAFETY: fcntl with a flock on our stack.
-        if unsafe { libc::fcntl(fd, super::fs::DARWIN_F_OFD_SETLKW, &range) } == 0 {
+        if unsafe { libc::fcntl(fd, cmd, &range) } == 0 {
             return Ok(());
         }
         let error = crate::errno::last();
@@ -658,7 +711,7 @@ pub fn with_inode_lock<T>(
         }
         locked.push(key);
     }
-    struct Held<'a>((i32, u64), &'a aim_storage::private_fd::PrivateFile, bool);
+    struct Held<'a>((libc::dev_t, u64), &'a aim_storage::private_fd::PrivateFile, bool);
     impl Drop for Held<'_> {
         fn drop(&mut self) {
             HELD_INODE_LOCKS.with(|held| held.borrow_mut().retain(|key| *key != self.0));
@@ -698,7 +751,7 @@ struct Creations {
 const CREATION_SLOTS: usize = 2048;
 
 fn creations(stat: &libc::stat) -> Result<&'static Creations, crate::errno::Errno> {
-    static MAPPED: Mutex<Vec<(i32, usize)>> = Mutex::new(Vec::new());
+    static MAPPED: Mutex<Vec<(libc::dev_t, usize)>> = Mutex::new(Vec::new());
     let mut mapped = MAPPED.lock().unwrap();
     let base = match mapped.iter().find(|(device, _)| *device == stat.st_dev) {
         Some(&(_, base)) => base,
@@ -815,8 +868,13 @@ fn record_inode(
     if !recording() {
         return Ok(());
     }
-    let epoch = mode_epoch()?;
     let stat = host_stat(host)?;
+    // chmod of this inode is EROFS. Do not leave a guest-inode or a table
+    // line that a later stat would use as its mode.
+    if vfs::is_image_root_inode(&stat) {
+        return Ok(());
+    }
+    let epoch = mode_epoch()?;
     let result = with_inode_lock(host, &stat, || {
         if stat.st_mode & libc::S_IFMT == libc::S_IFCHR {
             let previous = table_lookup_key(&device_key(&stat));
@@ -1042,6 +1100,9 @@ fn path_stat_known(
     }
     if let Some(stat) = super::procfs::stat(guest, true) {
         return stat;
+    }
+    if let Some(stat) = super::loopdev::stat(guest) {
+        return Ok(stat);
     }
     let (host, area) = vfs::lookup(guest);
     use std::os::unix::ffi::OsStrExt;
@@ -1616,6 +1677,139 @@ mod tests {
             );
         }
         *INODES.lock().unwrap() = None;
+    }
+
+    /// A chmod of the image directory, including one reached through a
+    /// writable mount whose host is that directory, must not replace its
+    /// mode. uid 9999 searched `/` before that mode became 0700.
+    #[test]
+    fn image_root_chmod_does_not_record_a_mode_only_guest_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, _root) = vfs::test_view();
+        let image = vfs::root().to_path_buf();
+        let previous = std::fs::symlink_metadata(&image).unwrap().permissions();
+        // Owner write so the android-inode attribute can be stored.
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = std::ffi::CString::new(image.as_os_str().as_encoded_bytes()).unwrap();
+        let name = std::ffi::CStr::from_bytes_with_nul(b"dev.aim.guest-inode\0").unwrap();
+        let _ = unsafe {
+            aim_storage::host::removexattr(
+                host.as_ptr(),
+                name.as_ptr(),
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        struct Restore<'a> {
+            image: &'a std::path::Path,
+            mode: std::fs::Permissions,
+            host: &'a std::ffi::CString,
+            name: &'a std::ffi::CStr,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = vfs::remove_mount("/");
+                let _ = unsafe {
+                    aim_storage::host::removexattr(
+                        self.host.as_ptr(),
+                        self.name.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    )
+                };
+                let dari = std::ffi::CString::new("user.aim.android-inode").unwrap();
+                let _ = unsafe {
+                    aim_storage::host::removexattr(
+                        self.host.as_ptr(),
+                        dari.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    )
+                };
+                let _ = std::fs::set_permissions(self.image, self.mode.clone());
+                *INODES.lock().unwrap() = None;
+            }
+        }
+        let _restore = Restore {
+            image: &image,
+            mode: previous,
+            host: &host,
+            name,
+        };
+        vfs::add_mount("/", image.clone(), vfs::Area::Writable, "tmpfs", "tmpfs").unwrap();
+        // android-inode 0755 on a host 0700 directory stays the guest mode.
+        // A guest-inode must not replace it; this tree's `/system` has
+        // neither attribute, so the published host mode is what search uses.
+        let dari = {
+            let mut bytes = b"DARI\x01\0\0\0".to_vec();
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0o755u32.to_le_bytes());
+            bytes
+        };
+        let dari_name = std::ffi::CString::new("user.aim.android-inode").unwrap();
+        assert_eq!(
+            unsafe {
+                aim_storage::host::setxattr(
+                    host.as_ptr(),
+                    dari_name.as_ptr(),
+                    dari.as_ptr().cast(),
+                    dari.len(),
+                    0,
+                    aim_storage::host::XATTR_NOFOLLOW,
+                )
+            },
+            0,
+            "android-inode: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        *INODES.lock().unwrap() = None;
+        assert_eq!(path_stat("/").unwrap().st_mode & 0o7777, 0o755);
+        let _ = unsafe {
+            aim_storage::host::removexattr(
+                host.as_ptr(),
+                dari_name.as_ptr(),
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o555)).unwrap();
+        *INODES.lock().unwrap() = None;
+        let slash = std::ffi::CString::new("/").unwrap();
+        let chmod = super::super::fsops::fchmodat([
+            vfs::LINUX_AT_FDCWD as u64,
+            slash.as_ptr() as u64,
+            0o700,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!(chmod, -(crate::errno::EROFS as i64), "chmod /");
+        let mode = std::fs::symlink_metadata(&image).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "host mode of the image root");
+        let mut present = [0u8; 20];
+        let n = unsafe {
+            aim_storage::host::getxattr(
+                host.as_ptr(),
+                name.as_ptr(),
+                present.as_mut_ptr().cast(),
+                present.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        assert!(n < 0, "guest-inode was written on the image root");
+        let stat = path_stat("/").unwrap();
+        assert_eq!(stat.st_mode & 0o7777, 0o555);
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        assert_eq!(search("/", &super::super::cred::current(), FS, None), Ok(()));
+        super::super::cred::init(saved, None);
     }
 
     #[test]

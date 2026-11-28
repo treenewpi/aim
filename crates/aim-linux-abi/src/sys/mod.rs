@@ -57,6 +57,7 @@ mod fileattr;
 mod fork;
 mod fown;
 mod fs;
+mod fs_config;
 pub(crate) mod fscrypt;
 mod fsops;
 mod fsverity_ioctl;
@@ -70,6 +71,7 @@ mod itimer;
 mod jit;
 mod kmsg;
 mod knob;
+mod sysctl;
 mod mem;
 pub(crate) mod regular_file;
 pub(crate) mod verified_source;
@@ -82,6 +84,9 @@ pub(crate) use verity_pager::{
 mod memfd;
 mod misc;
 mod mount;
+mod ext4ro;
+mod dmverity;
+mod loopdev;
 pub mod names;
 mod nat66;
 mod net;
@@ -107,6 +112,7 @@ pub(crate) use pstate::initialize_umask;
 mod ptimer;
 mod ptrace;
 mod random;
+mod reboot;
 mod selinuxfs;
 mod sharedfile;
 mod sigframe;
@@ -120,6 +126,14 @@ pub(crate) mod space;
 mod sync_file;
 mod tcp_shutdown;
 mod thread;
+
+pub(crate) fn current_guest_tid() -> Option<i32> {
+    thread::current().map(|thread| thread.tid)
+}
+
+pub(crate) fn main_guest_tid() -> i32 {
+    thread::main_tid()
+}
 mod tmpfile;
 pub(crate) mod tty;
 mod uevent;
@@ -172,6 +186,15 @@ pub use window::init as init_heap_window;
 pub static TRACE: AtomicBool = AtomicBool::new(false);
 static TRACE_CALL: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    static ACTIVE_TRACE_CALL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The syscall currently running on this thread, when tracing is on.
+pub(crate) fn active_trace_call() -> Option<u64> {
+    ACTIVE_TRACE_CALL.with(|call| call.get())
+}
+
 /// Reclaims unused host memfd backing names after guest shutdown.
 pub fn sweep_unused_memfds() -> u64 {
     memfd::sweep_unused()
@@ -201,10 +224,82 @@ pub(crate) fn guest_cstr(p: u64) -> Result<Vec<u8>, crate::errno::Errno> {
     user_memory::read_cstr(p, user_memory::PATH_MAX)
 }
 
+/// One traced argument. `mount` (40) is `source, target, fstype, flags, data`.
+/// A null pointer is `NULL`. The flag word is decoded.
+fn trace_arg(nr: u64, index: usize, value: u64) -> String {
+    if nr == 40 && matches!(index, 0 | 1 | 2 | 4) && value == 0 {
+        return "NULL".to_owned();
+    }
+    if nr == 40 && index == 3 {
+        return mount_flags(value);
+    }
+    let string = (nr == 40 && matches!(index, 0 | 1 | 2 | 4))
+        || (path_arg(nr) == Some(index) && nr != 17);
+    if string {
+        return match guest_cstr(value) {
+            Ok(path) => format!("\"{}\"", String::from_utf8_lossy(&path)),
+            Err(error) => format!("<errno {error}>"),
+        };
+    }
+    if (value as i64) < 0 && (value as i64) > -4096 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:#x}")
+    }
+}
+
+fn mount_flags(flags: u64) -> String {
+    const NAMED: &[(u64, &str)] = &[
+        (1, "MS_RDONLY"),
+        (2, "MS_NOSUID"),
+        (4, "MS_NODEV"),
+        (8, "MS_NOEXEC"),
+        (16, "MS_SYNCHRONOUS"),
+        (32, "MS_REMOUNT"),
+        (64, "MS_MANDLOCK"),
+        (128, "MS_DIRSYNC"),
+        (1024, "MS_NOATIME"),
+        (2048, "MS_NODIRATIME"),
+        (4096, "MS_BIND"),
+        (8192, "MS_MOVE"),
+        (1 << 14, "MS_REC"),
+        (1 << 15, "MS_SILENT"),
+        (1 << 16, "MS_POSIXACL"),
+        (1 << 17, "MS_UNBINDABLE"),
+        (1 << 18, "MS_PRIVATE"),
+        (1 << 19, "MS_SLAVE"),
+        (1 << 20, "MS_SHARED"),
+        (1 << 21, "MS_RELATIME"),
+        (1 << 22, "MS_KERNMOUNT"),
+        (1 << 23, "MS_I_VERSION"),
+        (1 << 24, "MS_STRICTATIME"),
+        (1 << 25, "MS_LAZYTIME"),
+    ];
+    if flags == 0 {
+        return "0".to_owned();
+    }
+    let mut left = flags;
+    let mut names = Vec::new();
+    for (bit, name) in NAMED {
+        if flags & bit != 0 {
+            names.push(*name);
+            left &= !bit;
+        }
+    }
+    let mut text = names.join("|");
+    if left != 0 {
+        if !text.is_empty() {
+            text.push('|');
+        }
+        text.push_str(&format!("{left:#x}"));
+    }
+    text
+}
+
 /// Syscalls whose first or second argument is a path, for tracing.
 fn path_arg(nr: u64) -> Option<usize> {
     match nr {
-        34 | 35 | 48 | 56 | 78 | 79 | 439 | 291 | 53 | 54 | 88 => Some(1),
+        34 | 35 | 48 | 56 | 78 | 79 | 439 | 291 | 53 | 54 | 88 | 281 => Some(1),
         17 | 49 | 221 => Some(0),
         _ => None,
     }
@@ -219,6 +314,16 @@ pub fn dispatch(ctx: &mut GuestContext) {
         let pid = unsafe { libc::getpid() };
         (pid, host_tid(), TRACE_CALL.fetch_add(1, Ordering::Relaxed))
     });
+    struct ClearCall;
+    impl Drop for ClearCall {
+        fn drop(&mut self) {
+            ACTIVE_TRACE_CALL.with(|call| call.set(None));
+        }
+    }
+    let _clear_call = ClearCall;
+    if let Some((_, _, call)) = trace {
+        ACTIVE_TRACE_CALL.with(|slot| slot.set(Some(call)));
+    }
     if let Some((pid, tid, call)) = trace {
         let name = match names::name(nr) {
             Some(n) => n,
@@ -230,19 +335,10 @@ pub fn dispatch(ctx: &mut GuestContext) {
             if i > 0 {
                 line.push_str(", ");
             }
-            if path_arg(nr) == Some(i) && nr != 17 {
-                match guest_cstr(*v) {
-                    Ok(path) => line.push_str(&format!("\"{}\"", String::from_utf8_lossy(&path))),
-                    Err(error) => line.push_str(&format!("<errno {error}>")),
-                }
-            } else if (*v as i64) < 0 && (*v as i64) > -4096 {
-                line.push_str(&format!("{}", *v as i64));
-            } else {
-                line.push_str(&format!("{v:#x}"));
-            }
+            line.push_str(&trace_arg(nr, i, *v));
         }
         line.push(')');
-        crate::diag!("{line} [pid={pid} tid={tid} call={call} enter]");
+        crate::diag!("{line} [pid={pid} tid={tid} nr={nr} call={call} enter]");
     }
     if private_offset::held() && !private_offset::keeps(nr) {
         private_offset::release();
@@ -263,16 +359,30 @@ pub fn dispatch(ctx: &mut GuestContext) {
         r = -(error as i64);
     }
     if let Some((pid, tid, call)) = trace {
+        // After the call: a bounded copy of a write to guest fd 0, 1, or 2.
+        // `r` is already the syscall result and is not assigned here.
+        if let Some(payload) = fs::trace_stdio_write(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
+        }
+        if let Some(payload) = fs::trace_readlinkat(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
+        }
+        if let Some(payload) = fs::trace_proc_sys(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
+        }
+        if let Some(payload) = fs::trace_lookup_host(nr, &a, r) {
+            crate::diag!("{payload} [pid={pid} tid={tid} nr={nr} call={call}]");
+        }
         if (-4095..0).contains(&r) {
             crate::diag!(
-                "{line} = -{} ({}) [pid={pid} tid={tid} call={call} leave]",
+                "{line} = -{} ({}) [pid={pid} tid={tid} nr={nr} call={call} leave]",
                 -r,
                 names::errno_name(-r as i32)
             );
         } else if !(0..=0xffff).contains(&r) {
-            crate::diag!("{line} = {r:#x} [pid={pid} tid={tid} call={call} leave]");
+            crate::diag!("{line} = {r:#x} [pid={pid} tid={tid} nr={nr} call={call} leave]");
         } else {
-            crate::diag!("{line} = {r} [pid={pid} tid={tid} call={call} leave]");
+            crate::diag!("{line} = {r} [pid={pid} tid={tid} nr={nr} call={call} leave]");
         }
     }
     ctx.x[0] = r as u64;
@@ -446,6 +556,7 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
         278 => misc::getrandom(a),
         aim_hostcall::SYSCALL_NR => crate::hostcall::call(a[0], a[1], a[2], a[3]),
         // process lifecycle
+        142 => reboot::reboot(a),
         221 => exec::execve(ctx, a),
         281 => exec::execveat(ctx, a),
         95 => wait::waitid(a),
@@ -482,6 +593,7 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
         280 => bpf::bpf(a),
         // mount namespaces
         97 => mount::unshare(a),
+        268 => mount::setns(a),
         39 => mount::umount2(a),
         40 => mount::mount(a),
         // userfaultfd: answered "unsupported" (ADR 0012); ART then uses
@@ -503,6 +615,50 @@ fn handle(ctx: &mut GuestContext, nr: u64, a: [u64; 6]) -> i64 {
             );
             -(ENOSYS as i64)
         }
+    }
+}
+
+/// `fcntl(F_GETPATH)`: a NUL-terminated host path in a `PATH_MAX` buffer.
+/// Linux reads the same path from `/proc/self/fd`.
+pub unsafe fn fgetpath(fd: i32, buf: *mut u8) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::fcntl(fd, libc::F_GETPATH, buf)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let linked = std::fs::read_link(format!("/proc/self/fd/{fd}"));
+        let Ok(path) = linked else {
+            unsafe { *aim_storage::host::__error() = libc::ENOENT };
+            return -1;
+        };
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+        let cap = libc::PATH_MAX as usize;
+        if bytes.len() + 1 > cap {
+            unsafe { *aim_storage::host::__error() = libc::ENAMETOOLONG };
+            return -1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            *buf.add(bytes.len()) = 0;
+        }
+        0
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::trace_arg;
+
+    #[test]
+    fn mount_trace_prints_null_and_decoded_flags() {
+        assert_eq!(trace_arg(40, 0, 0), "NULL");
+        assert_eq!(trace_arg(40, 2, 0), "NULL");
+        assert_eq!(trace_arg(40, 4, 0), "NULL");
+        assert_eq!(trace_arg(40, 3, 0), "0");
+        assert_eq!(trace_arg(40, 3, (1 << 20) | (1 << 14)), "MS_REC|MS_SHARED");
+        assert_eq!(trace_arg(40, 3, (1 << 19) | (1 << 14)), "MS_REC|MS_SLAVE");
+        assert_eq!(crate::sys::names::errno_name(19), "ENODEV");
     }
 }
 

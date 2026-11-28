@@ -1,0 +1,21 @@
+[package]
+license.workspace = true
+name = "aim-bionic-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Stage original reDroid linker64 and toybox and run them under linux-run"
+
+[dependencies]
+aim-android-init = { path = "../aim-android-init" }
+aim-binder-driver = { path = "../aim-binder-driver" }
+aim-paths = { path = "../aim-paths" }
+libc.workspace = true
+android-image-extract = { path = "../../tools/android-image-extract" }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+sha2.workspace = true
+tar = "0.4.44"
+
+[[bin]]
+name = "bionic-smoke"
+path = "src/bin/bionic-smoke.rs"

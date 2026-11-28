@@ -34,7 +34,8 @@ const CAP_SETGID: u32 = 6;
 const CAP_SETUID: u32 = 7;
 const CAP_SETPCAP: u32 = 8;
 const CAP_SYS_PTRACE: u32 = 19;
-pub(super) const CAP_SYS_ADMIN: u32 = 21;
+    pub(super) const CAP_SYS_ADMIN: u32 = 21;
+    pub(super) const CAP_SYS_BOOT: u32 = 22;
 pub(super) const CAP_IPC_LOCK: u32 = 14;
 const CAP_SYS_NICE: u32 = 23;
 const RLIMIT_NICE: usize = 13;
@@ -1481,9 +1482,9 @@ pub fn getpriority(a: [u64; 6]) -> i64 {
     }
     // SAFETY: errno is cleared first because -1 is a valid priority.
     unsafe {
-        *libc::__error() = 0;
-        let p = libc::getpriority(a[0] as i32, a[1] as u32);
-        if p == -1 && *libc::__error() != 0 {
+        *crate::hostlibc::__error() = 0;
+        let p = libc::getpriority(a[0] as _, a[1] as _);
+        if p == -1 && *crate::hostlibc::__error() != 0 {
             return -(crate::errno::last() as i64);
         }
         20 - p as i64
@@ -1629,7 +1630,7 @@ pub fn setpriority(a: [u64; 6]) -> i64 {
         return super::ptrace::remote_priority(owner, tid, Some(nice));
     }
     // SAFETY: a process group outside a guest namespace.
-    crate::errno::check(unsafe { libc::setpriority(a[0] as i32, a[1] as u32, nice) } as i64)
+    crate::errno::check(unsafe { libc::setpriority(a[0] as _, a[1] as _, nice) } as i64)
 }
 
 #[cfg(test)]

@@ -309,15 +309,15 @@ impl TimerClock {
 }
 
 /// User and system time of a Mach thread, in nanoseconds.
-pub fn thread_times(port: libc::mach_port_t) -> Option<(u64, u64)> {
+pub fn thread_times(port: crate::mach_port_t) -> Option<(u64, u64)> {
     // SAFETY: THREAD_EXTENDED_INFO into a local of the right size.
     unsafe {
-        let mut info: libc::thread_extended_info = std::mem::zeroed();
-        let mut count = libc::THREAD_EXTENDED_INFO_COUNT;
-        let kr = libc::thread_info(
+        let mut info: crate::hostlibc::thread_extended_info = std::mem::zeroed();
+        let mut count = crate::hostlibc::THREAD_EXTENDED_INFO_COUNT;
+        let kr = crate::hostlibc::thread_info(
             port,
-            libc::THREAD_EXTENDED_INFO as u32,
-            (&mut info as *mut libc::thread_extended_info).cast(),
+            crate::hostlibc::THREAD_EXTENDED_INFO as u32,
+            (&mut info as *mut crate::hostlibc::thread_extended_info).cast(),
             &mut count,
         );
         (kr == 0).then_some((info.pth_user_time, info.pth_system_time))
@@ -355,7 +355,7 @@ fn cpu_ns((id, thread, which): (i32, bool, i64), gettime: bool) -> Result<u64, i
                 return Ok(total);
             }
             // SAFETY: the calling thread's own port.
-            thread_times(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
+            thread_times(unsafe { crate::hostlibc::pthread_mach_thread_np(libc::pthread_self()) })
         }
         (true, _) if id == tid => return cpu_ns((0, true, which), gettime),
         (true, _) => super::thread::cpu_times(id),

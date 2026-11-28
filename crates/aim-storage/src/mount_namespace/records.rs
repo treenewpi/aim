@@ -95,6 +95,7 @@ fn insert(
     owner: &Namespace,
     mounts: &mut Vec<MountRecord>,
     mut record: MountRecord,
+    assign_group: bool,
 ) -> io::Result<()> {
     record.id = allocate(owner, 1)?[0];
     record.parent = mounts
@@ -102,9 +103,11 @@ fn insert(
         .filter(|mount| mount.guest == record.guest || below(&mount.guest, &record.guest))
         .max_by_key(|mount| (mount.guest.len(), mount.id))
         .map_or(record.id, |mount| mount.id);
-    if let Some(parent) = mounts.iter().find(|mount| mount.id == record.parent) {
-        if record.shared == 0 && parent.shared != 0 {
-            record.shared = allocate(owner, 1)?[0];
+    if assign_group && record.shared == 0 {
+        if let Some(parent) = mounts.iter().find(|mount| mount.id == record.parent) {
+            if parent.shared != 0 {
+                record.shared = allocate(owner, 1)?[0];
+            }
         }
     }
     mounts.push(record);
@@ -119,7 +122,7 @@ pub(super) fn initialize(owner: &Namespace, base: &str) -> io::Result<Vec<MountR
     definitions.sort_by_key(|mount| mount.guest.len());
     let mut mounts = Vec::new();
     for definition in definitions {
-        insert(owner, &mut mounts, definition)?;
+        insert(owner, &mut mounts, definition, true)?;
     }
     apply_policies(owner, &mut mounts, base)?;
     validate(&mounts)?;
@@ -161,7 +164,7 @@ pub(super) fn bind_base(
         }
     }
     if latest == old {
-        insert(owner, mounts, definition)?;
+        insert(owner, mounts, definition, true)?;
     }
     if let Some(parent) = old {
         if let Some(mount) = mounts
@@ -207,7 +210,7 @@ pub(super) fn replace_base(
                 && mount.host == definition.host
                 && mount.kind == definition.kind
         }) {
-            insert(owner, mounts, definition)?;
+            insert(owner, mounts, definition, true)?;
         }
     }
     let delta = base
@@ -376,8 +379,46 @@ pub(super) fn apply(
             {
                 mount.guest = format!("{to}{}", &mount.guest[from.len()..]);
             }
+        } else if let Some(rest) = line.strip_prefix("propagated\t") {
+            let fields: Vec<_> = rest.split('\t').collect();
+            if fields.len() != 7 {
+                return Err(protocol());
+            }
+            let shared = fields[0].parse::<u64>().map_err(|_| protocol())?;
+            let master = fields[1].parse::<u64>().map_err(|_| protocol())?;
+            if shared > i32::MAX as u64 || master > i32::MAX as u64 {
+                return Err(protocol());
+            }
+            if !fields[3].starts_with('/') || !fields[4].starts_with('/') {
+                return Err(protocol());
+            }
+            if mounts
+                .iter()
+                .any(|mount| mount.guest == fields[3] && mount.host == fields[4])
+            {
+                continue;
+            }
+            insert(
+                owner,
+                mounts,
+                MountRecord {
+                    id: 0,
+                    origin: 0,
+                    parent: 0,
+                    shared,
+                    master,
+                    kind: fields[2].into(),
+                    guest: fields[3].into(),
+                    host: fields[4].into(),
+                    source: fields[5].into(),
+                    fstype: fields[6].into(),
+                    root: "/".into(),
+                    own: true,
+                },
+                false,
+            )?;
         } else if let Some(record) = definition(line, true)? {
-            insert(owner, mounts, record)?;
+            insert(owner, mounts, record, true)?;
         }
     }
     apply_policies(owner, mounts, event)?;
@@ -420,7 +461,7 @@ pub(super) fn sync_projections(
     let mut changed = before != mounts.len();
     for item in live {
         if !mounts.iter().any(|mount| same(mount, item)) {
-            insert(owner, mounts, item.clone())?;
+            insert(owner, mounts, item.clone(), true)?;
             changed = true;
         }
     }

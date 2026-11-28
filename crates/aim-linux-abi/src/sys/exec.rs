@@ -36,8 +36,9 @@
 //! itself. `AT_EXECFN` is the filename as the caller named it; `argv[0]` is
 //! whatever the caller passed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::context::{self, GuestContext};
@@ -242,20 +243,48 @@ fn parse_shebang(buf: &[u8; BINPRM_BUF_SIZE]) -> Option<(Vec<u8>, Option<Vec<u8>
     Some((buf[name..sep].to_vec(), arg))
 }
 
-/// Classify the file at `host` as `execve` would, after the permission
-/// checks.
-fn classify(host: &CStr) -> Result<Kind, i64> {
+/// Classify `guest` (the file `host` resolves) as `execve` would, after
+/// the permission checks.
+///
+/// The guest identity is what Linux checks. uid 9999 is init's `nobody`
+/// (`DecodeUid`), not a failed lookup rewritten to `AID_NOBODY`. gid 0 is
+/// what init leaves when the service names no group. The mode is the
+/// inode's, including an ext4 payload's recorded owner: the host file can
+/// lack group and other execute after create, and this does not add the
+/// bit. A mode that does not grant execute stays `EACCES`. When the guest
+/// may execute, the host user's `access(X_OK)` is not the decision.
+/// Opening the file still has to succeed, so a file that cannot be read
+/// is that errno.
+fn classify(guest: &str, host: &CStr) -> Result<Kind, i64> {
     // SAFETY: host path from the resolver; local buffers.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
         if libc::stat(host.as_ptr(), &mut st) < 0 {
             return Err(-(errno::last() as i64));
         }
-        if st.st_mode & libc::S_IFMT != libc::S_IFREG || libc::access(host.as_ptr(), libc::X_OK) < 0
-        {
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
             return Err(-(EACCES as i64));
         }
-        let source = super::verified_source::VerifiedSource::open(host, true)
+        if super::attrs::recording() {
+            let guest_st = super::attrs::path_stat(guest).map_err(|error| -(error as i64))?;
+            let id = super::cred::current();
+            if !super::attrs::permits(&guest_st, 1, &id, super::attrs::FS) {
+                return Err(-(EACCES as i64));
+            }
+            if super::tracing() && libc::access(host.as_ptr(), libc::X_OK) < 0 {
+                let error = errno::last();
+                crate::diag!(
+                    "[linux-abi] exec: guest-exec allow host-access errno={error} ({}) mode={:#o} uid={} guest=\"{guest}\" host=\"{}\"",
+                    super::names::errno_name(error as i32),
+                    st.st_mode,
+                    id.uid[super::attrs::FS],
+                    host.to_string_lossy()
+                );
+            }
+        } else if libc::access(host.as_ptr(), libc::X_OK) < 0 {
+            return Err(-(EACCES as i64));
+        }
+        let source = super::verified_source::VerifiedSource::open_guest(host, Some(guest), true)
             .map_err(|error| -(error as i64))?;
         let mut buf = [0u8; BINPRM_BUF_SIZE];
         let n = source
@@ -278,11 +307,11 @@ fn classify(host: &CStr) -> Result<Kind, i64> {
 }
 
 pub fn execve(ctx: &mut GuestContext, a: [u64; 6]) -> i64 {
-    exec(ctx, LINUX_AT_FDCWD, a[0], a[1], a[2], 0)
+    exec(ctx, 221, LINUX_AT_FDCWD, a[0], a[1], a[2], 0)
 }
 
 pub fn execveat(ctx: &mut GuestContext, a: [u64; 6]) -> i64 {
-    exec(ctx, a[0] as i32, a[1], a[2], a[3], a[4])
+    exec(ctx, 281, a[0] as i32, a[1], a[2], a[3], a[4])
 }
 
 fn trace_stage(stage: &str) {
@@ -296,7 +325,15 @@ fn trace_stage(stage: &str) {
     }
 }
 
-fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, flags: u64) -> i64 {
+fn exec(
+    ctx: &mut GuestContext,
+    nr: u64,
+    dirfd: i32,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> i64 {
     trace_stage("arguments.enter");
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return -(EINVAL as i64);
@@ -344,17 +381,23 @@ fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, fla
     trace_stage("resolve.enter");
     let target = match resolve(dirfd, &path, flags) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => {
+            note_exec(nr, "program", &String::from_utf8_lossy(&path), e);
+            return e;
+        }
     };
     trace_stage("resolve.leave");
     trace_stage("interpret.enter");
     match interpret(target, &filename, argv) {
         Ok((target, argv)) => {
             trace_stage("interpret.leave");
-            in_place(ctx, &target, &argv, &envp, &filename)
+            in_place(ctx, nr, &target, &argv, &envp, &filename)
                 .unwrap_or_else(|| relaunch(&target.guest, &argv, &envp, &filename))
         }
-        Err(e) => e,
+        Err(e) => {
+            note_exec(nr, "interpret", &String::from_utf8_lossy(&filename), e);
+            e
+        }
     }
 }
 
@@ -362,6 +405,7 @@ fn exec(ctx: &mut GuestContext, dirfd: i32, path: u64, argv: u64, envp: u64, fla
 /// cannot, and execs anew.
 fn in_place(
     ctx: &mut GuestContext,
+    nr: u64,
     target: &vfs::Resolved,
     argv: &[CString],
     envp: &[CString],
@@ -380,14 +424,28 @@ fn in_place(
     // What Linux checks before the point of no return: the interpreter.
     let interp = match crate::loader::interpreter_errno(&target.host) {
         Ok(interp) => interp,
-        Err(error) => return Some(-(error as i64)),
+        Err(error) => {
+            note_exec(nr, "interpreter-header", &target.guest, -(error as i64));
+            return Some(-(error as i64));
+        }
     };
     if let Some(i) = interp {
         let r = match vfs::resolve(LINUX_AT_FDCWD, i.as_bytes(), true) {
             Ok(r) => r,
-            Err(e) => return Some(-(e as i64)),
+            Err(e) => {
+                note_exec(nr, "interpreter", &i, -(e as i64));
+                return Some(-(e as i64));
+            }
         };
-        if let Err(e) = classify(&r.host) {
+        // `i` is the PT_INTERP string. It is usually a symlink into an
+        // apex (`/system/bin/linker64`, or `/apex/<name>` → `<name>@ver`).
+        // `path_stat` does not follow a guest symlink: the kernel would
+        // follow the stored target from the host root and return ENOENT
+        // while this walk already has the installed file. The check is
+        // the resolved inode.
+        if let Err(e) = classify(&r.guest, &r.host) {
+            note_classify(&r.guest, &r.host);
+            note_exec(nr, "interpreter", &i, e);
             return Some(e);
         }
     }
@@ -451,9 +509,16 @@ pub fn interpret(
     let mut interp_of = filename.to_vec();
     let mut depth = 0;
     loop {
-        match classify(&target.host)? {
-            Kind::Elf => return Ok((target, argv)),
-            Kind::Script(interp, arg) => {
+        match classify(&target.guest, &target.host) {
+            Ok(Kind::Elf) => {
+                note_pt_interp(&target);
+                return Ok((target, argv));
+            }
+            Err(error) => {
+                note_classify(&target.guest, &target.host);
+                return Err(error);
+            }
+            Ok(Kind::Script(interp, arg)) => {
                 if depth == MAX_INTERP_DEPTH {
                     return Err(-(ELOOP as i64));
                 }
@@ -468,6 +533,222 @@ pub fn interpret(
             }
         }
     }
+}
+
+/// A failed `execve` in this process. `errno` is the negative Linux value
+/// the syscall returns. The program path and, when the ELF named one, the
+/// interpreter path are both recorded: `clone` has already returned in the
+/// parent, so this line is the child's. A walk that fails names the first
+/// component whose resolution returns that errno.
+fn note_exec(nr: u64, what: &str, path: &str, errno: i64) {
+    if !super::tracing() || !(-4095..0).contains(&errno) {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    let walk = component_trace(path);
+    let page = probe_page(path);
+    crate::diag!(
+        "[linux-abi] exec: pid={pid} tid={} nr={nr} {what}=\"{path}\" errno={} ({}) {walk} {page}",
+        super::host_tid(),
+        -errno,
+        super::names::errno_name((-errno) as i32)
+    );
+}
+
+/// Stat `guest`, then read its first page. The two results stay separate:
+/// a walk can return `ENODEV` while the mount's ext4 tree still reads, or
+/// the walk can succeed and the read can fail. The read uses the mount's
+/// host file, not a new open of the loop or dm device.
+pub(super) fn probe_page(guest: &str) -> String {
+    if !guest.starts_with('/') {
+        return String::new();
+    }
+    // The mount lookup uses the path the walk resolved. The caller's
+    // string is often a symlink; the ext4 tree is on the target.
+    let (resolved, backend_guest) = match vfs::resolve(LINUX_AT_FDCWD, guest.as_bytes(), true) {
+        Ok(found) => {
+            let backend = found.guest;
+            (
+                format!(
+                    "resolve host=\"{}\" {}",
+                    found.host.to_string_lossy(),
+                    read_page(Path::new(OsStr::from_bytes(found.host.as_bytes())))
+                ),
+                backend,
+            )
+        }
+        Err(error) => (
+            format!(
+                "resolve errno={error} ({})",
+                super::names::errno_name(error)
+            ),
+            guest.to_string(),
+        ),
+    };
+    let backend = match vfs::mounted_backend(&backend_guest) {
+        Some((path, source, fstype)) => format!(
+            "superblock fstype={fstype} source=\"{source}\" path=\"{}\" {}",
+            path.display(),
+            read_page(&path)
+        ),
+        None => "superblock missing".to_string(),
+    };
+    format!("{resolved} {backend}")
+}
+
+fn read_page(path: &Path) -> String {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            return format!(
+                "stat-read errno={errno} ({})",
+                super::names::errno_name(errno)
+            );
+        }
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    match file.read(&mut buf) {
+        Ok(n) => format!("read={n}"),
+        Err(error) => {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            format!("read errno={errno} ({})", super::names::errno_name(errno))
+        }
+    }
+}
+
+fn note_pt_interp(target: &vfs::Resolved) {
+    if !super::tracing() {
+        return;
+    }
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    match crate::loader::interpreter_errno(&target.host) {
+        Ok(Some(interp)) => {
+            let page = probe_page(&interp);
+            crate::diag!(
+                "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP=\"{interp}\" {page}",
+                super::host_tid(),
+                target.guest
+            );
+        }
+        Ok(None) => crate::diag!(
+            "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP=none",
+            super::host_tid(),
+            target.guest
+        ),
+        Err(error) => crate::diag!(
+            "[linux-abi] exec: pid={pid} tid={} program=\"{}\" PT_INTERP errno={error} ({})",
+            super::host_tid(),
+            target.guest,
+            super::names::errno_name(error)
+        ),
+    }
+}
+
+/// The first prefix of `path` that `resolve` rejects, and the host of the
+/// prefix before it. A path that resolves is `resolved`.
+fn component_trace(path: &str) -> String {
+    if !path.starts_with('/') {
+        return String::new();
+    }
+    let mut acc = String::new();
+    let mut previous = "/".to_string();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        acc.push('/');
+        acc.push_str(part);
+        match vfs::resolve(LINUX_AT_FDCWD, acc.as_bytes(), true) {
+            Ok(found) => {
+                previous = format!("{acc} host=\"{}\"", found.host.to_string_lossy());
+            }
+            Err(error) => {
+                return format!(
+                    "component=\"{acc}\" errno={error} ({}) after=\"{previous}\"",
+                    super::names::errno_name(error as i32)
+                );
+            }
+        }
+    }
+    format!("resolved after=\"{previous}\"")
+}
+
+/// Why `classify` rejected `host`. Stage `interpret` is this check of the
+/// program, before its `PT_INTERP` is opened. `access(X_OK)` uses the host
+/// uid. The guest walk and the guest execute bit are named beside it so a
+/// later log can tell them apart. uid 1036 is logd's service uid.
+fn note_classify(guest: &str, host: &CStr) {
+    if !super::tracing() {
+        return;
+    }
+    // SAFETY: host path from the resolver; local buffer.
+    let (mode, reason, access_errno) = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::stat(host.as_ptr(), &mut st) < 0 {
+            let error = errno::last();
+            (
+                0u32,
+                format!(
+                    "stat errno={error} ({})",
+                    super::names::errno_name(error as i32)
+                ),
+                None,
+            )
+        } else if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            (st.st_mode as u32, "not-regular".to_string(), None)
+        } else if libc::access(host.as_ptr(), libc::X_OK) < 0 {
+            let error = errno::last();
+            (st.st_mode as u32, "host-access".to_string(), Some(error))
+        } else {
+            // Host execute succeeded. The guest mode is a separate check.
+            (st.st_mode as u32, "guest-mode".to_string(), None)
+        }
+    };
+    let id = super::cred::current();
+    let guest_exec = match super::attrs::path_stat(guest) {
+        Ok(st) => {
+            let verdict = if super::attrs::permits(&st, 1, &id, super::attrs::FS) {
+                "allow"
+            } else {
+                "deny"
+            };
+            format!(
+                "{verdict} mode={:#o} st_uid={} st_gid={}",
+                st.st_mode, st.st_uid, st.st_gid
+            )
+        }
+        Err(error) => format!("errno={error} ({})", super::names::errno_name(error as i32)),
+    };
+    let parent = guest.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("/");
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let guest_search = if !super::attrs::recording() {
+        "not-recorded".to_string()
+    } else {
+        match super::attrs::search(parent, &id, super::attrs::FS, None) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!(
+                "errno={error} ({}) at=\"{parent}\"",
+                super::names::errno_name(error as i32)
+            ),
+        }
+    };
+    let access = access_errno
+        .map(|error| {
+            format!(
+                " errno={error} ({})",
+                super::names::errno_name(error as i32)
+            )
+        })
+        .unwrap_or_default();
+    // SAFETY: this process's pid.
+    let pid = unsafe { libc::getpid() };
+    crate::diag!(
+        "[linux-abi] exec: pid={pid} tid={} stage=interpret reason={reason}{access} mode={mode:#o} guest=\"{guest}\" host=\"{}\" uid={} guest-exec={guest_exec} guest-search={guest_search}",
+        super::host_tid(),
+        host.to_string_lossy(),
+        id.uid[super::attrs::FS]
+    );
 }
 
 fn to_cstring(b: &[u8]) -> CString {
@@ -662,5 +943,604 @@ mod tests {
         let mut long = b"#!/".to_vec();
         long.extend(std::iter::repeat_n(b'a', 300));
         assert_eq!(shebang(&long), None);
+    }
+
+    /// uid 9999 is the service user `nobody`. A file the guest may not
+    /// execute stays `EACCES` and keeps its mode. A guest mode with execute
+    /// is allowed when the host file is only readable: the host execute bit
+    /// is not added, and the call does not report success for a non-ELF.
+    #[test]
+    fn nobody_executes_only_when_the_guest_mode_allows() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::nobody_executes_only_when_the_guest_mode_allows",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, root) = crate::vfs::test_view();
+        let file = root.join("data").join("self-test-mode");
+        std::fs::write(&file, b"not an elf").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [9999; 4];
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_amb = 0;
+        super::super::cred::init(nobody, None);
+        let guest = "/data/self-test-mode";
+        let host = CString::new(file.as_os_str().as_bytes()).unwrap();
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(EACCES as i64)));
+        assert_eq!(mode(&file), 0o644);
+        super::super::cred::init(super::super::cred::Identity::default(), None);
+        let path = CString::new(guest).unwrap();
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o755,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::super::cred::init(
+            {
+                let mut id = super::super::cred::Identity::default();
+                id.uid = [9999; 4];
+                id.gid = [9999; 4];
+                id.cap_eff = 0;
+                id.cap_perm = 0;
+                id.cap_amb = 0;
+                id
+            },
+            None,
+        );
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(ENOEXEC as i64)));
+        assert_eq!(mode(&file), 0o644);
+        super::super::cred::init(super::super::cred::Identity::default(), None);
+        assert_eq!(
+            super::super::fsops::fchmodat([
+                LINUX_AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                0o750,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(mode(&file), 0o750);
+        super::super::cred::init(
+            {
+                let mut id = super::super::cred::Identity::default();
+                id.uid = [9999; 4];
+                id.gid = [9999; 4];
+                id.cap_eff = 0;
+                id.cap_perm = 0;
+                id.cap_amb = 0;
+                id
+            },
+            None,
+        );
+        assert!(matches!(classify(guest, &host), Err(error) if error == -(EACCES as i64)));
+        assert_eq!(mode(&file), 0o750);
+        super::super::cred::init(saved, None);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Bootstrap mounts the runtime ext4 on a unique host and points
+    /// `/apex/com.android.runtime` at `<name>@<ver>`. `PT_INTERP` is the
+    /// `/system/bin/linker64` symlink into that tree. `path_stat` of either
+    /// symlink is `ENOENT`: it does not follow a guest symlink, and the
+    /// kernel follows the stored target from the host root. The exec check
+    /// uses the resolved path, whose host is the directory the payload was
+    /// installed into. A planted `apex-mounts/1` is not that directory.
+    #[test]
+    fn bootstrap_interpreter_uses_the_unique_ext4_host() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::bootstrap_interpreter_uses_the_unique_ext4_host",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, root) = crate::vfs::test_view();
+        let runtime = crate::vfs::runtime_dir().unwrap();
+        let decoy = runtime.join("apex-mounts/1/bin/linker64");
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let image = root.join("root");
+        std::fs::create_dir_all(image.join("apex/com.android.runtime@1")).unwrap();
+        std::fs::create_dir_all(image.join("system/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "com.android.runtime@1",
+            image.join("apex/com.android.runtime"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "/apex/com.android.runtime/bin/linker64",
+            image.join("system/bin/linker64"),
+        )
+        .unwrap();
+        let (payload, _manifest) = super::super::ext4ro::manifest_fixture();
+        let image_path = root.join("runtime-payload.img");
+        std::fs::write(&image_path, &payload).unwrap();
+        let backing = CString::new(image_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        let mut info = [0u8; 232];
+        info[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        super::super::loopdev::configure(minor, fd, 4096, &info).unwrap();
+        unsafe { libc::close(fd) };
+        super::super::loopdev::mount_ext4(
+            &format!("/dev/block/loop{minor}"),
+            "/apex/com.android.runtime@1",
+            true,
+        )
+        .unwrap();
+        let mounted = vfs::resolve(LINUX_AT_FDCWD, b"/apex/com.android.runtime@1", true).unwrap();
+        let host_root = Path::new(OsStr::from_bytes(mounted.host.as_bytes()));
+        let installed = host_root.join("bin/linker64");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, b"not an elf").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let found = vfs::resolve(LINUX_AT_FDCWD, b"/system/bin/linker64", true).unwrap();
+        let host = Path::new(OsStr::from_bytes(found.host.as_bytes()));
+        let pid = std::process::id().to_string();
+        assert!(
+            host.components().any(|component| component.as_os_str() == "apex-mounts"),
+            "host {}",
+            host.display()
+        );
+        assert!(
+            host.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&format!("{pid}-")))
+            }),
+            "host {}",
+            host.display()
+        );
+        assert_eq!(std::fs::read(host).unwrap(), b"not an elf");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
+        assert_eq!(
+            super::super::attrs::path_stat("/system/bin/linker64").unwrap_err(),
+            ENOENT
+        );
+        assert_eq!(
+            super::super::attrs::path_stat("/apex/com.android.runtime/bin/linker64").unwrap_err(),
+            ENOENT
+        );
+        assert!(matches!(
+            classify("/system/bin/linker64", &found.host),
+            Err(error) if error == -(ENOENT as i64)
+        ));
+        assert!(matches!(
+            classify(&found.guest, &found.host),
+            Err(error) if error == -(ENOEXEC as i64)
+        ));
+        assert!(found.guest.contains("/apex/com.android.runtime@1/"));
+        assert!(crate::vfs::mounted_backend("/system/bin/linker64").is_none());
+        let (backend, _source, fstype) = crate::vfs::mounted_backend(&found.guest).unwrap();
+        assert_eq!(fstype, "ext4");
+        assert_eq!(std::fs::read(backend).unwrap(), b"not an elf");
+        let page = probe_page("/system/bin/linker64");
+        assert!(page.contains("fstype=ext4"), "{page}");
+        assert!(page.contains(&format!("{pid}-")), "{page}");
+        assert!(!page.contains("superblock missing"), "{page}");
+        let via = vfs::resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.runtime/bin/linker64",
+            true,
+        )
+        .unwrap();
+        assert_eq!(via.host.as_bytes(), found.host.as_bytes());
+        assert!(matches!(
+            classify(&via.guest, &via.host),
+            Err(error) if error == -(ENOEXEC as i64)
+        ));
+    }
+
+    /// The conscrypt payload's `boringssl_self_test64` is mode 0755, uid 0,
+    /// gid 2000. uid 9999 gid 0 (init's `user nobody` with no `group`) may
+    /// execute it through the other bits. The host file and its directories
+    /// are left without group or other execute; that bit is not added. A
+    /// 0750 or 0644 inode stays `EACCES`. The active path is a bind of the
+    /// versioned ext4 tree, which is where formal apexd puts this file.
+    #[test]
+    fn nobody_executes_conscrypt_when_the_inode_mode_allows() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::nobody_executes_conscrypt_when_the_inode_mode_allows",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, root) = crate::vfs::test_view();
+        let image = root.join("root");
+        std::fs::create_dir_all(image.join("apex/com.android.conscrypt@360499999")).unwrap();
+        std::fs::create_dir_all(image.join("apex/com.android.conscrypt")).unwrap();
+        let payload = super::super::ext4ro::permission_payload();
+        let image_path = root.join("conscrypt-payload.img");
+        std::fs::write(&image_path, &payload).unwrap();
+        let backing = CString::new(image_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        let mut info = [0u8; 232];
+        info[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        super::super::loopdev::configure(minor, fd, 4096, &info).unwrap();
+        unsafe { libc::close(fd) };
+        let versioned = "/apex/com.android.conscrypt@360499999";
+        super::super::loopdev::mount_ext4(&format!("/dev/block/loop{minor}"), versioned, true)
+            .unwrap();
+        let source = CString::new(versioned).unwrap();
+        let target = CString::new("/apex/com.android.conscrypt").unwrap();
+        assert_eq!(
+            super::super::mount::mount([
+                source.as_ptr() as u64,
+                target.as_ptr() as u64,
+                0,
+                4096,
+                0,
+                0,
+            ]),
+            0,
+            "bind the versioned conscrypt tree"
+        );
+        let found = vfs::resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.conscrypt/bin/boringssl_self_test64",
+            true,
+        )
+        .unwrap();
+        let host = Path::new(OsStr::from_bytes(found.host.as_bytes()));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(
+            host.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mounted = vfs::resolve(LINUX_AT_FDCWD, versioned.as_bytes(), true).unwrap();
+        let mount_root = Path::new(OsStr::from_bytes(mounted.host.as_bytes()));
+        std::fs::set_permissions(mount_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode(host), 0o644);
+        assert_eq!(mode(host.parent().unwrap()), 0o700);
+        assert_eq!(mode(mount_root), 0o700);
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.groups.clear();
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        let guest_st = super::super::attrs::path_stat(&found.guest).unwrap();
+        assert_eq!(guest_st.st_uid, 0);
+        assert_eq!(guest_st.st_gid, 2000);
+        assert_eq!(guest_st.st_mode & 0o7777, 0o755);
+        assert!(matches!(
+            classify(&found.guest, &found.host),
+            Err(error) if error == -(ENOEXEC as i64)
+        ));
+        assert_eq!(mode(host), 0o644, "the host execute bit stays unset");
+        let (_backend, bind_source, fstype) = crate::vfs::mounted_backend(&found.guest).unwrap();
+        assert_eq!(fstype, "bind");
+        assert_eq!(bind_source, versioned);
+        for (name, errno) in [("private", EACCES), ("data", EACCES)] {
+            let path = format!("/apex/com.android.conscrypt/bin/{name}");
+            let file = vfs::resolve(LINUX_AT_FDCWD, path.as_bytes(), true).unwrap();
+            assert!(
+                matches!(classify(&file.guest, &file.host), Err(error) if error == -(errno as i64)),
+                "{name}"
+            );
+        }
+        super::super::cred::init(saved, None);
+    }
+
+    /// `/apex` is tmpfs `mode=0755,uid=0,gid=0`. The host directory can be
+    /// left at the umask (0700); that is not the guest mode. The payload
+    /// inode is 0755 uid 0 gid 2000, so uid 9999 executes it through the
+    /// other bits. The host file stays 0644. A 0750 or 0644 inode stays
+    /// `EACCES`.
+    #[test]
+    fn nobody_searches_apex_tmpfs_and_executes_the_payload() {
+        if super::super::fdtab::isolated_kernel_test(
+            "sys::exec::tests::nobody_searches_apex_tmpfs_and_executes_the_payload",
+        ) {
+            return;
+        }
+        let (_guard, root) = crate::vfs::test_view();
+        let previous = unsafe { libc::umask(0o077) };
+        let mkdir = |path: &CStr| {
+            assert_eq!(
+                super::super::fsops::mkdirat([
+                    LINUX_AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    0o755,
+                    0,
+                    0,
+                    0,
+                ]),
+                0,
+                "mkdir {}",
+                path.to_string_lossy()
+            );
+        };
+        // The image already has `/apex`. Guest mkdir there is EROFS; init
+        // mounts the tmpfs on that directory.
+        std::fs::create_dir_all(root.join("root/apex")).unwrap();
+        let apex = CString::new("/apex").unwrap();
+        let tmpfs = CString::new("tmpfs").unwrap();
+        let opts = CString::new("mode=0755,uid=0,gid=0").unwrap();
+        assert_eq!(
+            super::super::mount::mount([
+                tmpfs.as_ptr() as u64,
+                apex.as_ptr() as u64,
+                tmpfs.as_ptr() as u64,
+                0,
+                opts.as_ptr() as u64,
+                0,
+            ]),
+            0,
+            "tmpfs /apex"
+        );
+        let versioned = CString::new("/apex/com.android.conscrypt@360499999").unwrap();
+        mkdir(&versioned);
+        let active = CString::new("/apex/com.android.conscrypt").unwrap();
+        mkdir(&active);
+        let payload = super::super::ext4ro::permission_payload();
+        let image_path = root.join("conscrypt-payload.img");
+        std::fs::write(&image_path, &payload).unwrap();
+        let backing = CString::new(image_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(backing.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open payload");
+        let minor = super::super::loopdev::ctl_free().unwrap() as u32;
+        let mut info = [0u8; 232];
+        info[32..40].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        super::super::loopdev::configure(minor, fd, 4096, &info).unwrap();
+        unsafe { libc::close(fd) };
+        super::super::loopdev::mount_ext4(
+            &format!("/dev/block/loop{minor}"),
+            "/apex/com.android.conscrypt@360499999",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::mount::mount([
+                versioned.as_ptr() as u64,
+                active.as_ptr() as u64,
+                0,
+                4096,
+                0,
+                0,
+            ]),
+            0,
+            "bind the versioned conscrypt tree"
+        );
+        let found = vfs::resolve(
+            LINUX_AT_FDCWD,
+            b"/apex/com.android.conscrypt/bin/boringssl_self_test64",
+            true,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let apex_dir = vfs::resolve(LINUX_AT_FDCWD, b"/apex", true).unwrap();
+        std::fs::set_permissions(
+            std::path::Path::new(apex_dir.host.to_str().unwrap()),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            std::path::Path::new(found.host.to_str().unwrap()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let file_st = super::super::attrs::path_stat(&found.guest).unwrap();
+        assert_eq!(file_st.st_uid, 0);
+        assert_eq!(file_st.st_gid, 2000);
+        assert_eq!(file_st.st_mode & 0o7777, 0o755);
+        let apex_st = super::super::attrs::path_stat("/apex").unwrap();
+        assert_eq!(apex_st.st_uid, 0);
+        assert_eq!(apex_st.st_gid, 0);
+        assert_eq!(apex_st.st_mode & 0o7777, 0o755);
+        let saved = super::super::cred::current();
+        let mut nobody = super::super::cred::Identity::default();
+        nobody.uid = [9999; 4];
+        nobody.gid = [0; 4];
+        nobody.groups.clear();
+        nobody.cap_eff = 0;
+        nobody.cap_perm = 0;
+        nobody.cap_inh = 0;
+        nobody.cap_amb = 0;
+        nobody.cap_bset = 0;
+        super::super::cred::init(nobody, None);
+        let error = match classify(&found.guest, &found.host) {
+            Ok(_) => 0,
+            Err(error) => error,
+        };
+        assert_eq!(error, -(ENOEXEC as i64), "classify errno {}", -error);
+        assert_eq!(
+            std::fs::metadata(std::path::Path::new(found.host.to_str().unwrap()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        for (name, errno) in [("private", EACCES), ("data", EACCES)] {
+            let path = format!("/apex/com.android.conscrypt/bin/{name}");
+            let found = vfs::resolve(LINUX_AT_FDCWD, path.as_bytes(), true).unwrap();
+            assert!(
+                matches!(classify(&found.guest, &found.host), Err(error) if error == -(errno as i64)),
+                "{name}"
+            );
+        }
+        super::super::cred::init(saved, None);
+        unsafe { libc::umask(previous) };
+    }
+
+    /// `/system/bin/logd` is mode 0550, uid 1036, gid 1036. The extract
+    /// keeps the mode and drops the owner, so a guest stat was root and
+    /// uid 1036 (no `CAP_DAC_OVERRIDE`) was other. The fs_config record
+    /// supplies the owner. The host mode is not changed, a wider mode in
+    /// the record is not applied, and a non-ELF is still `ENOEXEC`.
+    #[test]
+    fn logd_executes_when_its_published_owner_is_restored() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, _root) = crate::vfs::test_view();
+        let image = crate::vfs::root();
+        let logd = image.join("system/bin/logd");
+        let other = image.join("system/bin/not-logd");
+        let config = image.join("system/etc/fs_config_files");
+        std::fs::create_dir_all(logd.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        for dir in [
+            image.join("system"),
+            image.join("system/bin"),
+            config.parent().unwrap().to_path_buf(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(&logd, b"not an elf").unwrap();
+        std::fs::write(&other, b"not an elf").unwrap();
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o550)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let host_mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let saved = super::super::cred::current();
+        struct Restore(
+            super::super::cred::Identity,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.1, std::fs::Permissions::from_mode(0o644));
+                let path = CString::new(self.1.as_os_str().as_bytes()).unwrap();
+                let name = CString::new("user.aim.android-inode").unwrap();
+                unsafe {
+                    aim_storage::host::removexattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    );
+                }
+                let _ = std::fs::remove_file(&self.2);
+                super::super::fs_config::reload();
+                super::super::cred::init(self.0.clone(), None);
+            }
+        }
+        let _restore = Restore(saved, logd.clone(), config.clone());
+        let as_user = |uid: u32, gid: u32| {
+            let mut id = super::super::cred::Identity::default();
+            id.uid = [uid; 4];
+            id.gid = [gid; 4];
+            id.groups.clear();
+            id.cap_eff = 0;
+            id.cap_perm = 0;
+            id.cap_inh = 0;
+            id.cap_amb = 0;
+            id.cap_bset = 0;
+            super::super::cred::init(id, None);
+        };
+        let class = |guest: &[u8]| {
+            let found = vfs::resolve(LINUX_AT_FDCWD, guest, true).unwrap();
+            match classify(&found.guest, &found.host) {
+                Ok(_) => 0,
+                Err(error) => error,
+            }
+        };
+        super::super::fs_config::reload();
+        as_user(1036, 1036);
+        let st = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(st.st_uid, 1036);
+        assert_eq!(st.st_gid, 1036);
+        assert_eq!(st.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        as_user(9999, 9999);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(1036, 1036);
+        let plain = super::super::attrs::path_stat("/system/bin/not-logd").unwrap();
+        assert_eq!(plain.st_uid, 0);
+        assert_eq!(plain.st_gid, 2000);
+        assert_eq!(plain.st_mode & 0o7777, 0o644);
+        assert_eq!(class(b"/system/bin/not-logd"), -(EACCES as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+        assert_eq!(host_mode(&other), 0o644);
+        assert!(crate::vfs::mounted_backend("/system/bin/logd").is_none());
+        // The image file wins over the compiled rule, and its mode is not
+        // copied onto the inode.
+        std::fs::write(&config, fs_record("system/bin/logd", 0o755, 1111, 2222)).unwrap();
+        super::super::fs_config::reload();
+        let overridden = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(overridden.st_uid, 1111);
+        assert_eq!(overridden.st_gid, 2222);
+        assert_eq!(overridden.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(1111, 2222);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+        // android-inode is the extract's owner and hides the fs_config one.
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut dari = b"DARI\x01\0\0\0".to_vec();
+        dari.extend_from_slice(&7u32.to_le_bytes());
+        dari.extend_from_slice(&8u32.to_le_bytes());
+        dari.extend_from_slice(&0o550u32.to_le_bytes());
+        let path = CString::new(logd.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.aim.android-inode").unwrap();
+        let set = unsafe {
+            aim_storage::host::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                dari.as_ptr().cast(),
+                dari.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        assert_eq!(set, 0, "android-inode: {}", std::io::Error::last_os_error());
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o550)).unwrap();
+        super::super::attrs::forget_inodes();
+        let recorded = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(recorded.st_uid, 7);
+        assert_eq!(recorded.st_gid, 8);
+        assert_eq!(recorded.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(7, 8);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+    }
+
+    fn fs_record(prefix: &str, mode: u16, uid: u16, gid: u16) -> Vec<u8> {
+        let text = prefix.as_bytes();
+        let len = (16 + text.len() + 1) as u16;
+        let mut out = Vec::new();
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&mode.to_le_bytes());
+        out.extend_from_slice(&uid.to_le_bytes());
+        out.extend_from_slice(&gid.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(text);
+        out.push(0);
+        out
     }
 }

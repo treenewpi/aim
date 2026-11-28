@@ -55,7 +55,7 @@ pub fn migrate_legacy_dir(old: &Path, new: &Path) -> io::Result<bool> {
     let from = CString::new(old.as_os_str().as_bytes())?;
     let to = CString::new(new.as_os_str().as_bytes())?;
     // SAFETY: both paths are NUL-terminated and outlive the call.
-    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+    if unsafe { aim_storage::host::renamex_np(from.as_ptr(), to.as_ptr(), aim_storage::host::RENAME_EXCL) } == 0 {
         return Ok(true);
     }
     let error = io::Error::last_os_error();

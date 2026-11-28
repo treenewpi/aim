@@ -187,7 +187,7 @@ impl Random {
     fn seeded() -> Random {
         let mut seed = [0u8; 8];
         // SAFETY: a valid buffer of its length.
-        unsafe { libc::arc4random_buf(seed.as_mut_ptr().cast(), seed.len()) };
+        unsafe { crate::host_os::arc4random_buf(seed.as_mut_ptr().cast(), seed.len()) };
         Random {
             state: u64::from_le_bytes(seed) | 1,
             spare: None,

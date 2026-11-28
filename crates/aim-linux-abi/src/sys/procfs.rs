@@ -3,6 +3,9 @@
 //!
 //! - Files are generated when opened and handed to the guest as an unlinked
 //!   temporary file, so reads, seeks and fstat behave like a regular file.
+//!   `/proc/mounts` and `mountinfo` are that file plus `mounts_poll`: always
+//!   readable, and `POLLERR|POLLPRI` for one observation after this
+//!   process's mount table changes. A later read shows the table then.
 //! - Directories are directory streams with fixed entries (see `dir`).
 //! - Values init wrote under `<runtime>/kernfs/...`
 //!   (`docs/guest-init-contract.md` section 7) take precedence over the
@@ -12,8 +15,10 @@
 //!   the process's record (`procrec`: threads, names, tracers, command
 //!   line) and its agent (`ptrace`: memory maps and fds).
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::dir::{self, DirStream, Entry};
@@ -30,6 +35,8 @@ pub enum Node {
     MountTable {
         host_pid: i32,
         info: bool,
+        /// `None` is the thread-group leader (`/proc/self/mounts`).
+        thread: Option<i32>,
     },
     Dir(Vec<Entry>),
     Link(String),
@@ -105,8 +112,14 @@ fn pid() -> i32 {
 
 /// Guest path of an open host fd.
 pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
+    if let Some(text) = mount_ns_text(fd) {
+        return Ok(text);
+    }
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Ok(open.path.clone());
+    }
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        return Ok(guest);
     }
     if let Some(reference) = fdtab::character_reference(fd) {
         reference
@@ -122,7 +135,7 @@ pub fn fd_guest_path(fd: i32) -> Result<String, Errno> {
     }
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes.
-    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+    if unsafe { crate::sys::fgetpath(fd, buf.as_mut_ptr()) } < 0 {
         return Err(errno::last());
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
@@ -135,8 +148,14 @@ pub(super) fn fd_link(fd: i32) -> Option<String> {
     if !fdtab::visible(fd) {
         return None;
     }
+    if let Some(text) = mount_ns_text(fd) {
+        return Some(text);
+    }
     if let Some(Kind::TracePipe(open)) = fdtab::get(fd) {
         return Some(open.path.clone());
+    }
+    if let Some(guest) = fdtab::socket_path_guest(fd) {
+        return Some(guest);
     }
     if fdtab::character_reference(fd).is_some() {
         return fd_guest_path(fd).ok();
@@ -176,16 +195,16 @@ pub(super) fn fd_link(fd: i32) -> Option<String> {
 
 // ---- process information ---------------------------------------------------
 
-fn task_info(pid: i32) -> Option<libc::proc_taskallinfo> {
-    let mut t: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskallinfo>() as i32;
+fn task_info(pid: i32) -> Option<crate::hostlibc::proc_taskallinfo> {
+    let mut t: crate::hostlibc::proc_taskallinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<crate::hostlibc::proc_taskallinfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             pid,
-            libc::PROC_PIDTASKALLINFO,
+            crate::hostlibc::PROC_PIDTASKALLINFO,
             0,
-            (&mut t as *mut libc::proc_taskallinfo).cast(),
+            (&mut t as *mut crate::hostlibc::proc_taskallinfo).cast(),
             size,
         )
     };
@@ -194,12 +213,12 @@ fn task_info(pid: i32) -> Option<libc::proc_taskallinfo> {
 
 /// argv of a host process running `linux-run`, without its own options.
 fn host_argv(pid: i32) -> Vec<Vec<u8>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut mib = [crate::hostlibc::CTL_KERN, crate::hostlibc::KERN_PROCARGS2, pid];
     let mut buf = vec![0u8; 256 << 10];
     let mut len = buf.len();
     // SAFETY: sysctl into our buffer.
     if unsafe {
-        libc::sysctl(
+        crate::hostlibc::sysctl(
             mib.as_mut_ptr(),
             3,
             buf.as_mut_ptr().cast(),
@@ -262,8 +281,8 @@ fn read_guest(lo: u64, hi: u64) -> Vec<u8> {
 }
 
 unsafe extern "C" {
-    static mach_task_self_: libc::mach_port_t;
-    fn mach_vm_read_overwrite(t: libc::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
+    static mach_task_self_: crate::mach_port_t;
+    fn mach_vm_read_overwrite(t: crate::mach_port_t, a: u64, s: u64, d: u64, o: *mut u64) -> i32;
 }
 
 /// A command line as Linux's `get_mm_cmdline` reads it from the memory
@@ -372,15 +391,15 @@ fn thread_times(p: i32, tid: i32) -> Option<(u64, u64, char)> {
             .find(|t| t.tid == tid)?
             .host
     };
-    let mut ti: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_threadinfo>() as i32;
+    let mut ti: crate::hostlibc::proc_threadinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<crate::hostlibc::proc_threadinfo>() as i32;
     // SAFETY: proc_pidinfo writes at most `size` bytes.
     let n = unsafe {
-        libc::proc_pidinfo(
+        crate::hostlibc::proc_pidinfo(
             p,
             PROC_PIDTHREADID64INFO,
             host,
-            (&mut ti as *mut libc::proc_threadinfo).cast(),
+            (&mut ti as *mut crate::hostlibc::proc_threadinfo).cast(),
             size,
         )
     };
@@ -607,11 +626,15 @@ pub(super) fn vmas_in(lo: u64, hi: u64) -> Vec<Vma> {
             dev = d;
             ino = i;
             name = n;
-        } else if let Some((c, off)) = super::copies::find(r.start) {
-            offset = off;
-            dev = c.dev;
-            ino = c.ino;
-            name = c.guest;
+        } else if super::copies::covered(r.start, r.end)
+            .iter()
+            .any(|(_, _, copy)| copy.is_some())
+        {
+            // The Darwin entry can run from the file bytes into the
+            // anonymous `.bss`. Only the recorded file extent is a file.
+            // The rest can take `PR_SET_VMA_ANON_NAME`.
+            push_copy_split(&mut out, &r, &perms);
+            continue;
         } else if r.start < stack.hi && stack.lo < r.end && prot != 0 {
             name = "[stack]".into();
         } else if let Some(n) = crate::vdso::name_of(r.start) {
@@ -679,6 +702,79 @@ pub(super) fn vmas_in(lo: u64, hi: u64) -> Vec<Vma> {
     out
 }
 
+/// One Darwin entry that holds both a copied file and anonymous bytes.
+fn push_copy_split(out: &mut Vec<Vma>, r: &vmmap::Region, perms: &str) {
+    let pages = (r.end - r.start) / super::mem::PAGE;
+    let share = |start: u64, end: u64| r.usage.share((end - start) / super::mem::PAGE, pages);
+    let line_of = |start: u64, end: u64, offset: u64, dev: u64, ino: u64, name: &str| {
+        let mut line = format!(
+            "{start:08x}-{end:08x} {perms} {offset:08x} {:02x}:{:02x} {ino}",
+            (dev >> 24) & 0xff,
+            dev & 0xff_ffff
+        );
+        if !name.is_empty() {
+            push_name(&mut line, name);
+        }
+        line.push('\n');
+        line
+    };
+    for (start, end, copy) in super::copies::covered(r.start, r.end) {
+        if let Some((c, offset)) = copy {
+            let piece = vmmap::Region {
+                start,
+                end,
+                prot: r.prot,
+                shared: r.shared,
+                offset,
+                file: None,
+                usage: share(start, end),
+            };
+            out.push(Vma {
+                line: line_of(start, end, offset, c.dev, c.ino, &c.guest),
+                region: piece,
+                name: c.guest,
+                file: c.ino != 0,
+                shmem: false,
+            });
+            continue;
+        }
+        let named = super::vma_names::pieces(start, end);
+        let anon = |start: u64, end: u64| vmmap::Region {
+            start,
+            end,
+            prot: r.prot,
+            shared: r.shared,
+            offset: 0,
+            file: None,
+            usage: share(start, end),
+        };
+        if named.iter().all(|(_, _, n)| n.is_none()) {
+            out.push(Vma {
+                line: line_of(start, end, 0, 0, 0, ""),
+                region: anon(start, end),
+                name: String::new(),
+                file: false,
+                shmem: false,
+            });
+            continue;
+        }
+        for (start, end, n) in named {
+            let name = match n {
+                Some(n) if r.shared => format!("[anon_shmem:{n}]"),
+                Some(n) => format!("[anon:{n}]"),
+                None => String::new(),
+            };
+            out.push(Vma {
+                line: line_of(start, end, 0, 0, 0, &name),
+                region: anon(start, end),
+                name,
+                file: false,
+                shmem: false,
+            });
+        }
+    }
+}
+
 /// A mapping's name after its `maps` line, from column 73 on.
 pub(super) fn push_name(line: &mut String, name: &str) {
     line.push_str(&" ".repeat(73usize.saturating_sub(line.len()).max(1)));
@@ -691,7 +787,7 @@ fn sysctl_u64(name: &str) -> u64 {
     let mut len = 8usize;
     // SAFETY: sysctlbyname into a u64.
     unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c.as_ptr(),
             (&mut v as *mut u64).cast(),
             &mut len,
@@ -708,7 +804,7 @@ fn sysctl_string(name: &str) -> String {
     let mut len = buf.len();
     // SAFETY: sysctlbyname into our buffer.
     unsafe {
-        libc::sysctlbyname(
+        crate::hostlibc::sysctlbyname(
             c.as_ptr(),
             buf.as_mut_ptr().cast(),
             &mut len,
@@ -731,7 +827,7 @@ unsafe extern "C" {
         info: *mut *mut i32,
         n: *mut u32,
     ) -> i32;
-    fn mach_vm_deallocate(t: libc::mach_port_t, a: u64, s: u64) -> i32;
+    fn mach_vm_deallocate(t: crate::mach_port_t, a: u64, s: u64) -> i32;
 }
 
 fn meminfo() -> String {
@@ -980,9 +1076,9 @@ pub(super) fn pids() -> Vec<i32> {
         }
         // SAFETY: sizing call then a buffer of that size.
         None => unsafe {
-            let n = libc::proc_listallpids(std::ptr::null_mut(), 0);
+            let n = crate::hostlibc::proc_listallpids(std::ptr::null_mut(), 0);
             let mut v = vec![0i32; n.max(0) as usize + 64];
-            let n = libc::proc_listallpids(v.as_mut_ptr().cast(), (v.len() * 4) as i32);
+            let n = crate::hostlibc::proc_listallpids(v.as_mut_ptr().cast(), (v.len() * 4) as i32);
             v.truncate(n.max(0) as usize);
             v
         },
@@ -1145,6 +1241,26 @@ fn mountinfo(points: Vec<vfs::MountPoint>) -> String {
     }).collect()
 }
 
+fn poll_generation(poll: &MountPoll) -> u64 {
+    poll.ns
+        .as_ref()
+        .map(|ns| vfs::mount_namespace_event(ns))
+        .unwrap_or_else(vfs::mount_event)
+}
+
+fn mount_poll_points(
+    host_pid: i32,
+    ns: Option<&Arc<vfs::MountNs>>,
+) -> Result<Vec<vfs::MountPoint>, Errno> {
+    if host_pid == pid()
+        && let Some(ns) = ns
+    {
+        vfs::refresh_fuse_mounts()?;
+        return vfs::mount_points_of(ns);
+    }
+    process_mount_points(host_pid)
+}
+
 fn process_mount_points(host_pid: i32) -> Result<Vec<vfs::MountPoint>, Errno> {
     if host_pid == pid() {
         vfs::refresh_fuse_mounts()?;
@@ -1183,11 +1299,18 @@ fn pid_node(p: i32, rest: &str, thread: Option<i32>, listed: bool) -> Option<Nod
     }
     Some(match rest {
         "" => {
-            let e = PID_ENTRIES
+            let mut e: Vec<_> = PID_ENTRIES
                 .iter()
-                .filter(|(n, _)| thread.is_none() || *n != "task");
-            Node::Dir(e.map(|(n, t)| Entry::new(1, *t, n.as_bytes())).collect())
+                .filter(|(n, _)| thread.is_none() || *n != "task")
+                .map(|(n, t)| Entry::new(1, *t, n.as_bytes()))
+                .collect();
+            if me {
+                e.push(Entry::new(1, dir::DT_DIR, b"ns"));
+            }
+            Node::Dir(e)
         }
+        "ns" if me => Node::Dir(entries(&[("mnt", dir::DT_LNK)])),
+        "ns/mnt" if me => Node::Link(vfs::proc_namespace_link(thread)),
         "net" => Node::Dir(
             NET_FILES
                 .iter()
@@ -1226,10 +1349,12 @@ fn pid_node(p: i32, rest: &str, thread: Option<i32>, listed: bool) -> Option<Nod
         "mounts" => Node::MountTable {
             host_pid: p,
             info: false,
+            thread,
         },
         "mountinfo" => Node::MountTable {
             host_pid: p,
             info: true,
+            thread,
         },
         "oom_score_adj" => {
             Node::File(format!("{}\n", super::cred::oom_score_adj_of(p).unwrap_or(0)).into_bytes())
@@ -1357,7 +1482,7 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
                 .into_bytes(),
             ),
             "filesystems" => {
-                Node::File(b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\n\text4\n".to_vec())
+                Node::File(b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tbpf\n\text4\n".to_vec())
             }
             "sys" => return sys_node(tail),
             n => {
@@ -1394,13 +1519,17 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
     }
     Some(match rest {
         "" => Node::Dir(entries(&[
+            ("block", dir::DT_DIR),
             ("class", dir::DT_DIR),
             ("dev", dir::DT_DIR),
             ("devices", dir::DT_DIR),
             ("fs", dir::DT_DIR),
             ("kernel", dir::DT_DIR),
         ])),
-        "fs" => Node::Dir(entries(&[("selinux", dir::DT_DIR)])),
+        "fs" => Node::Dir(entries(&[("bpf", dir::DT_DIR), ("selinux", dir::DT_DIR)])),
+        // `sysfs_create_mount_point(fs_kobj, "bpf")`: the directory bpffs
+        // is mounted on. Empty until that mount.
+        "fs/bpf" => Node::Dir(entries(&[])),
         "kernel" => Node::Dir(entries(&[
             ("debug", dir::DT_DIR),
             ("tracing", dir::DT_DIR),
@@ -1445,9 +1574,31 @@ fn node_listed(guest: &str, listed: bool) -> Option<Node> {
     })
 }
 
+/// `/proc/sys/net/core`: the two JIT knobs NetBpfLoad writes. `None`
+/// leaves the rest of `/proc/sys/net` to the IPv6 configuration.
+fn net_core_node(rest: &str) -> Option<Node> {
+    Some(match rest {
+        "core" => Node::Dir(entries(&[
+            ("bpf_jit_enable", dir::DT_REG),
+            ("bpf_jit_kallsyms", dir::DT_REG),
+        ])),
+        "core/bpf_jit_enable" => {
+            Node::File(super::sysctl::text("/proc/sys/net/core/bpf_jit_enable").ok()?)
+        }
+        "core/bpf_jit_kallsyms" => {
+            Node::File(super::sysctl::text("/proc/sys/net/core/bpf_jit_kallsyms").ok()?)
+        }
+        _ => return None,
+    })
+}
+
 fn sys_node(tail: &str) -> Option<Node> {
     if tail == "net" || tail.starts_with("net/") {
-        return super::ipv6conf::node(tail.strip_prefix("net").unwrap().trim_start_matches('/'));
+        let rest = tail.strip_prefix("net").unwrap().trim_start_matches('/');
+        if let Some(node) = net_core_node(rest) {
+            return Some(node);
+        }
+        return super::ipv6conf::node(rest);
     }
     Some(match tail {
         "" => Node::Dir(entries(&[
@@ -1461,17 +1612,35 @@ fn sys_node(tail: &str) -> Option<Node> {
         "fs/inotify/max_queued_events" => {
             Node::File(format!("{}\n", super::inotify::MAX_QUEUED_EVENTS).into_bytes())
         }
-        "vm" => Node::Dir(entries(&[("memfd_noexec", dir::DT_REG)])),
+        "vm" => Node::Dir(entries(&[
+            ("memfd_noexec", dir::DT_REG),
+            ("mmap_rnd_bits", dir::DT_REG),
+            ("mmap_rnd_compat_bits", dir::DT_REG),
+        ])),
         "vm/memfd_noexec" => {
             Node::File(format!("{}\n", super::memfd::noexec_scope().ok()?).into_bytes())
         }
+        "vm/mmap_rnd_bits" => {
+            Node::File(super::sysctl::text("/proc/sys/vm/mmap_rnd_bits").ok()?)
+        }
+        "vm/mmap_rnd_compat_bits" => {
+            Node::File(super::sysctl::text("/proc/sys/vm/mmap_rnd_compat_bits").ok()?)
+        }
         "kernel" => Node::Dir(entries(&[
             ("hostname", dir::DT_REG),
+            ("kptr_restrict", dir::DT_REG),
             ("osrelease", dir::DT_REG),
             ("ostype", dir::DT_REG),
             ("pid_max", dir::DT_REG),
             ("random", dir::DT_DIR),
+            ("unprivileged_bpf_disabled", dir::DT_REG),
         ])),
+        "kernel/kptr_restrict" => {
+            Node::File(super::sysctl::text("/proc/sys/kernel/kptr_restrict").ok()?)
+        }
+        "kernel/unprivileged_bpf_disabled" => {
+            Node::File(super::sysctl::text("/proc/sys/kernel/unprivileged_bpf_disabled").ok()?)
+        }
         "kernel/random" => Node::Dir(entries(&[("boot_id", dir::DT_REG), ("uuid", dir::DT_REG)])),
         "kernel/random/boot_id" => {
             let s = match vfs::runtime_dir().map(aim_storage::boot_id::BootId::read) {
@@ -1551,6 +1720,332 @@ static POOL: Pool = Pool(Mutex::new(Vec::new()));
 const POOL_MAX: usize = 8;
 
 struct Pool(Mutex<Vec<i32>>);
+
+/// An open mounts or mountinfo file. `seen` is Linux `proc_mounts.event`:
+/// dup shares it, and the poll that observes a generation change consumes
+/// it. The host fd stays the content file (`fstat` is a regular file).
+pub(super) struct MountPoll {
+    host_pid: i32,
+    info: bool,
+    seen: AtomicU64,
+    filled: AtomicU64,
+    /// Namespace the path named at open. Later `unshare` does not retarget it.
+    ns: Option<Arc<vfs::MountNs>>,
+}
+
+static MOUNT_POLLS: Mutex<BTreeMap<i32, Arc<MountPoll>>> = Mutex::new(BTreeMap::new());
+
+const MOUNT_IN: i16 = 0x1;
+const MOUNT_PRI: i16 = 0x2;
+const MOUNT_ERR: i16 = 0x8;
+const MOUNT_RDNORM: i16 = 0x40;
+
+fn open_mount_table(host_pid: i32, info: bool, thread: Option<i32>, cloexec: bool) -> i64 {
+    // Sample the generation around the read. A mount during the read
+    // retries so the file does not open already holding an edge. A storm
+    // that never settles still opens: the next change remains visible.
+    // `/proc/self/mounts` is the leader's namespace, captured here.
+    let ns = (host_pid == pid()).then(|| vfs::proc_mount_namespace(thread));
+    let mut prepared = (String::new(), 0u64);
+    for _ in 0..8 {
+        let event = ns
+            .as_ref()
+            .map(|ns| vfs::mount_namespace_event(ns))
+            .unwrap_or(0);
+        let text = match mount_poll_points(host_pid, ns.as_ref()) {
+            Ok(points) => {
+                if info {
+                    mountinfo(points)
+                } else {
+                    mounts(points)
+                }
+            }
+            Err(error) => return -(error as i64),
+        };
+        let now = ns
+            .as_ref()
+            .map(|ns| vfs::mount_namespace_event(ns))
+            .unwrap_or(0);
+        let stable = now == event;
+        prepared = (text, event);
+        if stable {
+            break;
+        }
+    }
+    let (text, event) = prepared;
+    let fd = content_fd_unpublished(text.as_bytes(), cloexec);
+    if fd < 0 {
+        return fd;
+    }
+    let fd_i = fd as i32;
+    MOUNT_POLLS.lock().unwrap().insert(
+        fd_i,
+        Arc::new(MountPoll {
+            host_pid,
+            info,
+            seen: AtomicU64::new(event),
+            filled: AtomicU64::new(event),
+            ns,
+        }),
+    );
+    if let Err(error) = fdtab::publish_guest(fd_i) {
+        fdtab::on_close(fd_i);
+        // SAFETY: the fd we just opened.
+        unsafe {
+            libc::close(fd_i);
+        }
+        return -(error as i64);
+    }
+    fd
+}
+
+/// `mounts_poll` without consuming the edge.
+pub(super) fn mount_poll_bits(fd: i32) -> Option<i16> {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let poll = polls.get(&fd)?;
+    let mut bits = MOUNT_IN | MOUNT_RDNORM;
+    // Another process's table is not this process's `ns->event`. The file
+    // is still pollable; it does not invent a priority edge.
+    if poll.host_pid == pid() && poll.seen.load(Ordering::Acquire) != poll_generation(poll) {
+        bits |= MOUNT_ERR | MOUNT_PRI;
+    }
+    Some(bits)
+}
+
+/// The poll that observes `ns->event` advances `p->event`. False when
+/// another waiter already did, or this fd is not a mount file.
+pub(super) fn take_mount_edge(fd: i32) -> bool {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let Some(poll) = polls.get(&fd) else {
+        return false;
+    };
+    if poll.host_pid != pid() {
+        return false;
+    }
+    let current = poll_generation(poll);
+    let seen = poll.seen.load(Ordering::Acquire);
+    if seen == current {
+        return false;
+    }
+    poll.seen.store(current, Ordering::Release);
+    true
+}
+
+pub(super) fn is_mount_poll(fd: i32) -> bool {
+    MOUNT_POLLS.lock().unwrap().contains_key(&fd)
+}
+
+pub(super) fn mount_wake_fd() -> i32 {
+    vfs::mount_wake_fd()
+}
+
+pub(super) fn mount_wake_errno() -> i32 {
+    vfs::mount_wake_errno()
+}
+
+pub(super) fn drain_mount_wake() {
+    vfs::drain_mount_wake();
+}
+
+/// A dup shares the open file, including `p->event`.
+pub(super) fn dup_mount_poll(old: i32, new: i32) {
+    let mut polls = MOUNT_POLLS.lock().unwrap();
+    if let Some(poll) = polls.get(&old).cloned() {
+        polls.insert(new, poll);
+    }
+}
+
+pub(super) fn close_mount_poll(fd: i32) {
+    MOUNT_POLLS.lock().unwrap().remove(&fd);
+}
+
+/// An open `/proc/<pid>/ns/mnt` fd. The Arc is the namespace it named at
+/// open, which stays after `unshare` switches the process away.
+static MOUNT_NS_FDS: Mutex<BTreeMap<i32, Arc<vfs::MountNs>>> = Mutex::new(BTreeMap::new());
+
+fn mount_ns_ino(target: &str) -> Option<u64> {
+    let rest = target.strip_prefix("mnt:[")?.strip_suffix(']')?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn mount_ns_text(fd: i32) -> Option<String> {
+    let ns = MOUNT_NS_FDS.lock().unwrap().get(&fd).cloned()?;
+    Some(format!("mnt:[{}]", vfs::mount_namespace_ino(&ns)))
+}
+
+pub(super) fn mount_namespace_of(fd: i32) -> Option<Arc<vfs::MountNs>> {
+    MOUNT_NS_FDS.lock().unwrap().get(&fd).cloned()
+}
+
+/// Inherited namespace fds. The host descriptor arrives by `dup2`; this is
+/// the namespace it named in the parent.
+pub(super) fn mount_namespace_fds() -> Vec<(i32, u64)> {
+    MOUNT_NS_FDS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(fd, ns)| (*fd, vfs::mount_namespace_ino(ns)))
+        .collect()
+}
+
+pub(super) fn bind_mount_namespace(fd: i32, ns: Arc<vfs::MountNs>) {
+    MOUNT_NS_FDS.lock().unwrap().insert(fd, ns);
+}
+
+#[cfg(test)]
+pub(super) fn testing_clear_namespace_fds() {
+    MOUNT_NS_FDS.lock().unwrap().clear();
+}
+
+fn open_mount_namespace(ino: u64, cloexec: bool) -> i64 {
+    let Some(ns) = vfs::mount_namespace(ino) else {
+        return -(ENOENT as i64);
+    };
+    let fd = content_fd(&[], cloexec);
+    if fd < 0 {
+        return fd;
+    }
+    MOUNT_NS_FDS.lock().unwrap().insert(fd as i32, ns);
+    fd
+}
+
+pub(super) fn close_mount_namespace(fd: i32) {
+    MOUNT_NS_FDS.lock().unwrap().remove(&fd);
+}
+
+pub(super) fn dup_mount_namespace(old: i32, new: i32) {
+    let mut fds = MOUNT_NS_FDS.lock().unwrap();
+    if let Some(ns) = fds.get(&old).cloned() {
+        fds.insert(new, ns);
+    }
+}
+
+/// Identity of the open file's `mounts_poll` cursor, for a fork that shares
+/// one description across dup.
+pub(super) fn mount_poll_ptr(fd: i32) -> Option<*const ()> {
+    MOUNT_POLLS
+        .lock()
+        .unwrap()
+        .get(&fd)
+        .map(|poll| Arc::as_ptr(poll) as *const ())
+}
+
+pub(super) fn mount_poll_record(fd: i32) -> Option<(bool, u64, u64)> {
+    let polls = MOUNT_POLLS.lock().unwrap();
+    let poll = polls.get(&fd)?;
+    Some((
+        poll.info,
+        poll.seen.load(Ordering::Acquire),
+        poll.filled.load(Ordering::Acquire),
+    ))
+}
+
+pub(super) fn save_mount_poll(fd: i32, w: &mut super::fork_state::Writer) {
+    let (info, seen, filled) = mount_poll_record(fd).expect("mount poll");
+    w.bool(info);
+    w.u64(seen);
+    w.u64(filled);
+}
+
+pub(super) fn load_mount_poll(r: &mut super::fork_state::Reader) -> Arc<MountPoll> {
+    Arc::new(MountPoll {
+        host_pid: pid(),
+        info: r.bool(),
+        seen: AtomicU64::new(r.u64()),
+        filled: AtomicU64::new(r.u64()),
+        ns: Some(vfs::proc_mount_namespace(None)),
+    })
+}
+
+pub(super) fn install_mount_poll(fd: i32, poll: Arc<MountPoll>) {
+    MOUNT_POLLS.lock().unwrap().insert(fd, poll);
+}
+
+/// Exec shares one cursor per open file, keyed by the id in the exec text.
+pub(super) struct MountPollCache(BTreeMap<u64, Arc<MountPoll>>);
+
+impl MountPollCache {
+    pub(super) fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+pub(super) fn restore_mount_exec(
+    cache: &mut MountPollCache,
+    fd: i32,
+    id: u64,
+    info: bool,
+    seen: u64,
+    filled: u64,
+) {
+    let poll = cache
+        .0
+        .entry(id)
+        .or_insert_with(|| {
+            Arc::new(MountPoll {
+                host_pid: pid(),
+                info,
+                seen: AtomicU64::new(seen),
+                filled: AtomicU64::new(filled),
+                ns: Some(vfs::proc_mount_namespace(None)),
+            })
+        })
+        .clone();
+    install_mount_poll(fd, poll);
+}
+
+#[cfg(test)]
+pub(crate) fn detach_mount_polls() {
+    MOUNT_POLLS.lock().unwrap().clear();
+}
+
+/// Rewrite the content file when the mount generation moved, keeping the
+/// offset. `seq_read` shows the namespace as it is at the read.
+pub(super) fn refresh_mount_file(fd: i32) {
+    let poll = {
+        let polls = MOUNT_POLLS.lock().unwrap();
+        polls.get(&fd).cloned()
+    };
+    let Some(poll) = poll else {
+        return;
+    };
+    if poll.host_pid != pid() {
+        return;
+    }
+    for _ in 0..4 {
+        let event = poll_generation(&poll);
+        if poll.filled.load(Ordering::Acquire) == event {
+            return;
+        }
+        let text = match mount_poll_points(poll.host_pid, poll.ns.as_ref()) {
+            Ok(points) => {
+                if poll.info {
+                    mountinfo(points)
+                } else {
+                    mounts(points)
+                }
+            }
+            Err(_) => return,
+        };
+        if poll_generation(&poll) != event {
+            continue;
+        }
+        // SAFETY: the content file's offset, restored after the rewrite.
+        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        fill(fd, text.as_bytes());
+        if pos > 0 {
+            let end = text.len() as i64;
+            unsafe {
+                libc::lseek(fd, pos.min(end), libc::SEEK_SET);
+            }
+        }
+        poll.filled.store(event, Ordering::Release);
+        return;
+    }
+}
 
 /// A file holding `data`, positioned at 0. Closing it gives the file back
 /// to the pool ([`recycle`]).
@@ -1696,7 +2191,7 @@ fn shared(fd: i32) -> bool {
     let mut info = [0u32; 44];
     // SAFETY: a buffer of the flavour's size.
     let n = unsafe {
-        libc::proc_pidfdinfo(
+        crate::hostlibc::proc_pidfdinfo(
             libc::getpid(),
             fd,
             PROC_PIDFDVNODEINFO,
@@ -1855,6 +2350,9 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     if let Some(result) = super::fuse_sysfs::open(guest, flags) {
         return Some(result);
     }
+    if let Some(result) = super::loopdev::open_sysfs(guest, flags) {
+        return Some(result);
+    }
     if !is_kernfs(guest) {
         return None;
     }
@@ -1876,6 +2374,9 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     let write = flags & O_ACCMODE != 0;
     if canonical(guest) == super::memfd::NOEXEC_SYSCTL {
         return Some(super::memfd::open_noexec(write, cloexec));
+    }
+    if let Some(result) = super::sysctl::open(&canonical(guest), flags & O_ACCMODE, cloexec) {
+        return Some(result);
     }
     if canonical(guest) == "/proc/kmsg" {
         return Some(super::kmsg::open_proc(flags, host_flags));
@@ -1938,6 +2439,20 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
         if !fdtab::visible(n) {
             return Some(-(ENOENT as i64));
         }
+        if let Some(guest) = fdtab::socket_path_guest(n) {
+            let path = std::ffi::CString::new(guest).ok()?;
+            return Some(super::fs::openat_as(
+                [
+                    vfs::LINUX_AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    flags,
+                    0,
+                    0,
+                    0,
+                ],
+                &super::cred::current(),
+            ));
+        }
         if let Some(reference) = fdtab::character_reference(n) {
             if let Err(error) = reference.stat(n) {
                 return Some(
@@ -1984,7 +2499,7 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
         let mut path = [0u8; libc::PATH_MAX as usize];
         // SAFETY: F_GETPATH into a local buffer; then open or dup.
         return Some(unsafe {
-            if libc::fcntl(n, libc::F_GETPATH, path.as_mut_ptr()) == 0 {
+            if crate::sys::fgetpath(n, path.as_mut_ptr()) == 0 {
                 errno::check(
                     libc::open(path.as_ptr().cast(), host_flags & !libc::O_CREAT, 0) as i64,
                 )
@@ -2007,22 +2522,15 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
     }
     Some(match node(&canon) {
         Some(Node::Mem(pid)) => super::proc_mem::open(pid, flags),
-        Some(Node::MountTable { host_pid, info }) => {
+        Some(Node::MountTable {
+            host_pid,
+            info,
+            thread,
+        }) => {
             if write {
                 return Some(-(EACCES as i64));
             }
-            match process_mount_points(host_pid) {
-                Ok(points) => content_fd(
-                    if info {
-                        mountinfo(points)
-                    } else {
-                        mounts(points)
-                    }
-                    .as_bytes(),
-                    cloexec,
-                ),
-                Err(error) => -(error as i64),
-            }
+            open_mount_table(host_pid, info, thread, cloexec)
         }
         Some(Node::NetTable(kind)) => {
             if write {
@@ -2053,28 +2561,28 @@ pub fn open(guest: &str, flags: u64, host_flags: i32) -> Option<i64> {
         Some(Node::Dir(list)) => dir_fd(&canon, list, cloexec),
         Some(Node::Denied(_)) => -(EACCES as i64),
         Some(Node::Link(t)) => {
+            if let Some(ino) = mount_ns_ino(&t) {
+                if write {
+                    return Some(-(EACCES as i64));
+                }
+                return Some(open_mount_namespace(ino, cloexec));
+            }
             let target = if t.starts_with('/') {
                 t
             } else {
                 format!("/proc/{t}")
             };
             let linked = node(&canonical(&target));
-            if let Some(Node::MountTable { host_pid, info }) = linked {
+            if let Some(Node::MountTable {
+                host_pid,
+                info,
+                thread,
+            }) = linked
+            {
                 if write {
                     return Some(-(EACCES as i64));
                 }
-                match process_mount_points(host_pid) {
-                    Ok(points) => content_fd(
-                        if info {
-                            mountinfo(points)
-                        } else {
-                            mounts(points)
-                        }
-                        .as_bytes(),
-                        cloexec,
-                    ),
-                    Err(error) => -(error as i64),
-                }
+                open_mount_table(host_pid, info, thread, cloexec)
             } else if let Some(Node::Dir(list)) = linked {
                 dir_fd(&canonical(&target), list, cloexec)
             } else if let Some(Node::File(data)) = linked.filter(|_| !write) {
@@ -2216,12 +2724,16 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
             st.st_mode = libc::S_IFREG | 0o600;
             st.st_nlink = 1;
         }
-        Some(Node::File(_)) if canon == super::memfd::NOEXEC_SYSCTL => {
+        Some(Node::File(_))
+            if canon == super::memfd::NOEXEC_SYSCTL
+                || super::sysctl::known(&canon)
+                || super::loopdev::queue_attr(&canon) =>
+        {
             st.st_mode = libc::S_IFREG | 0o644;
             st.st_nlink = 1;
         }
         Some(Node::File(_)) if conf6.is_some() => {
-            st.st_mode = libc::S_IFREG as u16 | conf6.unwrap() as u16;
+            st.st_mode = libc::S_IFREG as libc::mode_t | conf6.unwrap() as libc::mode_t;
             st.st_nlink = 1;
         }
         Some(Node::File(_) | Node::NetTable(_) | Node::MountTable { .. }) => {
@@ -2242,6 +2754,12 @@ pub fn stat(guest: &str, follow: bool) -> Option<Result<libc::stat, Errno>> {
         }
         Some(Node::Denied(None)) => return Some(Err(EACCES)),
         Some(Node::Link(t)) if follow => {
+            if let Some(ino) = mount_ns_ino(&t) {
+                st.st_mode = libc::S_IFREG | 0o444;
+                st.st_ino = ino;
+                st.st_nlink = 1;
+                return Some(Ok(st));
+            }
             let fd_n = canon
                 .strip_prefix(&format!("/proc/{me}/fd/"))
                 .and_then(|n| n.parse::<i32>().ok());
@@ -2646,5 +3164,1142 @@ mod tests {
             assert!(out.status.success());
             assert_eq!(out.stdout, data.as_bytes());
         }
+    }
+
+    /// Linux `mounts_poll`: the fd is a regular file that poll can watch.
+    /// `EPOLLERR|EPOLLPRI` is one edge per mount-table change, shared by
+    /// dup, and a later read shows the new table. Another proc file stays
+    /// EPERM. Init's MountHandler registers exactly those two bits.
+    #[test]
+    fn proc_mounts_polls_once_per_mount_change() {
+        let (_view, root) = crate::vfs::test_view();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        assert!(ep >= 0, "epoll {ep}");
+        let stat = super::open("/proc/self/stat", 0, libc::O_RDONLY).unwrap();
+        assert!(stat >= 0, "stat {stat}");
+        let interest = [0xau64, 0x4d];
+        let add = |ep: i64, fd: i64| {
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                fd as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ])
+        };
+        assert_eq!(add(ep, stat), -(crate::errno::EPERM as i64));
+        assert_eq!(crate::sys::fs::close([stat as u64, 0, 0, 0, 0, 0]), 0);
+
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let info = super::open("/proc/self/mountinfo", 0, libc::O_RDONLY).unwrap();
+        assert!(mounts >= 0 && info >= 0 && mounts != info);
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(mounts as i32, &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
+        assert!(matches!(
+            crate::sys::fdtab::get(mounts as i32),
+            Some(crate::sys::fdtab::Kind::Content)
+        ));
+        assert_eq!(add(ep, info), 0);
+        assert_eq!(add(ep, mounts), 0);
+        let wait = |ms: i64| {
+            let mut out = [0u64; 2];
+            let n = crate::sys::epoll::epoll_pwait([
+                ep as u64,
+                out.as_mut_ptr() as u64,
+                1,
+                ms as u64,
+                0,
+                0,
+            ]);
+            (n, out)
+        };
+        assert_eq!(wait(0).0, 0);
+        let polled = |fd: i64, events: i16| {
+            let mut entry = libc::pollfd {
+                fd: fd as i32,
+                events,
+                revents: 0,
+            };
+            let mut timeout = [0i64; 2];
+            let n = crate::sys::poll::ppoll([
+                &mut entry as *mut libc::pollfd as u64,
+                1,
+                timeout.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+            ]);
+            (n, entry.revents)
+        };
+        assert_eq!(polled(mounts, 0x2), (0, 0));
+        let words = (mounts as usize + 1).div_ceil(64);
+        let mut read = vec![0u64; words];
+        let mut write = vec![0u64; words];
+        let mut exc = vec![0u64; words];
+        exc[(mounts as usize) / 64] |= 1u64 << ((mounts as usize) % 64);
+        let mut timeout = [0i64; 2];
+        assert_eq!(
+            crate::sys::poll::pselect6([
+                mounts as u64 + 1,
+                read.as_ptr() as u64,
+                write.as_ptr() as u64,
+                exc.as_mut_ptr() as u64,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(polled(mounts, 0x1 | 0x40), (1, 0x1 | 0x40));
+        assert_eq!(wait(0).0, 0);
+
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        let dupfd = crate::sys::fs::fcntl([mounts as u64, 0, 0, 0, 0, 0]);
+        assert!(copied >= 0 && dupfd >= 0 && copied != dupfd && copied != mounts);
+        let ep2 = crate::sys::epoll::epoll_create1([0; 6]);
+        assert_eq!(add(ep2, dupfd), 0);
+        assert_eq!(crate::sys::fs::close([ep2 as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([dupfd as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([info as u64, 0, 0, 0, 0, 0]), 0);
+
+        let mount_at = |name: &str| {
+            let host = root.join(name);
+            std::fs::create_dir_all(&host).unwrap();
+            let guest = format!("/mnt/{name}");
+            crate::vfs::add_mount(
+                &guest,
+                host,
+                crate::vfs::Area::Writable,
+                "tmpfs",
+                "tmpfs",
+            )
+            .unwrap();
+            guest
+        };
+        let names = ["mount-poll-a", "mount-poll-b", "mount-poll-c", "mount-poll-d"];
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let root_thread = root.clone();
+        let added = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let host = root_thread.join("mount-poll-a");
+            std::fs::create_dir_all(&host).unwrap();
+            crate::vfs::add_mount(
+                "/mnt/mount-poll-a",
+                host,
+                crate::vfs::Area::Writable,
+                "tmpfs",
+                "tmpfs",
+            )
+            .unwrap();
+        });
+        let (n, out) = wait(2_000);
+        added.join().unwrap();
+        cleanup.0.push("/mnt/mount-poll-a".into());
+        assert_eq!(n, 1, "epoll did not observe the mount");
+        assert_eq!(out[0] & 0xa, 0xa);
+        assert_eq!(out[0] & 0x1, 0);
+        assert_eq!(out[1], 0x4d);
+        assert_eq!(wait(0).0, 0);
+        assert_eq!(polled(copied, 0x2), (0, 0));
+
+        let mut bytes = vec![0u8; 65536];
+        let length = crate::sys::fs::pread64([
+            mounts as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(length > 0);
+        bytes.truncate(length as usize);
+        assert!(String::from_utf8(bytes).unwrap().contains(" /mnt/mount-poll-a "));
+
+        cleanup.0.push(mount_at("mount-poll-b"));
+        assert_eq!(polled(copied, 0x2), (1, 0x2 | 0x8));
+        assert_eq!(wait(0).0, 0);
+        assert_eq!(crate::sys::fs::close([copied as u64, 0, 0, 0, 0, 0]), 0);
+        cleanup.0.push(mount_at("mount-poll-c"));
+        let (n, out) = wait(0);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x4d));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        cleanup.0.push(mount_at("mount-poll-d"));
+        assert_eq!(wait(0).0, 0);
+        let again = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(add(ep, again), 0);
+        assert_eq!(wait(0).0, 0);
+        let mut bytes = vec![0u8; 65536];
+        let length = crate::sys::fs::pread64([
+            again as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(length > 0);
+        bytes.truncate(length as usize);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(" /mnt/mount-poll-d "));
+        assert_eq!(crate::sys::fs::close([again as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in names {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    fn mount_at(root: &std::path::Path, name: &str) -> String {
+        let host = root.join(name);
+        std::fs::create_dir_all(&host).unwrap();
+        let guest = format!("/mnt/{name}");
+        crate::vfs::add_mount(
+            &guest,
+            host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        guest
+    }
+
+    fn pri(fd: i64) -> (i64, i16) {
+        let mut entry = libc::pollfd {
+            fd: fd as i32,
+            events: 0x2,
+            revents: 0,
+        };
+        let timeout = [0i64; 2];
+        let n = crate::sys::poll::ppoll([
+            &mut entry as *mut libc::pollfd as u64,
+            1,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        (n, entry.revents)
+    }
+
+    /// `ep_insert` polls the file. `mounts_poll` consumes a change between
+    /// open and ADD, and `ep_send_events` polls again, so that edge is not
+    /// delivered. `EPOLLIN` is the current state: once for `EPOLLET`, on
+    /// every wait when level-triggered.
+    #[test]
+    fn proc_mounts_epoll_insert_observes_the_open_file() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        cleanup.0.push(mount_at(&root, "mount-insert-a"));
+        let interest = [0xau64, 0x11];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(pri(mounts), (0, 0));
+        let wait = |ep: i64, ms: i64| {
+            let mut out = [0u64; 2];
+            let n = crate::sys::epoll::epoll_pwait([
+                ep as u64,
+                out.as_mut_ptr() as u64,
+                1,
+                ms as u64,
+                0,
+                0,
+            ]);
+            (n, out)
+        };
+        assert_eq!(wait(ep, 0).0, 0);
+        cleanup.0.push(mount_at(&root, "mount-insert-b"));
+        let (n, out) = wait(ep, 0);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x11));
+        assert_eq!(wait(ep, 0).0, 0);
+
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        let edge = crate::sys::epoll::epoll_create1([0; 6]);
+        let et = [1u64 | (1 << 31), 0x22];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                edge as u64,
+                1,
+                copied as u64,
+                et.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        let (n, out) = wait(edge, 0);
+        assert_eq!(n, 1);
+        assert_eq!(out[0] & (0x1 | 0x40), 0x1 | 0x40);
+        assert_eq!(out[0] & 0x2, 0);
+        assert_eq!(out[1], 0x22);
+        assert_eq!(wait(edge, 0).0, 0);
+        cleanup.0.push(mount_at(&root, "mount-insert-c"));
+        let (n, out) = wait(edge, 0);
+        assert_eq!(n, 1);
+        assert_eq!(out[0] & (0x1 | 0x40 | 0x8), 0x1 | 0x40 | 0x8);
+        assert_eq!(wait(edge, 0).0, 0);
+
+        let level_fd = super::open("/proc/self/mounts", 0, libc::O_RDONLY).unwrap();
+        let level = crate::sys::epoll::epoll_create1([0; 6]);
+        let inn = [1u64, 0x33];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                level as u64,
+                1,
+                level_fd as u64,
+                inn.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        for _ in 0..2 {
+            let (n, out) = wait(level, 0);
+            assert_eq!(n, 1);
+            assert_eq!(out[0] & (0x1 | 0x40), 0x1 | 0x40);
+            assert_eq!(out[1], 0x33);
+        }
+        for fd in [mounts, copied, level_fd, ep, edge, level] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        drop(cleanup);
+        for name in ["mount-insert-a", "mount-insert-b", "mount-insert-c"] {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    /// Fork copies the open file's cursor and this process's generation.
+    /// dup shares that copy. exec of a non-`CLOEXEC` mount fd does too.
+    /// Closing one fd leaves the other.
+    #[test]
+    fn proc_mounts_fork_keeps_the_poll_cursor() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let copied = crate::sys::fs::dup([mounts as u64, 0, 0, 0, 0, 0]);
+        cleanup.0.push(mount_at(&root, "mount-fork-a"));
+        assert_eq!(pri(mounts), (1, 0x2 | 0x8));
+        assert_eq!(pri(copied), (0, 0));
+
+        let save = || {
+            let mut writer = crate::sys::fork_state::Writer::default();
+            crate::sys::fdtab::fork_save(&mut writer);
+            writer.into_bytes()
+        };
+        let restore = |blob: &[u8]| {
+            super::detach_mount_polls();
+            crate::vfs::restore_mount_event(0);
+            let mut reader = crate::sys::fork_state::Reader::new(blob);
+            crate::sys::fdtab::fork_restore(&mut reader);
+            assert!(reader.ok(), "{}", reader.diagnostic());
+        };
+        let caught_up = save();
+        super::detach_mount_polls();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        let interest = [0xau64, 1];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            -(crate::errno::EPERM as i64)
+        );
+        restore(&caught_up);
+        assert_eq!(pri(mounts), (0, 0));
+        assert_eq!(pri(copied), (0, 0));
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+
+        cleanup.0.push(mount_at(&root, "mount-fork-b"));
+        let pending = save();
+        restore(&pending);
+        assert_eq!(pri(mounts), (1, 0x2 | 0x8));
+        assert_eq!(pri(copied), (0, 0));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        assert!(super::is_mount_poll(copied as i32));
+        cleanup.0.push(mount_at(&root, "mount-fork-c"));
+        assert_eq!(pri(copied), (1, 0x2 | 0x8));
+
+        let again = crate::sys::fs::dup([copied as u64, 0, 0, 0, 0, 0]);
+        cleanup.0.push(mount_at(&root, "mount-fork-d"));
+        let text = crate::sys::fdtab::regular_exec_text().unwrap();
+        let mounts_only = text
+            .lines()
+            .filter(|line| line.starts_with("mounts\t") || line.starts_with("mountevent\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        super::detach_mount_polls();
+        crate::vfs::restore_mount_event(0);
+        crate::sys::fdtab::restore_regular_exec(&mounts_only).unwrap();
+        assert_eq!(pri(copied), (1, 0x2 | 0x8));
+        assert_eq!(pri(again), (0, 0));
+        assert_eq!(crate::sys::fs::close([copied as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([again as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in ["mount-fork-a", "mount-fork-b", "mount-fork-c", "mount-fork-d"] {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    /// A missing wake pipe fails a blocking wait. It does not invent an
+    /// edge, and a generation that already moved is still one edge.
+    #[test]
+    fn proc_mounts_wake_failure_reports_the_pipe_errno() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Arm;
+        impl Drop for Arm {
+            fn drop(&mut self) {
+                crate::vfs::testing_fail_mount_wake(false);
+            }
+        }
+        let _arm = Arm;
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for guest in &self.0 {
+                    let _ = crate::vfs::remove_mount(guest);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Vec::new());
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let ep = crate::sys::epoll::epoll_create1([0; 6]);
+        let interest = [0xau64, 0x44];
+        assert_eq!(
+            crate::sys::epoll::epoll_ctl([
+                ep as u64,
+                1,
+                mounts as u64,
+                interest.as_ptr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        crate::vfs::testing_fail_mount_wake(true);
+        cleanup.0.push(mount_at(&root, "mount-wake-a"));
+        let mut out = [0u64; 2];
+        let n = crate::sys::epoll::epoll_pwait([
+            ep as u64,
+            out.as_mut_ptr() as u64,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x44));
+        assert_eq!(
+            crate::sys::epoll::epoll_pwait([ep as u64, out.as_mut_ptr() as u64, 1, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            crate::sys::epoll::epoll_pwait([ep as u64, out.as_mut_ptr() as u64, 1, 200, 0, 0]),
+            -(crate::errno::EMFILE as i64)
+        );
+        assert_eq!(pri(mounts), (0, 0));
+        let mut entry = libc::pollfd {
+            fd: mounts as i32,
+            events: 0x2,
+            revents: 0,
+        };
+        let timeout = [0i64, 200_000_000];
+        assert_eq!(
+            crate::sys::poll::ppoll([
+                &mut entry as *mut libc::pollfd as u64,
+                1,
+                timeout.as_ptr() as u64,
+                0,
+                0,
+                0,
+            ]),
+            -(crate::errno::EMFILE as i64)
+        );
+        crate::vfs::testing_fail_mount_wake(false);
+        cleanup.0.push(mount_at(&root, "mount-wake-b"));
+        let n = crate::sys::epoll::epoll_pwait([
+            ep as u64,
+            out.as_mut_ptr() as u64,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!((n, out[0] & 0xa, out[1]), (1, 0xa, 0x44));
+        assert_eq!(crate::sys::fs::close([mounts as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(crate::sys::fs::close([ep as u64, 0, 0, 0, 0, 0]), 0);
+        drop(cleanup);
+        for name in ["mount-wake-a", "mount-wake-b"] {
+            let _ = std::fs::remove_dir(root.join(name));
+        }
+    }
+
+    fn ns_text(path: &str) -> String {
+        let bytes = super::readlink(path.as_bytes()).unwrap().unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn mounts_text() -> String {
+        let fd = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        let mut bytes = vec![0u8; 65536];
+        let n = crate::sys::fs::pread64([
+            fd as u64,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        ]);
+        assert!(n > 0);
+        assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        bytes.truncate(n as usize);
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Init's `SetupMountNamespaces`: the bootstrap fd stays the namespace
+    /// from before `unshare`, and `setns` switches back to it. `setns` of a
+    /// bad fd is `EBADF`, of the wrong kind or `nstype` is `EINVAL`, and
+    /// without `CAP_SYS_ADMIN` or `CAP_SYS_CHROOT` is `EPERM`.
+    #[test]
+    fn mount_namespace_setns_switches_the_named_table() {
+        let (_view, root) = crate::vfs::test_view();
+        struct Cred(crate::sys::cred::Identity);
+        impl Drop for Cred {
+            fn drop(&mut self) {
+                crate::sys::cred::init(self.0.clone(), None);
+            }
+        }
+        let _cred = Cred(crate::sys::cred::current());
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert!(boot >= 0);
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert!(boot_link.starts_with("mnt:[") && boot_link.ends_with(']'));
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        let pid = super::pid();
+        let by_pid = super::open(&format!("/proc/{pid}/ns/mnt"), 0, libc::O_RDONLY).unwrap();
+        assert!(by_pid >= 0);
+        assert_eq!(ns_text(&format!("/proc/{pid}/ns/mnt")), boot_link);
+        assert_eq!(crate::sys::fs::close([by_pid as u64, 0, 0, 0, 0, 0]), 0);
+
+        assert_eq!(
+            crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]),
+            0
+        );
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+
+        // The mounts below name the namespace. `/` is shared until told
+        // otherwise, so this tree is made private before them.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
+        let host = root.join("ns-default");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-default",
+            host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert!(mounts_text().contains(" /mnt/ns-default "));
+
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(!mounts_text().contains(" /mnt/ns-default "));
+        let host = root.join("ns-boot");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-boot",
+            host,
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-boot "));
+        assert!(!text.contains(" /mnt/ns-default "));
+
+        let copied = crate::sys::fs::dup([boot as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(crate::sys::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{copied}")), boot_link);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), default_link);
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-default "));
+        assert!(!text.contains(" /mnt/ns-boot "));
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(mounts_text().contains(" /mnt/ns-boot "));
+
+        assert_eq!(
+            crate::sys::mount::setns([(-1i32) as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+        let gone = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::fs::close([gone as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            crate::sys::mount::setns([gone as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+        let mounts = super::open("/proc/mounts", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([mounts as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x2000_0000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+
+        let mut weak = crate::sys::cred::current();
+        weak.cap_eff &= !(1 << 21);
+        crate::sys::cred::init(weak, None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EPERM as i64)
+        );
+        let mut admin = _cred.0.clone();
+        admin.cap_eff &= !(1 << 18);
+        crate::sys::cred::init(admin, None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0, 0, 0, 0, 0]),
+            -(crate::errno::EPERM as i64)
+        );
+        crate::sys::cred::init(_cred.0.clone(), None);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-default");
+        assert_eq!(
+            crate::sys::mount::setns([copied as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-boot");
+        for fd in [default_ns, copied, mounts] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(root.join("ns-default"));
+        let _ = std::fs::remove_dir(root.join("ns-boot"));
+    }
+
+    /// `mntns_install` rejects a shared `fs_struct` (`users != 1`), including
+    /// `setns` back into the namespace the caller is already in.
+    #[test]
+    fn mount_namespace_setns_with_a_shared_fs_is_einval() {
+        let (_view, _root) = crate::vfs::test_view();
+        let share = crate::vfs::testing_share_fs();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        drop(share);
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::sys::fs::close([boot as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    /// vendor_init's fork is a new process. The inherited default-namespace
+    /// fd is unbound until the image reinstalls it, which is the `EINVAL`
+    /// from `mount_namespace_of`. Fork without `CLONE_FS` leaves `users == 1`
+    /// even when the parent still has a shared `fs_struct`, and the child's
+    /// `/proc/self/ns/mnt` stays the parent's current (bootstrap) inode.
+    #[test]
+    fn fork_child_rebinds_inherited_namespace_and_keeps_a_private_fs() {
+        let (_view, root) = crate::vfs::test_view();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        // The mounts below name the namespace. `/` is shared until told
+        // otherwise, so this tree is made private before them.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
+        let host = root.join("ns-default");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-default",
+            host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        let host = root.join("ns-boot");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-boot",
+            host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        let share = crate::vfs::testing_share_fs();
+        assert!(crate::vfs::fs_is_shared());
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        assert!(!crate::vfs::fs_is_shared());
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), default_link);
+        let text = mounts_text();
+        assert!(text.contains(" /mnt/ns-default "));
+        assert!(!text.contains(" /mnt/ns-boot "));
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert!(mounts_text().contains(" /mnt/ns-boot "));
+        drop(share);
+        let _ = crate::vfs::remove_mount("/mnt/ns-boot");
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-default");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(root.join("ns-default"));
+        let _ = std::fs::remove_dir(root.join("ns-boot"));
+    }
+
+    /// A plain `/proc` content file is an open file description. Fork keeps
+    /// the fd; it is not only the mount-poll and namespace fds that are.
+    #[test]
+    fn fork_save_keeps_a_plain_proc_content_fd() {
+        let _view = crate::vfs::test_view();
+        let before = fd_entry_count();
+        let fd = super::open("/proc/meminfo", 0, libc::O_RDONLY).unwrap();
+        assert!(fd >= 0);
+        assert!(matches!(
+            super::fdtab::get(fd as i32),
+            Some(super::fdtab::Kind::Content)
+        ));
+        assert_eq!(fd_entry_count(), before + 1);
+        assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+    }
+
+    fn fd_entry_count() -> u64 {
+        let mut writer = super::super::fork::state::Writer::default();
+        super::fdtab::fork_save(&mut writer);
+        let bytes = writer.into_bytes();
+        u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    }
+
+    /// vendor_init `setns` into the reconstructed default namespace, then
+    /// `readlink("/proc/self/exe")`. The exe path is the executed file and
+    /// does not move with the namespace. A fuse line whose origin is another
+    /// namespace must not make that walk return `EIO`: the parked journal
+    /// keeps its mount records. `mntns_install` sets the cwd to the
+    /// namespace root.
+    #[test]
+    fn fork_setns_readlink_exe_uses_the_journal_records() {
+        let (_view, _root) = crate::vfs::test_view();
+        let previous_exe = (
+            crate::sys::process::exe_guest_path(),
+            crate::sys::process::exe_host_path(),
+        );
+        let previous_cwd = crate::vfs::cwd();
+        crate::sys::process::set_exe("/system/bin/init".into(), "/system/bin/init".into());
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let journal = crate::vfs::mount_namespace_id().unwrap();
+        let owner = aim_storage::mount_namespace::Namespace::open(
+            crate::vfs::runtime_dir().unwrap(),
+            &journal,
+        )
+        .unwrap();
+        let state = owner.read().unwrap();
+        assert!(
+            state.mounts.iter().any(|mount| mount.guest == "/"),
+            "default namespace journal has no root mount"
+        );
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        let table = crate::vfs::runtime_dir().unwrap().join("fuse-mounts");
+        let saved_table = std::fs::read(&table).ok();
+        let line = [
+            "/fuse-foreign-probe",
+            "/var/empty",
+            "src",
+            "plain",
+            "rw",
+            "tmpfs",
+            "",
+            "not-this-namespace",
+            "1",
+            "1",
+            "0",
+            "0",
+        ]
+        .join("\t");
+        std::fs::write(&table, format!("{line}\n")).unwrap();
+        crate::vfs::set_cwd("/system".into());
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::vfs::cwd(), "/");
+        crate::vfs::refresh_fuse_mounts().expect("path walk after setns");
+        let resolved = crate::vfs::resolve(
+            crate::vfs::LINUX_AT_FDCWD,
+            b"/proc/self/exe",
+            false,
+        )
+        .expect("resolve /proc/self/exe");
+        let bytes = super::readlink(resolved.guest.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"/system/bin/init");
+        match saved_table {
+            Some(bytes) => std::fs::write(&table, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&table);
+            }
+        }
+        let _ = crate::vfs::remove_mount("/fuse-foreign-probe");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        crate::vfs::set_cwd(previous_cwd);
+        crate::sys::process::set_exe(previous_exe.0, previous_exe.1);
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+    }
+
+    /// `unshare(CLONE_NEWNS)` copies the caller's mount tree. It does not
+    /// start an empty table. A file with no covering mount stays on the
+    /// image root. A tmpfs mounted before the call, the way init covers
+    /// `/linkerconfig` and `/apex` in `MountExtraFilesystems`, is in the
+    /// copy and still hides the image file. Fork, `setns` into that
+    /// namespace, and the exec replay (`load_own_mounts` of
+    /// `own_mounts_text`) resolve the same hosts. `setns` sets cwd to `/`;
+    /// these paths are absolute.
+    #[test]
+    fn fork_setns_exec_keeps_the_copied_mount_tree() {
+        let (_view, dir) = crate::vfs::test_view();
+        let image = dir.join("root");
+        for rel in [
+            "system/lib64/bootstrap",
+            "system/bin",
+            "linkerconfig",
+            "apex/com.android.runtime/lib64/bionic",
+        ] {
+            std::fs::create_dir_all(image.join(rel)).unwrap();
+        }
+        std::fs::write(image.join("system/lib64/bootstrap/libc.so"), b"image-libc").unwrap();
+        std::fs::write(image.join("system/bin/init"), b"image-init").unwrap();
+        std::fs::write(image.join("linkerconfig/ld.config.txt"), b"image-config").unwrap();
+        std::fs::write(
+            image.join("apex/com.android.runtime/lib64/bionic/libc.so"),
+            b"image-apex",
+        )
+        .unwrap();
+        let paths = [
+            "/linkerconfig/ld.config.txt",
+            "/system/lib64/bootstrap/libc.so",
+            "/system/bin/init",
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+        ];
+        let startup: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(startup[0].1, crate::vfs::Area::Image);
+        assert_eq!(std::fs::read(&startup[0].0).unwrap(), b"image-config");
+        assert_eq!(startup[1].1, crate::vfs::Area::Image);
+        assert_eq!(std::fs::read(&startup[1].0).unwrap(), b"image-libc");
+        assert_eq!(std::fs::read(&startup[3].0).unwrap(), b"image-apex");
+
+        let linker_host = dir.join("tmpfs-linkerconfig");
+        let apex_host = dir.join("tmpfs-apex");
+        std::fs::create_dir_all(&linker_host).unwrap();
+        std::fs::create_dir_all(&apex_host).unwrap();
+        crate::vfs::add_mount(
+            "/linkerconfig",
+            linker_host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        crate::vfs::add_mount(
+            "/apex",
+            apex_host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        let covered: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(covered[0].0, linker_host.join("ld.config.txt"));
+        assert_eq!(covered[0].1, crate::vfs::Area::Writable);
+        assert!(!covered[0].0.exists());
+        assert_eq!(covered[1].0, startup[1].0);
+        assert_eq!(std::fs::read(&covered[1].0).unwrap(), b"image-libc");
+        assert_eq!(covered[2].0, startup[2].0);
+        assert_eq!(covered[3].0, apex_host.join("com.android.runtime/lib64/bionic/libc.so"));
+        assert!(!covered[3].0.exists());
+        let listed = mounts_text();
+        assert!(listed.contains(" /linkerconfig "));
+        assert!(listed.contains(" /apex "));
+
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let copied: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(copied, covered);
+        let listed = mounts_text();
+        assert!(
+            listed.contains(" /linkerconfig ") && listed.contains(" /apex "),
+            "unshare left a table without the pre-unshare mounts: {listed}"
+        );
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let image = crate::vfs::capture_fork_namespaces(false);
+        let inherited = super::mount_namespace_fds();
+        crate::vfs::testing_forget_other_namespaces();
+        super::testing_clear_namespace_fds();
+        assert!(crate::vfs::install_fork_namespaces(&image));
+        for (fd, ino) in inherited {
+            let ns = crate::vfs::mount_namespace(ino).expect("restored namespace");
+            super::bind_mount_namespace(fd, ns);
+        }
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(crate::vfs::cwd(), "/");
+        let after_setns: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(after_setns, covered);
+        let text = crate::vfs::own_mounts_text();
+        assert!(text.contains("namespace-owner\t"));
+        assert!(text.contains("/linkerconfig\t"));
+        assert!(text.contains("/apex\t"));
+        crate::vfs::load_own_mounts(&text).expect("exec mount replay");
+        let after_exec: Vec<_> = paths
+            .iter()
+            .map(|guest| crate::vfs::lookup(guest))
+            .collect();
+        assert_eq!(after_exec, covered);
+        assert_eq!(std::fs::read(&after_exec[1].0).unwrap(), b"image-libc");
+        assert_eq!(std::fs::read(&after_exec[2].0).unwrap(), b"image-init");
+        assert!(!after_exec[0].0.exists());
+        assert!(!after_exec[3].0.exists());
+
+        let _ = crate::vfs::remove_mount("/linkerconfig");
+        let _ = crate::vfs::remove_mount("/apex");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/linkerconfig");
+        let _ = crate::vfs::remove_mount("/apex");
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir.join("root/system"));
+        let _ = std::fs::remove_dir_all(dir.join("root/linkerconfig"));
+        let _ = std::fs::remove_dir_all(dir.join("root/apex"));
+        let _ = std::fs::remove_dir_all(&linker_host);
+        let _ = std::fs::remove_dir_all(&apex_host);
+    }
+
+    /// `unshare(CLONE_NEWCGROUP)` is not Linux's success. The flag is outside
+    /// the mount-namespace mask, which is the unsupported-namespace answer
+    /// (ADR 0012). Init continues after the `EINVAL`.
+    #[test]
+    fn unshare_clone_newcgroup_is_einval() {
+        let _view = crate::vfs::test_view();
+        assert_eq!(
+            crate::sys::mount::unshare([0x200_0000, 0, 0, 0, 0, 0]),
+            -(crate::errno::EINVAL as i64)
+        );
+    }
+
+    /// Init's sequence with the property-service thread still alive:
+    /// `unshare(CLONE_NEWNS)` unshares `fs`, the pre-unshare fd keeps its
+    /// inode, and `setns` of that fd succeeds.
+    #[test]
+    fn mount_namespace_unshare_then_setns_with_another_thread() {
+        let (_view, root) = crate::vfs::test_view();
+        let share = crate::vfs::testing_share_fs();
+        let boot = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        let boot_link = ns_text("/proc/self/ns/mnt");
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+
+        assert_eq!(crate::sys::mount::unshare([0x20000, 0, 0, 0, 0, 0]), 0);
+        let default_link = ns_text("/proc/self/ns/mnt");
+        assert_ne!(default_link, boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+        let default_ns = super::open("/proc/self/ns/mnt", 0, libc::O_RDONLY).unwrap();
+        assert_eq!(ns_text(&format!("/proc/self/fd/{default_ns}")), default_link);
+
+        // The other thread stays in the bootstrap namespace. This tree is
+        // made private so the mount is not a peer of that namespace.
+        crate::vfs::set_mount_propagation("/", (1 << 18) | 0x4000).unwrap();
+        let host = root.join("ns-other-thread");
+        std::fs::create_dir_all(&host).unwrap();
+        crate::vfs::add_mount(
+            "/mnt/ns-other-thread",
+            host.clone(),
+            crate::vfs::Area::Writable,
+            "tmpfs",
+            "tmpfs",
+        )
+        .unwrap();
+        assert!(mounts_text().contains(" /mnt/ns-other-thread "));
+        assert!(!share.mounts_contain("/mnt/ns-other-thread"));
+
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(ns_text("/proc/self/ns/mnt"), boot_link);
+        assert_eq!(ns_text(&format!("/proc/self/fd/{boot}")), boot_link);
+        assert_eq!(share.namespace_link(), boot_link);
+        assert!(!mounts_text().contains(" /mnt/ns-other-thread "));
+        assert_eq!(
+            crate::sys::mount::setns([(-1i32) as u64, 0x20000, 0, 0, 0, 0]),
+            -(crate::errno::EBADF as i64)
+        );
+
+        assert_eq!(
+            crate::sys::mount::setns([default_ns as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        let _ = crate::vfs::remove_mount("/mnt/ns-other-thread");
+        assert_eq!(
+            crate::sys::mount::setns([boot as u64, 0x20000, 0, 0, 0, 0]),
+            0
+        );
+        drop(share);
+        for fd in [boot, default_ns] {
+            assert_eq!(crate::sys::fs::close([fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        let _ = std::fs::remove_dir(host);
     }
 }

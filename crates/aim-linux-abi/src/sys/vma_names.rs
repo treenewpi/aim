@@ -12,9 +12,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use super::mem::PAGE;
 use super::user_memory;
 use crate::errno::{EBADF, EFAULT, EINVAL, ENOMEM};
+
+/// Bionic names anonymous slices with a hardcoded 4 KiB length inside a
+/// 16 KiB host page, the same granule `mprotect` already accepts
+/// (`aim_guest_page`). `AT_PAGESZ` stays 16 KiB. This image's bionic
+/// `getpagesize` is the constant 4096 and does not read it. A 16 KiB Linux kernel
+/// would reject a start aligned only to 4 KiB; that check is what returned
+/// EINVAL for the linker's `prctl(PR_SET_VMA, 0, 0x8004ce9000, 0x8000, …)`
+/// while the mapping existed and the process continued.
+const GUEST_PAGE: u64 = aim_guest_page::GUEST_PAGE;
 
 /// `PR_SET_VMA_ANON_NAME`.
 const PR_SET_VMA_ANON_NAME: u64 = 0;
@@ -167,9 +175,27 @@ fn valid_name_char(c: u8) -> bool {
     c > 0x1f && c < 0x7f && !b"\\`$[]".contains(&c)
 }
 
+/// Linux rounds `size` up to a page and rejects a start that is not
+/// page-aligned (`prctl_set_vma`). The page here is [`GUEST_PAGE`].
+fn name_span(addr: u64, size: u64) -> Result<(u64, u64), i32> {
+    if addr & (GUEST_PAGE - 1) != 0 {
+        return Err(EINVAL);
+    }
+    let len = size.wrapping_add(GUEST_PAGE - 1) & !(GUEST_PAGE - 1);
+    if size != 0 && len == 0 {
+        return Err(EINVAL);
+    }
+    let end = addr.checked_add(len).ok_or(EINVAL)?;
+    Ok((addr, end))
+}
+
 /// `prctl(PR_SET_VMA, option, addr, size, arg)` (`prctl_set_vma`,
 /// `madvise_set_anon_name`): names the anonymous mappings of the range,
 /// or clears their names with a null `arg`.
+///
+/// A file or memfd mapping is `EBADF`. A hole in the range is `ENOMEM`
+/// after the mapped anonymous parts are named. A bad name is `EINVAL`.
+/// None of those become success.
 pub(super) fn prctl_set_vma(option: u64, addr: u64, size: u64, arg: u64) -> i64 {
     if option != PR_SET_VMA_ANON_NAME {
         return -(EINVAL as i64);
@@ -188,15 +214,9 @@ pub(super) fn prctl_set_vma(option: u64, addr: u64, size: u64, arg: u64) -> i64 
         }
         Some(String::from_utf8_lossy(&bytes).into())
     };
-    if addr & (PAGE - 1) != 0 {
-        return -(EINVAL as i64);
-    }
-    let len = size.wrapping_add(PAGE - 1) & !(PAGE - 1);
-    if size != 0 && len == 0 {
-        return -(EINVAL as i64);
-    }
-    let Some(end) = addr.checked_add(len) else {
-        return -(EINVAL as i64);
+    let (addr, end) = match name_span(addr, size) {
+        Ok(span) => span,
+        Err(error) => return -(error as i64),
     };
     if end == addr {
         return 0;
@@ -215,7 +235,11 @@ pub(super) fn prctl_set_vma(option: u64, addr: u64, size: u64, arg: u64) -> i64 
         if vma.file || vma.shmem {
             return -(EBADF as i64);
         }
-        set(&mut NAMES.lock().unwrap(), start, stop, name.clone());
+        let lo = start.max(addr);
+        let hi = stop.min(end);
+        if lo < hi {
+            set(&mut NAMES.lock().unwrap(), lo, hi, name.clone());
+        }
         cur = stop;
     }
     if cur < end || unmapped {
@@ -255,6 +279,32 @@ mod tests {
             named(&m),
             [(0x1000, 0x2000, "a".into()), (0x3000, 0x5000, "a".into())]
         );
+    }
+
+    #[test]
+    fn four_kib_slices_inside_a_host_page_are_a_name_span() {
+        // Alignment only. `0x8004ce9000` was EINVAL under a 16 KiB check and
+        // returned 0 once the granule was 4 KiB. `0x80004c5000` and
+        // `0x80002f9000` are the same kind of span; 90882eb returned EBADF
+        // because the host-page file note covered the anonymous `.bss`.
+        assert_eq!(
+            name_span(0x8004_ce90_00, 0x8000),
+            Ok((0x8004_ce90_00, 0x8004_cf10_00))
+        );
+        assert_eq!(
+            name_span(0x8000_4c50_00, 0x13000),
+            Ok((0x8000_4c50_00, 0x8000_4d80_00))
+        );
+        assert_eq!(
+            name_span(0x8000_2f90_00, 0x1000),
+            Ok((0x8000_2f90_00, 0x8000_2fa0_00))
+        );
+        assert_eq!(
+            name_span(0x8004_ce40_00, 0x450),
+            Ok((0x8004_ce40_00, 0x8004_ce50_00))
+        );
+        assert_eq!(name_span(0x100, 0x1000), Err(EINVAL));
+        assert_eq!(name_span(0x8004_ce90_01, 0x1000), Err(EINVAL));
     }
 
     #[test]

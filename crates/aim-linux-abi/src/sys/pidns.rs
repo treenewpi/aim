@@ -36,22 +36,22 @@ fn me() -> i32 {
     unsafe { libc::getpid() }
 }
 
-fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+fn bsd_info(pid: i32) -> Option<crate::hostlibc::proc_bsdinfo> {
     // SAFETY: zeroed plain data, filled by proc_pidinfo up to its size.
     unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let mut info: crate::hostlibc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<crate::hostlibc::proc_bsdinfo>() as i32;
         let n = loop {
-            *libc::__error() = 0;
-            let n = libc::proc_pidinfo(
+            *crate::hostlibc::__error() = 0;
+            let n = crate::hostlibc::proc_pidinfo(
                 pid,
-                libc::PROC_PIDTBSDINFO,
+                crate::hostlibc::PROC_PIDTBSDINFO,
                 // Zombies too.
                 1,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                (&mut info as *mut crate::hostlibc::proc_bsdinfo).cast(),
                 size,
             );
-            if n != size && *libc::__error() == libc::EINTR {
+            if n != size && *crate::hostlibc::__error() == libc::EINTR {
                 continue;
             }
             break n;
@@ -118,31 +118,85 @@ fn sweep_tables(tmp: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn context(exe: &Path) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("unreadable ({e})"));
+    let tmp = std::env::var_os("TMPDIR")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unset)".into());
+    format!("exe={} cwd={cwd} TMPDIR={tmp}", exe.display())
+}
+
+/// Sibling `aim-lock-holder` when `cargo aim` published it; otherwise this
+/// `linux-run`, which serves the same holder arguments.
+fn lock_holder(exe: &Path) -> Result<PathBuf, String> {
+    let sibling = exe.with_file_name("aim-lock-holder");
+    let sibling_exists = sibling.is_file();
+    let chosen = if sibling_exists {
+        sibling
+    } else {
+        exe.to_path_buf()
+    };
+    std::fs::canonicalize(&chosen).map_err(|e| {
+        format!(
+            "stage=lock-holder path={} (sibling aim-lock-holder exists: {sibling_exists}) {}: {e}",
+            chosen.display(),
+            context(exe)
+        )
+    })
+}
+
 fn start_watcher(init: ProcessIdentity) -> Result<(), String> {
-    let mut command =
-        std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    let exe = std::env::current_exe().map_err(|e| format!("stage=current-exe: {e}"))?;
+    let args = [
+        "--pidns-watch".to_string(),
+        init.host_pid.to_string(),
+        init.start_seconds.to_string(),
+        init.start_microseconds.to_string(),
+    ];
+    let mut command = std::process::Command::new(&exe);
     command
-        .arg("--pidns-watch")
-        .arg(init.host_pid.to_string())
-        .arg(init.start_seconds.to_string())
-        .arg(init.start_microseconds.to_string())
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
+    // Stderr stays inherited so the child's own diagnostic is visible.
     let mut child = aim_storage::inherited::stdio_only(&mut command)
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "stage=spawn-watcher {}: args={args:?}: {e}",
+                context(&exe)
+            )
+        })?;
     // Reap the intermediate helper before the guest can wait for children.
     // The watcher itself belongs to launchd, outside the guest namespace.
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let mut ready = [0];
+    let status = child.wait().map_err(|e| {
+        format!(
+            "stage=wait-watcher pid={} {}: {e}",
+            child.id(),
+            context(&exe)
+        )
+    })?;
+    let mut ready = Vec::new();
     child
         .stdout
         .take()
         .unwrap()
-        .read_exact(&mut ready)
-        .map_err(|e| e.to_string())?;
+        .read_to_end(&mut ready)
+        .map_err(|e| {
+            format!(
+                "stage=read-watcher-stdout pid={} status={status:?} {}: {e}",
+                child.id(),
+                context(&exe)
+            )
+        })?;
     if !status.success() || ready != [1] {
-        return Err("pid namespace watcher did not start".into());
+        return Err(format!(
+            "stage=watcher-startup pid={} status={status:?} ready_bytes={ready:?} (spawn succeeded; the child did not write the ready byte before exit) args={args:?} {}",
+            child.id(),
+            context(&exe)
+        ));
     }
     Ok(())
 }
@@ -154,16 +208,21 @@ pub fn watch(init: ProcessIdentity) -> io::Result<()> {
     let dir = std::env::temp_dir().join(format!("{PRIVATE}{}", init.host_pid));
     watch_table(&dir, init, || {
         let process = ProcessIdentity::running(me())?;
+        let exe = std::env::current_exe()?;
         let controller =
             aim_storage::posix_broker::Controller::start(aim_storage::posix_broker::Config {
                 endpoint: format!(
                     "dev.aim.posix.{}.{}.{}",
                     process.host_pid, process.start_seconds, process.start_microseconds
                 ),
-                holder: std::fs::canonicalize(
-                    std::env::current_exe()?.with_file_name("aim-lock-holder"),
-                )?,
+                holder: lock_holder(&exe).map_err(io::Error::other)?,
                 startup_timeout: Duration::from_secs(5),
+            })
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "stage=posix-controller {}: {e}",
+                    context(&exe)
+                ))
             })?;
         controller.bind_standalone(&dir, init)?;
         controller
@@ -210,18 +269,18 @@ fn report_ready() -> io::Result<()> {
 /// A kqueue with `init`'s exit registered, once `init` is known to run.
 /// NOTE_EXIT survives exec and PID reuse.
 fn exit_queue(init: ProcessIdentity) -> io::Result<OwnedFd> {
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return Err(io::Error::last_os_error());
     }
     let kq = unsafe { OwnedFd::from_raw_fd(kq) };
-    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let mut event: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
     event.ident = init.host_pid as usize;
-    event.filter = libc::EVFILT_PROC;
-    event.flags = libc::EV_ADD | libc::EV_ONESHOT;
-    event.fflags = libc::NOTE_EXIT;
+    event.filter = crate::hostlibc::EVFILT_PROC;
+    event.flags = crate::hostlibc::EV_ADD | crate::hostlibc::EV_ONESHOT;
+    event.fflags = crate::hostlibc::NOTE_EXIT;
     if unsafe {
-        libc::kevent(
+        crate::hostlibc::kevent(
             kq.as_raw_fd(),
             &event,
             1,
@@ -240,10 +299,10 @@ fn exit_queue(init: ProcessIdentity) -> io::Result<OwnedFd> {
 }
 
 fn wait_exit(kq: &OwnedFd) -> io::Result<()> {
-    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let mut event: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
     loop {
         match unsafe {
-            libc::kevent(
+            crate::hostlibc::kevent(
                 kq.as_raw_fd(),
                 std::ptr::null(),
                 0,
@@ -400,7 +459,7 @@ fn kill_members(directory: &std::fs::File, init: i32) -> io::Result<()> {
     loop {
         let alive: Vec<i32> = table_members_info(directory)?
             .into_iter()
-            .filter(|(p, info)| *p != init && info.pbi_status != libc::SZOMB)
+            .filter(|(p, info)| *p != init && info.pbi_status != crate::hostlibc::SZOMB)
             .map(|(p, _)| p)
             .collect();
         if alive.is_empty() {
@@ -426,20 +485,20 @@ fn kill_members(directory: &std::fs::File, init: i32) -> io::Result<()> {
 /// within 10 s.
 fn wait_exits(pids: &[i32]) -> bool {
     // SAFETY: a kqueue of our own, closed below.
-    let kq = unsafe { libc::kqueue() };
+    let kq = unsafe { crate::hostlibc::kqueue() };
     if kq < 0 {
         return false;
     }
     let mut left = 0;
     for &p in pids {
         // SAFETY: an all-zero kevent is valid.
-        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut ev: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
         ev.ident = p as usize;
-        ev.filter = libc::EVFILT_PROC;
-        ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
-        ev.fflags = libc::NOTE_EXIT;
+        ev.filter = crate::hostlibc::EVFILT_PROC;
+        ev.flags = crate::hostlibc::EV_ADD | crate::hostlibc::EV_ONESHOT;
+        ev.fflags = crate::hostlibc::NOTE_EXIT;
         // SAFETY: registering one event; a process already gone is ESRCH.
-        if unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
+        if unsafe { crate::hostlibc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
             left += 1;
         }
     }
@@ -453,9 +512,9 @@ fn wait_exits(pids: &[i32]) -> bool {
             tv_nsec: t.subsec_nanos() as libc::c_long,
         };
         // SAFETY: an all-zero kevent is valid.
-        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        let mut ev: crate::hostlibc::kevent = unsafe { std::mem::zeroed() };
         // SAFETY: waiting for one event into our buffer.
-        match unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut ev, 1, &ts) } {
+        match unsafe { crate::hostlibc::kevent(kq, std::ptr::null(), 0, &mut ev, 1, &ts) } {
             n if n > 0 => left -= 1,
             n if n < 0 && crate::errno::last() == libc::EINTR => {}
             _ => break,
@@ -467,14 +526,14 @@ fn wait_exits(pids: &[i32]) -> bool {
 }
 
 /// Whether the table's entry for `pid` names the running process `info`.
-fn entry_names(dir: &std::path::Path, pid: i32, info: &libc::proc_bsdinfo) -> bool {
+fn entry_names(dir: &std::path::Path, pid: i32, info: &crate::hostlibc::proc_bsdinfo) -> bool {
     std::fs::symlink_metadata(dir.join(pid.to_string()))
         .and_then(|m| m.modified())
         .is_ok_and(|written| written_after_start(written, info))
 }
 
 /// Whether an entry `written` then names the running process `info`.
-fn written_after_start(written: SystemTime, info: &libc::proc_bsdinfo) -> bool {
+fn written_after_start(written: SystemTime, info: &crate::hostlibc::proc_bsdinfo) -> bool {
     let started = SystemTime::UNIX_EPOCH
         + Duration::from_secs(info.pbi_start_tvsec)
         + Duration::from_micros(info.pbi_start_tvusec);
@@ -483,10 +542,10 @@ fn written_after_start(written: SystemTime, info: &libc::proc_bsdinfo) -> bool {
 
 /// The members with their host process information: this process and the
 /// live processes of the table. None without a table.
-fn members_info() -> Option<Vec<(i32, libc::proc_bsdinfo)>> {
+fn members_info() -> Option<Vec<(i32, crate::hostlibc::proc_bsdinfo)>> {
     let dir = super::cred::by_pid_dir()?;
     let me = me();
-    let mut v: Vec<(i32, libc::proc_bsdinfo)> = std::fs::read_dir(dir)
+    let mut v: Vec<(i32, crate::hostlibc::proc_bsdinfo)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
@@ -501,7 +560,7 @@ fn members_info() -> Option<Vec<(i32, libc::proc_bsdinfo)>> {
 
 /// The live processes the entries of the table `directory` name, read
 /// through its descriptor rather than its path.
-fn table_members_info(directory: &std::fs::File) -> io::Result<Vec<(i32, libc::proc_bsdinfo)>> {
+fn table_members_info(directory: &std::fs::File) -> io::Result<Vec<(i32, crate::hostlibc::proc_bsdinfo)>> {
     let mut members = Vec::new();
     for name in directory_names(directory)? {
         let Some(pid) = name.to_str().ok().and_then(|n| n.parse::<i32>().ok()) else {
@@ -558,10 +617,10 @@ fn directory_names(directory: &std::fs::File) -> io::Result<Vec<std::ffi::CStrin
     let mut names = Vec::new();
     let result = loop {
         // SAFETY: as above; errno tells the end from an error.
-        unsafe { *libc::__error() = 0 };
+        unsafe { *crate::hostlibc::__error() = 0 };
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            let errno = unsafe { *libc::__error() };
+            let errno = unsafe { *crate::hostlibc::__error() };
             break if errno == 0 {
                 Ok(())
             } else {
@@ -697,7 +756,7 @@ pub fn contains(pid: i32) -> bool {
 
 /// Whether host process `pid` exists and has not exited.
 pub fn running(pid: i32) -> bool {
-    bsd_info(pid).is_some_and(|i| i.pbi_status != libc::SZOMB)
+    bsd_info(pid).is_some_and(|i| i.pbi_status != crate::hostlibc::SZOMB)
 }
 
 /// Whether host process `pid` has exited or is exiting, and is not reaped.
@@ -705,7 +764,7 @@ pub fn ending(pid: i32) -> bool {
     // <sys/proc_info.h>: the process is working its way in exit().
     const PROC_FLAG_INEXIT: u32 = 4;
     bsd_info(pid)
-        .is_some_and(|i| i.pbi_status == libc::SZOMB || i.pbi_flags & PROC_FLAG_INEXIT != 0)
+        .is_some_and(|i| i.pbi_status == crate::hostlibc::SZOMB || i.pbi_flags & PROC_FLAG_INEXIT != 0)
 }
 
 /// Whether host process `pid` is a child of this one (zombies too).

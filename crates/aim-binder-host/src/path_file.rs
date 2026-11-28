@@ -57,9 +57,9 @@ impl CharacterReference {
         aim_storage::inode_lease::Identity {
             dev: stat.st_dev as u32 as u64,
             ino: stat.st_ino,
-            generation: stat.st_gen,
-            birth_seconds: stat.st_birthtime,
-            birth_nanoseconds: stat.st_birthtime_nsec,
+            generation: aim_storage::host::generation(stat),
+            birth_seconds: aim_storage::host::birth(stat).0,
+            birth_nanoseconds: aim_storage::host::birth(stat).1,
         }
     }
     fn lookup(directory: RawFd, name: &std::ffi::CStr) -> io::Result<libc::stat> {
@@ -90,8 +90,20 @@ impl CharacterReference {
     pub fn host(&self, directory: RawFd) -> io::Result<std::ffi::CString> {
         self.stat(directory)?;
         let mut path = vec![0u8; libc::PATH_MAX as usize];
+        #[cfg(target_os = "macos")]
         if unsafe { libc::fcntl(directory, libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let linked = std::fs::read_link(format!("/proc/self/fd/{directory}"))
+                .map_err(|error| io::Error::new(error.kind(), error))?;
+            let bytes = std::os::unix::ffi::OsStrExt::as_bytes(linked.as_os_str());
+            if bytes.len() + 1 > path.len() {
+                return Err(error(libc::ENAMETOOLONG));
+            }
+            path[..bytes.len()].copy_from_slice(bytes);
+            path[bytes.len()] = 0;
         }
         path.truncate(
             path.iter()
@@ -151,7 +163,7 @@ fn actual_path(fd: RawFd) -> io::Result<()> {
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    if flags & libc::O_EVTONLY == 0 {
+    if flags & aim_storage::host::O_EVTONLY == 0 {
         return Err(error(libc::EINVAL));
     }
     Ok(())
@@ -351,7 +363,7 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         let name = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-        let fd = unsafe { libc::open(name.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+        let fd = unsafe { libc::open(name.as_ptr(), aim_storage::host::O_EVTONLY | libc::O_CLOEXEC) };
         assert!(fd >= 0);
         (path, unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -371,7 +383,7 @@ mod tests {
         let directory = unsafe {
             libc::open(
                 c"/dev".as_ptr(),
-                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                aim_storage::host::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         assert!(directory >= 0);

@@ -5,6 +5,740 @@ aim-guest-init on the syscall layer (ADR 0012, tracking #153). Update it
 with every boot-relevant change: the table, the date and the run it came
 from.
 
+Original `/system/bin/init` on macmini (commit `9eacf04`, macOS 26.5.1,
+Darwin 25.5.0, arm64, 16 KiB pages) printed both stage logs to `[kmsg]`.
+Guest init created the property sockets and exited 6. This is not a boot
+and there is no `init ok`. The first failed syscall, which the process
+survived, is still `newfstatat("/dev/__properties__")` returning ENOENT
+at call 66. The bound-socket `openat` of
+`/dev/socket/property_service_for_system` with flags `0x288000` returned
+a new `Kind::Path` distinct from the bind socket. `fchmod` on that fd
+returned `-EBADF`, `F_GETFL` returned `0x208000`, and the proc-fd
+`fchmodat` fallback returned 0. `listen` on the bind socket returned 0.
+`openat("/proc/mounts")` returned a fd and `epoll_ctl` ADD of it returned
+0. On `9eacf04` that ADD is call 6091. `epoll_pwait` on epfd 4 (call 6228,
+timeout 0) then returned fd 12 with mask `0xa` after the mounts at calls
+6118-6141. Init's property service (tid 100001) stayed alive beside the
+leader (tid 100000).
+`SetupMountNamespaces` completed on `9eacf04`: `openat("/proc/self/ns/mnt")`
+returned fd 13 (call 6134), `readlinkat` returned `mnt:[268435457]` (call
+6135), `unshare(CLONE_NEWNS)` returned 0 (call 6137), the second `openat`
+returned fd 15 (call 6138), `readlinkat` returned `mnt:[268435458]` (call
+6139), and `setns(13, CLONE_NEWNS)` returned 0 (call 6140). kmsg:
+`SetupMountNamespaces done`. Linux `mntns_install` returns `EINVAL` only
+when `current->fs->users != 1`, and `unshare(CLONE_NEWNS)` implies
+`CLONE_FS`, so the caller can switch back while the other thread stays in
+the namespace it already had. The fd opened before `unshare` stays the
+namespace it named at open, and `readlink` of that fd keeps that inode.
+vendor_init's `setns` `EINVAL` on `9eacf04` was an empty child
+namespace table, and on `96f65ff` `setns` returned 0 then `readlink` of
+`/proc/self/exe` returned `EIO` and `execve` of an empty path returned
+`ENOENT`. Those are not the current stop. The parked journal keeps its
+mount records, a plain `/proc` content fd is in the fork image, and an
+evdev socket is adopted from the inherited fd. A binder file's mach send
+right is not in that socket. On `43f94a33` (archive
+`d2c89ce113b2528f221179295b6609e2a55dfaebbf81f83ae59a85f7fa832742`, lock
+unchanged, `--offline`) main init stays up through the harness bound
+(8.1s). `kptr_restrict` writes of 4 and 3 return `EINVAL` and 2 persists;
+the read-back is `2\n`. Second stage runs, both property sockets exist,
+and `SetupMountNamespaces` completes. The actions that finished are
+`SetupCgroups`, `SetKptrRestrict`, `TestPerfEventSelinux`,
+`ConnectEarlyStageSnapuserd`, and `wait_for_coldboot_done`. This is not
+a boot and there is no `init ok`.
+
+Each vendor_init child (clone `0x1200011`) does `setns(15, CLONE_NEWNS)`
+with result 0 (call 7), `readlink("/proc/self/exe")` returns
+`/system/bin/init`, and `execve` of that path succeeds. The new image's
+linker then gets `ENOENT` for `/linkerconfig/ld.config.txt` (call 126)
+and the other `ld.config` paths, then `ENOENT` for `libc.so` under
+`/system/lib64/bootstrap`, `/system/lib64` (call 307), `/odm/lib64`, and
+`/vendor/lib64`, and exits with `CANNOT LINK EXECUTABLE`. The 479
+restarts are that failure repeating.
+
+On `850846a` (archive
+`87ff9070e16826be4928f9f7a0bec625d4cf4fa251fbb0bcb0fbe4a76a989d52`) the
+parent's second-stage exec is call 1185, before the tmpfs mounts at
+calls 5953, 5955, and 5956. That process links through the image
+`linkerconfig/ld.config.txt` and the `system/lib64/libc.so` symlink into
+`/apex`. The vendor_init child execs after those mounts, so the tmpfs
+hides both. That is the Android order. The tmpfs is unchanged.
+`unshare(CLONE_NEWNS)` copies the full table from that moment, including
+the empty `/linkerconfig` and `/apex` tmpfs. `/system` is not one of
+those mounts, so it stays the image root. `setns` installs that table
+and sets cwd to `/`. An absolute lookup does not use cwd.
+
+Both sides open `/system/lib64/bootstrap/libc.so` first. The traced host
+is `_build/redroid-16-init/root/system/lib64/bootstrap/libc.so`, area
+`image`, and the result is `ENOENT`. That directory in the prepared root
+contains only `libdl_android.so`. The pinned layer
+(`efbc1c6b9440932189927a386ba3fc991f8a6b88bb8f56f1fd9b26ee8d7475b6`,
+733630886 bytes) stores the bootstrap set as regular files, not
+symlinks and not hardlinks: `libc.so` 1208608 bytes, `libm.so` 248968,
+`libdl.so` 50760, `libdl_android.so` 34672. The layer has no hardlink
+entries at all. `system/lib64/libc.so`, `libm.so`, `libdl.so`, and
+`libdl_android.so` are symlinks to
+`/apex/com.android.runtime/lib64/bionic/`. prepare kept the bootstrap
+`libdl_android.so` because that basename was not already in the bionic
+root, and dropped the other three because `find_lib` treated the
+`system/lib64` symlink as the library. `prepare-init` copies the
+layer's own files and fails unless each path matches the layer's type,
+size, and hash. It still does not copy `dev/__properties__`, children of
+`linkerconfig`, or children of `bootstrap-apex`, and it does not copy a
+device node. It does not invent a library the layer lacks. `/linkerconfig`
+and the tmpfs mounts are unchanged.
+
+On `2089ec5` (archive
+`4f524c8f2ba65c0eabed0d4d6b6b83c4cc787d47dff01f205fad95c73086e550`)
+prepare-init exited 1 after 21.6s. Its only line was
+`system/product/media/audio/notifications/Arcturus.ogg size root 7908 layer 7933 header 7933`.
+The root file's sha256 is
+`6487240c9d6dffe7c569ca12079d2c8d41a28af50b30d471eae9a3e2e377fa96`.
+Bootstrap `libc.so`, `libm.so`, and `libdl.so` are present with the
+layer hashes. The layer entry for `Arcturus.ogg` is a regular file,
+type flag `0`, 7933 bytes, sha256
+`2492fa4d4e84afff3c9a6ad378ba12b43e3018c7ae7d04ac12f15e005361e4c4`,
+with no pax header and no sparse map, at offset 1325846016. The same
+directory also has `arcturus.ogg`, a regular file of 7908 bytes later
+in the tar (offset 1327043072). That file's sha256 is the root hash
+above. The layer has seven such pairs and no other case-only
+collisions. macOS APFS is case-insensitive, so the later write replaces
+the earlier file. prepare-init now stops before copying when the root's
+volume is case-insensitive (`pathconf(_PC_CASE_SENSITIVE)` on macOS,
+and a probe file). linux-run probes the guest root of every round, including a round
+with no path map, and it probes the writable directories, kernfs host
+trees, `<runtime>/tmpfs`, socket directories, scratch, and `TMPDIR`.
+A folding volume fails startup and the message names each directory.
+`<runtime>` (`<data>.run`) is not inside the data image. A linux-run
+without a path map keeps its runtime in `TMPDIR`. Archive
+`c2c05f4c5c152be64684ec32478df657d5267054b3546a819caebfa35689ff6b`
+refused `_build/redroid-16-property/root` because that root was on the
+default volume. The worktree, every `_build` root, and `TMPDIR` belong
+on one case-sensitive APFS sparse image. Mounting an image only on
+`_build/redroid-16-init` leaves the other roots on the default volume.
+Archive
+`b88ba955e98f48f3549330c69e88a1a0d4ff8aa24e4d40030a7971cdc6537f61`
+had the worktree on that image and the probe passed.
+APFS stays normalization-insensitive on a case-sensitive volume: NFC
+and NFD of one name are one file, and Linux compares bytes. The pinned
+layer's 3743 paths are all ASCII. An offline NFC and NFD comparison
+(Unicode 15.0.0) finds 0 collisions. `Cargo.lock` has no normalization
+crate (`unicode-ident` only), so prepare does not add one and does not
+recompute that count. The lock stays
+`7c5398c25903c8b014fdb094b5113fc2b4195ccff481b01f48678bf12cde1ac5`.
+A path the bionic root already holds is a conflict when
+its type or content differs. The only covered conflict is a member
+`prepare` staged from this layer: the layer entry is kept and the
+manifest records both sides. Any other difference fails and the
+existing bytes stay. On this layer those staged members match, so the
+conflict list is empty.
+
+`unshare(0x2000000)` (`CLONE_NEWCGROUP`, around
+call 1065) returns `EINVAL`. Linux would return 0 with `CAP_SYS_ADMIN`
+(since 4.6). This is the unsupported-namespace gate (ADR 0012). Init has
+the capability and continues. A cgroup namespace is not invented here.
+`kptr_restrict` stays mode 0644, 0..=2, default 0. `mmap_rnd_bits`
+(18..=24) and `mmap_rnd_compat_bits` (0..=16) are the same kind of file.
+Guest mmap does not consult those two values. A shared file map whose
+offset is a multiple of 4096 but not of 16384 is the enclosing host
+pages, and the pointer is `base + (offset & 0x3fff)`. It stays a real
+`MAP_SHARED` of the file. `MAP_FIXED` `MAP_SHARED` whose address and offset disagree
+modulo 16 KiB returns `EINVAL` and is not replaced by a copy.
+`MAP_PRIVATE` at that residue is a copy at any protection, and the
+trace names the range as not a file mapping. A `PROT_EXEC` copy is
+filled read-write and then `mprotect`'d so it is never writable and
+executable at once. A later `mprotect` that would make a copy both
+writable and executable returns `EINVAL`. On archive
+`b88ba955e98f48f3549330c69e88a1a0d4ff8aa24e4d40030a7971cdc6537f61`,
+property-r1's getprop-after child loaded `/system/lib64/libc++.so`.
+`mmap(0x8006281000, 0x7fd80, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED, fd, 0x77000)`
+was copied. `mmap(0x8006304000, 0x7c88, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED, fd, 0xf6000)`
+returned `EINVAL` from the writable-copy refusal; that refusal is gone.
+That library's four `PT_LOAD` headers have `p_align` `0x4000`, and
+`(p_vaddr - p_offset) mod 16384` is 0 for every one of them
+(`0/0`, `0x7b8c0/0x778c0`, `0xfed80/0xf6d80`, `0x109c88/0xfdc88`).
+One load bias congruent to 0 modulo 16 KiB would make every segment a
+file mapping. The bias reconstructed from those calls is
+`0x8006206000`, which is `0x2000` modulo 16 KiB. The image's
+`/apex/com.android.runtime/bin/linker64` (`getpagesize` is `mov w0, #0x1000`)
+loads at a 4 KiB page. It took the normal file-map path, not compat
+mode: compat reads the segment with `pread` into the anonymous
+reservation (`ElfReader::CompatMapSegment` in
+`linker/linker_phdr_16kib_compat.cpp`). This binary has no
+`bionic.linker.16kb.app_compat.enabled` string. AOSP
+`android-16.0.0_r1` `ElfReader::Read` in `linker/linker_phdr.cpp`
+enables compat when `page_size() == 16384`, `min_align_ == 4096`, and
+that property or `get_16kb_appcompat_mode()` is set, and
+`ElfReader::LoadSegments` otherwise refuses a smaller `min_align_`.
+`ReserveAddressSpace` then steps the reservation by `page_size()`.
+A 16 KiB-aligned `mmap(NULL)` does not choose this linker's bias.
+A guest page that starts at or after EOF is mapped, and a touch raises
+`SIGBUS`. A past-EOF 4 KiB slice that shares its 16 KiB host page with
+a slice that still contains file bytes stays that shared mapping, and
+Darwin zero-fills the past-EOF slice.
+`mprotect` tracks each 4 KiB slice. The host page's protection is the
+read bits of every slice on it, write if any slice asks for write, and
+execute only when some slice asks for execute and none asks for write,
+including another module's data and an anonymous mapping. Write and
+execute are never set together. When the last writable slice is dropped,
+by RELRO `mprotect`, `munmap`, or a new `mmap`, execute is restored and
+`sys_icache_invalidate` covers the whole 16 KiB page. An instruction
+fetch from a slice that wants execute while a neighbor wants write is
+`SIGSEGV` `SEGV_ACCERR` at that address. The diagnostic names the module
+and slice that wanted execute, the module and slice that holds write,
+the thread, the syscall that established each slice, and that slice's
+guest protection history. `PROT_NONE` is not write. A non-fixed mmap
+starts on a host-page boundary and does not reuse another mapping's
+leftover 4 KiB slices. Sharing a host page is only for a guest
+`MAP_FIXED`. A request that itself asks for write and execute stays
+`EINVAL` on a private copy. On `8735777ad` (archive
+`7333a5273cea919b4ec9d8af4b8b70d6e28bf178583037b3cab8c9899cbb4e9e`)
+property-r1 exited 1 after libbase, libc++, libc, libm, libdl, and
+liblog loaded, with no `CANNOT LINK`. Sixteen host-protection
+transitions ran and none restored execute. The fetch at `0x8009fdc9f0`
+is libc text (`mmap(0x8009f50000, 0x8cc30, R|X, PRIVATE|FIXED, fd 5,
+off 0x58000)`, guest end `0x8009fdcc30`). The slice at `0x8009fdd000`
+is not libc `.bss`: that LOAD has `p_filesz == p_memsz == 0x8cc30`, so
+`ElfReader::MapBssSection` does not mmap it, and the trace has no mmap
+of that address. It is the `PROT_NONE` anonymous reservation
+`ReserveWithAlignmentPadding` leaves between this segment and the next
+LOAD at `0x8009fe0000`. The fill of the text slice had recorded that
+gap as writable. `crash_dump64` then returned `ENOENT` and the signal
+was re-raised. The runtime apex payload contains `bin/crash_dump64`
+(511608 bytes); the guest's `/apex` does not, so
+`/apex/com.android.runtime/bin/crash_dump64` stays absent. `MAP_SHARED` residue mismatch stays
+`EINVAL`. On archive
+`778450d18ce8ff9affccd49ffd3f8bec461ade7feaf010bc710f07402e594487`,
+property-r1's getprop-before failed to link `liblog.so`: bias
+`0x8005c47000` is 12288 modulo 16 KiB, and the private copy of the GNU
+RELRO segment returned `EINVAL` because that host page was still
+executable. That refusal is the cross-slice case this model allows.
+AOSP `android-16.0.0_r1` `soinfo::link_image` relocates, then
+`protect_relro` (`phdr_table_protect_gnu_relro` to `PROT_READ`), and
+only then does `soinfo::call_constructors` run `DT_INIT` and
+`DT_INIT_ARRAY` (`linker/linker.cpp`, `linker/linker_phdr.cpp`,
+`linker/linker_soinfo.cpp`, `linker/linker_main.cpp`). The library's own
+constructors do not run during its RELRO window. `msync` accepts a 4 KiB
+address and syncs the covering host pages. `AT_PAGESZ` stays 16384.
+This image's bionic `getpagesize` and `sysconf(_SC_PAGESIZE)` are
+`mov w0, #4096; ret` and do not read `AT_PAGESZ`. The linker steps
+reservations by that 4096. A static scan of the layer's native ELF files, including the apex
+libraries, found one `getauxval(6)` (`AT_PAGESZ`): `system/lib64/libclang_rt.asan-aarch64-android.so`,
+which also calls `getauxval(7)` (`AT_BASE`). Apex and bootstrap libc
+call `getauxval` with 16, 26, 25, and 33. The linker's `__dl_getauxval`
+callers pass 3, 5, 7, 9, 16, 23, 25, 26, and 33. `libart.so` and
+`libartbase.so` pass 16 and 26; the `libart` thunk is called with 16 and
+26. `libfcp_cpp_dep_jni.so` and
+`libtflite_support_classifiers_native.so` pass 16 and 26 as well. The
+string `AT_PAGESZ` in `linker64`, `linker_asan64`, and
+`linker_hwasan64` is the `ld_show_auxv` name table, not a page-size
+read. No scanned file contains `jemalloc`. Scudo's page size in this
+libc is `sysconf(_SC_PAGESIZE)`, which is the constant 4096.
+`AT_PAGESZ` is not changed. Thirty-eight ELFs still place an executable byte and a byte
+that stays writable after GNU RELRO on one 16 KiB page at some 4 KiB
+bias. Bias 0 is safe for every oat and odex in that set. The files are
+`system/app/KeyChain/oat/arm64/KeyChain.odex`,
+`system/app/WallpaperBackup/oat/arm64/WallpaperBackup.odex`,
+`system/framework/arm64/boot-bouncycastle.oat`,
+`system/framework/arm64/boot-core-icu4j.oat`,
+`system/framework/arm64/boot-framework.oat`,
+`system/framework/arm64/boot-okhttp.oat`,
+`system/framework/arm64/boot.oat`,
+`system/framework/oat/arm64/apex@com.android.adservices@javalib@service-adservices.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.adservices@javalib@service-sdksandbox.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.appsearch@javalib@service-appsearch.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.bt@javalib@service-bluetooth.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.configinfrastructure@javalib@service-configinfrastructure.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.devicelock@javalib@service-devicelock.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.healthfitness@javalib@service-healthfitness.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.media@javalib@service-media-s.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.os.statsd@javalib@service-statsd.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.permission@javalib@service-permission.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.profiling@javalib@service-profiling.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.tethering@javalib@service-connectivity.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.uwb@javalib@service-ranging.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.uwb@javalib@service-uwb.jar@classes.odex`,
+`system/framework/oat/arm64/apex@com.android.virt@javalib@service-virtualization.jar@classes.odex`,
+`system/framework/oat/arm64/com.android.location.provider.odex`,
+`system/framework/oat/arm64/org.apache.http.legacy.odex`,
+`system/priv-app/FusedLocation/oat/arm64/FusedLocation.odex`,
+`system/priv-app/SettingsProvider/oat/arm64/SettingsProvider.odex`,
+`system/priv-app/Telecom/oat/arm64/Telecom.odex`,
+`vendor/bin/uinputd`,
+`vendor/bin/vncserver`,
+`vendor/lib64/hw/gralloc.gbm.so`,
+`vendor/lib64/hw/hwcomposer.redroid.so`,
+`vendor/lib64/libdrm.so.2`,
+`vendor/lib64/libdrm_amdgpu.so.1`,
+`vendor/lib64/libdrm_etnaviv.so.1`,
+`vendor/lib64/libdrm_freedreno.so.1`,
+`vendor/lib64/libdrm_nouveau.so.2`,
+`vendor/lib64/libdrm_radeon.so.1`,
+and `vendor/lib64/libvncserver.so`.
+`vendor/etc/init/vncserver.rc` defines `vendor.vncserver` as `disabled`
+and starts it only when `ro.boot.use_redroid_stream` is 1 and
+`ro.boot.use_redroid_vnc` is 1. Neither property is in the image.
+`vendor/bin/vncserver` needs `libvncserver.so`, not the libdrm files.
+No init `.rc` names `libdrm.so.2`, `libdrm_amdgpu.so.1`,
+`libdrm_etnaviv.so.1`, or `libdrm_radeon.so.1`. Nothing in the layer
+references `libdrm_etnaviv.so.1`. `libdrm_radeon.so.1` is needed by
+`libgallium_dri.so`. `libdrm_amdgpu.so.1` is needed by that and
+`vulkan.radeon.so`. `libdrm.so.2` is needed by those, Mesa EGL,
+`gralloc.cros.so`, `libgbm.so.1`, and the other Vulkan drivers.
+`vendor/etc/init/redroid.common.rc` runs `gpu_config.sh` on `early-boot`,
+before HAL and SurfaceFlinger. With `ro.boot.redroid_gpu_mode` unset the
+script takes guest mode and sets `ro.hardware.gralloc` to `redroid`.
+`gralloc.redroid.so` and `hwcomposer.redroid.so` do not need libdrm.
+Those five bias-0 files are not on the default boot path, so they are
+non-blocking for boot. They are not fixed. The other thirty-three
+strict collisions stay open. `reboot` (arm64 142) kills
+this namespace init: `SIGHUP` for `RESTART` and `RESTART2`, `SIGINT` for
+`POWER_OFF` and `HALT`. The diagnostics line and
+`<runtime>/reboot-reason` record `guest-requested reboot:` plus the
+argument. `703f2a48edcb4367cd2707c90ed6efdbe4fd79e8` (archive SHA256
+`a9126d37608a11b9aad3ddf630db5f6cbbd43668b46ab3fc044d78cf54a789bb`)
+remeasured init after the `PROT_NONE` reservation fix. Every step
+exited 0. Property 8 roles, integrated x2, android, and libbinder
+passed. Init made 3716 transitions and 267 icache flushes, with 0
+`SEGV_ACCERR` and no `CANNOT LINK`. It reached second stage
+(`SetupMountNamespaces`, vendor_init pid 54084, `SetupCgroups`,
+`SetKptrRestrict`, `TestPerfEventSelinux`, early-init). sysrq and
+modprobe writes got `EACCES` and init continued. ueventd started.
+apexd-bootstrap started as `SVC_EXEC`, mapped
+`/vendor/apex/com.android.hardware.cas.apex` `MAP_SHARED` at offset
+`0x5a000`, found 38 APEXes and the bootstrap set (runtime, i18n, virt,
+tzdata), and logged `Need to pre-allocate 39 loop devices`. It then
+looped `newfstatat("/dev/loop-control") = ENOENT` 1270 times until the
+harness's 8 second limit. No reboot.
+`63008084d55ca0d2065100aa7a29fa5913e1d755` (archive SHA256
+`3a54ba4da8ba39f1d430c3d3bb262542e5aa3f1d231ac6f7053eaf8cdf1aeb64`)
+remeasured that path. Every step exited 0 and `--init-timeout 90` was
+accepted. `/dev/loop-control` stat and open succeeded (fd 5). Every
+ioctl returned `ENOTTY`: `LOOP_CTL_ADD` `0x4c80` (first failure, call
+3662), `LOOP_CTL_GET_FREE` `0x4c82` (2232 times), `DM_DEV_CREATE`
+`0xc138fd03` (35 times), and init's `DM_DEV_STATUS` `0xc138fd07` (4
+times). The trace has no `DM_VERSION` (`0xc138fd00`) before
+`DM_DEV_CREATE`. apexd-bootstrap exited 1 and init rebooted with
+`reboot,bootloader,bootstrap-apexd-failed` after 4.7s. No mount ran, so
+ext4 and verity were not exercised. ioctl now follows the device number
+stored at open (`10:237` loop-control, `10:236` device-mapper, `7:N`
+loop). `7e68fcab960a6fa53d62ee85189d68022613b481` (archive SHA256
+`3d89f69c06060d96c6e619355d8882fdd983f496db443bfda96faa1a4eaa23f9`)
+remeasured that dispatch. Every step exited 0. apexd-bootstrap mounted
+runtime, i18n, tzdata and virt (`MS_RDONLY|MS_NODEV|MS_DIRSYNC|MS_NOATIME`
+plus a bind) and exited 0: `Activated 4 packages`. `LOOP_CTL_ADD` was
+`EEXIST` eight times then 31 successes, `LOOP_CTL_GET_FREE` returned
+0..3, `LOOP_CONFIGURE` succeeded, and `DM_DEV_CREATE` / `DM_TABLE_LOAD`
+succeeded 35 times. Init then rebooted after 1.8s with
+`reboot,boringssl-self-check-failed`. The first failure in that archive
+was `clone(0x1200011)` = `ENOENT`.
+`391705d3076d482207f7d9bad26eefed40f0f451` (archive SHA256
+`4f0bf95ac8cf4da4178afbd5158e68864475766d4039c27ce5c0f4734e427184`)
+remeasured it. Every step exited 0. 43 forks, no `clone` `-2`, and both
+boringssl self-tests exited 0. Init reached post-fs, then vold aborted
+(`hw-ProcessState: Binder driver could not be opened`, `/dev/hwbinder`
+`-19` `ENODEV`) and init rebooted `reboot,vold-failed` at 5.0s. The
+init probe had not been given a binder host, so `/dev/binder`,
+`/dev/hwbinder`, `/dev/vndbinder` and `/dev/binderfs/{binder,hwbinder,vndbinder}`
+were `ENODEV`. `mount` of fstype `binder` was `ENODEV`, so
+`binder_alloc`'s `/dev/binderfs/binder-control` was `ENOENT`. The probe
+now starts `aim-binderd` beside `linux-run` and passes `--binder`. A
+`binder` mount creates `binder-control`, and `BINDER_CTL_ADD` of
+`binder`, `hwbinder` or `vndbinder` creates that context's node. Another
+name is `ENODEV`. A node that was not allocated stays `ENOENT`. Opening
+an allocated node with no binder host stays `ENODEV`. `/dev/binder`,
+`/dev/hwbinder` and `/dev/vndbinder` stay the same driver when a host
+is connected, which is how the standalone servicemanager steps open
+them. `aim-pty-holder` was not in `target/release`. `/dev/ptmx` is that
+helper (`posix_openpt`, `TIOCGPTN`, `TIOCSPTLCK`, `/dev/pts/N`); a
+missing helper is `ENODEV`. The early `mknod` of `/dev/ptmx` is `EPERM`
+because a device node is not created on the host. The open does not use
+that node: `/dev/ptmx` is the host device path. `/dev/hw_random` reads
+`getentropy`. `LOOP_CONFIGURE` of a backing fd that is not open in the
+process is `EBADF`. `DM_DEV_STATUS` of a device the catalog does not
+have is `ENXIO`.
+`e7f4e7f97b5a60521ddaecf83c175635d0ea247d` (archive SHA256
+`cc6d9eb74292349b95cda47e6284d67c7a7cbec5a6d9e410643d709b6e4550bc`)
+remeasured that. `aim-pty-holder` and `aim-binderd` built offline.
+`/dev/ptmx` opened, linkerconfig wrote `/linkerconfig/ld.config.txt`,
+and `/dev/hw_random` opened. `binder_alloc` (pid 59540) opened
+`/dev/binderfs/binder-control` as fd 3 and
+`ioctl(0x3, 0xc1086201, ...)` returned `-22` `EINVAL` (`Failed to
+allocate new binder device`, exit 1). The nodes were never created, so
+init's `/dev/binderfs/{hwbinder,binder,vndbinder}`, servicemanager's
+`/dev/binder`, and hwservicemanager's and vold's `/dev/hwbinder` were
+`ENOENT`. vold aborted and init rebooted `reboot,vold-failed` after
+post-fs at 6.4s. `struct binderfs_device` is `char name[256]`, then
+`__u32 major`, then `__u32 minor` (264 bytes, the `0x108` in the ioctl).
+The name was read at offset 8. `binder` is seven bytes including its
+NUL, so that read was an empty string and the old `allocate` returned
+`EINVAL`. The ioctl copies all 264 bytes in and, after a successful
+add, copies them back with major and minor at offsets 256 and 260.
+`EINVAL` is only a name with no NUL in the first 255 bytes, or a `/`
+before that NUL. An existing context is `EEXIST`. The binderfs root
+then holds `binder`, `hwbinder` and `vndbinder`, and init's
+`/dev/binder` symlink to `/dev/binderfs/binder` (and the `hwbinder` and
+`vndbinder` twins) resolves to those nodes. The trace names the reason
+and the node.
+The ioctl reaches the control handler because the fd's kind is
+`BinderControl`, copied onto the pin; the host fd is `/dev/null` and
+its rdev is not `10:58`. A forked child is `linux-run --fork-child`
+with the parent's `--binder`, and that process connects before the
+guest resumes. `binder_alloc` reached the ioctl, so the connect had
+returned. The trace line names the device. `libnativeloader.so` is in
+the art APEX and `libstatspull.so` is in the statsd APEX. apexd-bootstrap
+does not activate those. Full apexd is `restart apexd` in `post-fs-data`,
+which then waits for `apexd.status` `activated`. `on zygote-start` is
+queued after that and starts zygote; `on nonencrypted` does
+`class_start main`, which starts mediaserver. linkerconfig's
+`ld.config.txt` names those APEX directories. They are absent until
+apexd mounts them, so the linker reports the libraries missing. `4f2593f1b36261a6ba6109650b844c7a595a4c63` (archive SHA256
+`64cc6c39f4cee6b0d9ebca02de2d32c3f502efc17c97e6a89a914c9bd6c08271`)
+remeasured that name fix. `BINDER_CTL_ADD` returned 0 three times. init,
+servicemanager, hwservicemanager and vold opened binder. vold stayed up
+and init reached post-fs-data. `setns` into the default mount namespace
+returned 0, the linkerconfig bind ran, and kmsg said `Switched to default
+mount namespace`. Every fork child then failed
+`/apex/com.android.runtime/bin/linker64` with errno 19 (the trace printed
+`(E?)`) and `/apex` still the empty tmpfs copied at `unshare`. vdc, logd
+and apexd failed the same way (exit 127) and init rebooted
+`reboot,apexd-failed` at 6.2s. `a2c2215221e1ebd92c3d0fe72850e6e5cf278961`
+(archive SHA256
+`03d3d380b19bdb417b70fc2113deee74178bc38da909254b692ed80e2d4f0e01`)
+remeasured the shared-subtree fanout. Init still reaches post-fs-data and
+reboots `reboot,apexd-failed` at 6.3s. Call 6799 is
+`mount(NULL, "/apex", NULL, MS_PRIVATE)` in the only namespace, before
+`unshare`. Call 6819 `setns` returns to the bootstrap namespace, and call
+6820 bind-mounts `/bootstrap-apex` onto `/apex` there. The default
+namespace's `/apex` is that private tmpfs and must stay empty. Bootstrap
+APEXes are mounts under the bind, so they belong on `/bootstrap-apex` in
+both namespaces: `/bootstrap-apex` stayed shared when `/` was made
+`MS_SHARED|MS_REC`, and the bind joins that peer group. The fanout wrote
+them onto the default `/apex` instead (`runtime` at `apex-mounts/1`).
+That path is rewritten onto the peer. The ext4 tree is the mount's
+superblock: a namespace copy reads the installed directory and does not
+open the loop or dm device again. The fork-child line stats
+`/apex/com.android.runtime/bin/linker64` and reads its first page, and
+names the superblock path separately, so a later log can tell a walk
+`ENODEV` from a read `ENODEV`. `execve` logs the program's `PT_INTERP`
+the same way. The image on this machine has no `apexd`, `vdc` or `logd`
+binary, so those interpreters were not read here. AOSP's apexd is a
+bootstrap binary (`PT_INTERP` `/system/bin/bootstrap/linker64`); logd is
+not. `mount` traces a null source, fstype or data pointer as `NULL` and
+decodes the flag word. errno 19 is `ENODEV`. The first logd `execve`,
+pid 61672, before the namespace switch, returned `-13` at stage
+`interpret`. That stage classifies the program, before `PT_INTERP` is
+opened. The trace names `reason=host-access` or `reason=not-regular`,
+the host `access(X_OK)` errno, the guest execute bit for the filesystem
+uid (1036) and whether a directory search was recorded. File
+capabilities and a security label are not checked there.
+`6a3aa4beba30f31f9a15ec1fe84936d7eccfab00` (archive SHA256
+`b555775f0f294f0dfcefd0522ed743724d8357ea2d493e86a51b5a3c2900ad07`)
+remeasured the private `/apex` layout. Init still exits
+`reboot,apexd-failed` at 6.303s. It is not a boot. After `setns` the
+default `/apex` is the empty private tmpfs and `/bootstrap-apex` holds
+the bootstrap binds and ext4. The parent still walks `/system` and
+`/data`. A plain fork (`clone` flags `0x1200011`, not `CLONE_NEWNS`)
+then fails `/system`, `/dev/null`, `/proc/self/ns/mnt` and
+`/etc/cgroups.json` with errno 19, and vdc, logd and apexd execve fail
+the same way (exit 127). The child's first inode is the parent's
+bootstrap inode. Retargeting the child onto the default namespace
+removed that inode while the journal owner still named it, and
+materializing the inherited bootstrap namespace reused it. The next
+lookup parked the live journal onto the bootstrap namespace and left
+the view empty, so `refresh_fuse_mounts` returned `ENODEV` before the
+walk. The mount table itself still held the empty `/apex` tmpfs.
+`retarget_namespace` moves the journal owner with the namespace.
+`d4b119c9a8d609be09d777becacc37324f3d0d97` (archive SHA256
+`9cc018345ca4016e7e8e646c1a733e5390db14ed13d5c5412b403bd27373938a`)
+remeasured that. It is not a boot. Init ran 11.994s and rebooted
+`reboot,bpfloader-failed`. After `setns`, a plain fork walks
+`/system`, opens `/dev/null` and reads `/proc/self/ns/mnt`. vdc and
+formal apexd exec, apexd activates 35 packages, and art_boot exits 0.
+bpfloader (`/apex/com.android.tethering/bin/netbpfload`) then opens
+`/proc/sys/kernel/unprivileged_bpf_disabled` `O_WRONLY|O_CLOEXEC` and
+gets `EACCES`. That file is mode 0644, values 0, 1 and 2, default 2,
+and 1 locks until the boot ends. A write needs `CAP_SYS_ADMIN`; an
+unprivileged open for write is `EACCES`. NetBpfLoad next writes
+`/proc/sys/net/core/bpf_jit_enable` (1 only, the 6.12
+`CONFIG_BPF_JIT_ALWAYS_ON` value) and `bpf_jit_kallsyms`.
+`14377e2187894241e7b6066060e01097ccd2c816` (archive SHA256
+`d282826b95150aa21e52360a43b32f3e86257080085342da29b46fa9639f7e19`,
+init 2026-11-26 08:53:26 Asia/Kuala_Lumpur) remeasured that. It is not
+a boot. Init ran 11.925s and rebooted `reboot,bpfloader-failed`.
+Formal apexd activated 35 packages, including `com.android.art`, and
+art_boot exited 0. NetBpfLoad (pid 64660, uid 0) wrote
+`unprivileged_bpf_disabled` `0`, `bpf_jit_enable` `1` and
+`bpf_jit_kallsyms` `1`. Each `openat` returned 3 and each write
+returned 2. The stop moved. First-stage `mount("sysfs", "/sys",
+"sysfs", 0)` is `ENODEV`. A later remount returns 0 and does not
+install sysfs: every `/sys` lookup is the image
+(`.../root/sys/...`). `mount("bpf", "/sys/fs/bpf", "bpf",
+MS_NOSUID|MS_NODEV|MS_NOEXEC)` is `ENOENT` at call 10411.
+`resolve` names that image path when `bpf` is absent; it does not
+itself return `ENOENT`. The mount point was created only when the
+area was kernfs or writable, which the Linux unit set up and the Mac
+image is not. NetBpfLoad's `mkdir("/sys/fs/bpf/tethering")` is
+`ENOENT`. `bpf()` was not called. Writing `0` to
+`unprivileged_bpf_disabled` is the Android V+ value and is not a bug.
+`46ac521f9d2055bef529d7950c4833967fd50d3d` (archive SHA256
+`dfbd4f4a3418b4888ebd2f15e2c24130248098494a746cad6ba507d287a111a0`,
+SHA256SUMS `caf27b966144fad4cc099ab834a46c437bf9be05b5c367a84c70993fba87c8be`,
+started 2026-11-26 09:07:15 Asia/Kuala_Lumpur) did not reach init.
+`linux-run` exited 101: `st.st_mode` is `u16` on Darwin and the new
+`stat` helper returned `u32` (`E0308` at `mount.rs:156`). That
+approach, mounting bpffs over a missing image path, is not the fix.
+`mount` of fstype `sysfs` installs a kernfs. Its host directory
+has the kernel's top-level mount points, including `/sys/fs`, and
+`sysfs_create_mount_point` for `/sys/fs/bpf`. Nothing is created in
+the image. Init's `mount` of fstype `bpf` on that existing directory
+installs an empty bpffs, and `mkdir` of `tethering` is on the bpffs.
+A missing path stays `ENOENT`, including `/sys/fs/pstore` and
+`/sys/fs/selinux`. A remount whose path is not a mount root, or whose
+fstype is not the one mounted there, is `EINVAL`. `bpf()` is
+unchanged. `4b8480784181700568e656691d5db75b1701e51b` (archive SHA256
+`2a487ef2945aeee8bee0887053c5144211828af7c06a186770327a5dd106e8bb`,
+guest stderr SHA256
+`cd60f41fa1128d37bf33efe0617731e0cfbd1b932c22c3458fbd4d5cc1df437c`)
+remeasured that. It is not a boot. Init exited 6. There is no
+`system_server`, and `boot_completed` stays 0. First-stage
+`mount("sysfs", "/sys")` is 0, `mount("bpf", "/sys/fs/bpf")` is 0,
+`mkdir` of `tethering` is 0, and bpfloader exited 0. A same-size move
+of one guest page moves that slice on the 16 KiB host page. The host
+page stays write-wins and is never writable and executable together.
+The call returns the new address, or the errno of a move it refuses.
+A read-only page is read-only again after the moved bytes are written.
+`6b165e9e1dc3f6112f1e69af4bb452898dbcc22d` (archive SHA256
+`8c1deec0e76321326ac2cc21fddaac0d765e36ebb6600ab1604f3e4cdc776004`,
+guest stderr SHA256
+`23247a2040607ac314354ce601766afee0ab555d4b4d86c49ea716954be9ca36`)
+remeasured that. It is not a boot. There is no `system_server`, and
+`boot_completed` stays 0. Init ran 18.003s and rebooted
+`reboot,boringssl-self-check-failed`. First-stage `mount("sysfs",
+"/sys")` is 0, `mount("bpf", "/sys/fs/bpf")` is 0, `mkdir` of
+`tethering` is 0, and bpfloader exited 0 with its interpreter already
+on `apex-mounts/19`. keystore2's first start (pid 67287) completed 57
+same-size `MREMAP_MAYMOVE|MREMAP_FIXED` moves of one 4 KiB page, each
+returning 0. netd completed 39, each 0. The log has no
+`linker_cfi.cpp`, `ShadowWrite`, or `MAP_FAILED`. That start still
+aborted after those moves. The abort text was not available because
+logd was down. netd (pid 67321, interpreter `apex-mounts/19`) then
+grew one 4 KiB page to 8 KiB with `MREMAP_MAYMOVE` 115 times, each
+`ENOMEM`, and aborted in `__cxa_atexit`. zygote (pid 67323) was
+killed on netd's `onrestart`. A guest-page-aligned grow that is not a
+whole number of 16 KiB host pages extends in place when the extra
+guest pages are free or already the tail of that mapping. When they
+are not, `MREMAP_MAYMOVE` allocates a new mapping of the new length,
+copies the original guest pages, and unmaps the old range. The extra
+pages are mapped, or the call returns the errno. It does not report
+success for a page it did not map, and it does not take a neighbor
+that is already mapped. The old guest page is not mapped after a move.
+Host `mmap`, `mprotect` and `mremap` are given only 16 KiB multiples
+at 16 KiB-aligned addresses. `0x1000` and `0x2000` stay guest lengths.
+After formal apexd, bpfloader, netd, zygote, surfaceflinger, credstore
+and gpuservice resolved `PT_INTERP` `/system/bin/linker64` to
+`apex-mounts/19` and read 4096 bytes. keystore2's later starts (pids
+67315 and 67340) and lmkd still resolved it to
+`apex-mounts/1/bin/linker64` (`ENOENT`, status 127). Each process
+started its `apex-mounts` counter at 1, and installing a payload
+removed the directory already at that path. A new payload takes a
+directory that does not already exist. The installed directory is
+recorded beside it. A directory that is gone, or that no longer
+contains that record, does not cover the path. A fork snapshot whose
+ext4 host is not the one in the namespace journal is replayed before
+the walk, so a pinned generation does not keep `apex-mounts/1` after
+the journal has moved that path. Symlink results under an ext4 host
+are not cached. A path that is still missing stays `ENOENT`.
+`boringssl_self_test_apex64` (pid 67362, uid 9999) exited 127 in
+0.023s. `interpret` of
+`/apex/com.android.conscrypt/bin/boringssl_self_test64` was `EACCES`
+at host `apex-mounts/4/bin/boringssl_self_test64`. uid 9999 is
+`DecodeUid` of the service's `user nobody`, not a failed name mapped
+to `AID_NOBODY`. The exec check is the guest identity against the
+guest mode, and then a read of the host file. A mode without execute
+stays without execute and is `EACCES`. The host execute bit is not
+added, and a directory keeps the inode mode rather than the umask.
+The check is not skipped, and an exec that did not run is not
+reported as success.
+`33d159675b16b9c4021317ba3f8861c5fdb91c57` was measured on Mac
+(archive SHA256
+`0dc8a18fc3f12942ea23b855cdba186296e669eccc553d5fc79a09e47192dbd3`,
+SHA256SUMS
+`b35b9b45dfff9e055a4f67bca8f2b7c12b242466ce72afe86e03d0a96b998cf8`,
+93 members, guest stderr SHA256
+`36bdfa2ef6ddeb5e5ad1ab895a278f669b365f89ba6e3ddb7e88d9084f517bc0`).
+It is not a boot. There is no `system_server`, and `boot_completed`
+stays 0. Init started 2026-11-26 11:55:40 Asia/Kuala_Lumpur and ran
+20.770s (guest init pid 69221). The unique-host interpreter
+`ENOENT` is closed: after apexd-bootstrap (pid 69226) activated
+`/apex/com.android.runtime@1`, `PT_INTERP` `/system/bin/linker64`
+used `apex-mounts/69226-1/bin/linker64`, read 4096 bytes, and the
+superblock was `fstype=bind`. linkerconfig, prng_seeder,
+`boringssl_self_test64_vendor` (pid 69230, uid 0) and
+`/system/bin/boringssl_self_test64` (pid 69237, uid 9999) exited 0.
+Same-size `mremap(0x1000, 0x1000, flags=0x3)` ran 1912 times, each
+returning 0. `mremap(0x1000, 0x2000, flags=0x1)` ran 5 times, each
+succeeding, including netd (pid 69278). No leftover
+`apex-mounts/1` `ENOENT`. sysfs and bpf mounts and bpfloader exit 0
+still hold.
+`b284ec7efdcc3e935ded0acb093374261842a082` was measured on Mac
+(archive SHA256
+`73c67ad8a195ccb7ca9caa6d94dc9907798093a66c3547a3cdd7403c74cedc62`,
+SHA256SUMS
+`894bf6b89415352417ac6907ed90cfce1ede4f6bca7a39be8dc52c3932916cba`,
+94 members, guest stderr SHA256
+`3853a9d0734b075ff7c5dcfaef45701e7c97726cb9622cd8af8e06911741d875`).
+It is not a boot. There is no `system_server`, and `boot_completed`
+stays 0. Init started 2026-11-26 12:44:51 Asia/Kuala_Lumpur and ran
+52.662s. The payload inode record is on the conscrypt file: host
+mode 0755, `dev.aim.android-inode` DARI v1 uid 0 gid 2000 mode
+0100755. `user.aim.android-inode` is absent. Both views grant other
+execute to uid 9999, so the file check is not what returned
+`EACCES` and it was not logged. `/apex` is tmpfs
+`mode=0755,uid=0,gid=0`, and that mode was not recorded, so the
+guest mode was the host directory's. `mkdir` applies the umask
+first; a directory left at 0700 is owner-executable only. uid 0 can
+search it and uid 9999 (gid 0, no group execute) cannot. That is
+why `boringssl_self_test64_vendor` (pid 70193, uid 0) and
+`/system/bin/boringssl_self_test64` (pid 70200, uid 9999) exited 0
+while `boringssl_self_test_apex64` (pid 70308) did not. The tmpfs
+root records the mode the mount asked for, after the mount is
+visible. The exec open uses that same guest stat, and a denial logs
+the uid, gid and mode that produced it. The host execute bit is not
+added. A 0750 or 0644 inode stays `EACCES`. A path that is still
+missing stays `ENOENT`. Same-size `mremap` flags=0x3 ran 2336 times,
+each returning 0. Eight grows (flags=0x1) succeeded in place; the
+4K-to-8K move was not exercised.
+`7400b9fce2fe4f9b597d7ccefbc197ded88bf7b2` was measured on Mac
+(archive SHA256
+`1ab5b92400aaecff125baab907325fadd4e03ab5643acdda58e50582522372dc`,
+SHA256SUMS
+`bb99b71d4008b3a973e026a2620d437550faa3190a776dde040d99b8a0c64d15`,
+96 members, guest stderr SHA256
+`00cce33a2183e2ba5950617d7b5aecc31c04b2b6d4f71465669bff4bdc895f88`,
+`09-final.txt` SHA256
+`a6a156509c90fb83d699b713b3d967ec782ac00e371ae69dd396b5c83f0996b6`).
+It is not a boot. There is no `system_server` process or exec, and
+`boot_completed` stays unset. Init started 2026-11-26 13:53:39
+Asia/Kuala_Lumpur and ran 21.353s. `Cargo.lock` is unchanged
+(SHA256
+`7c5398c25903c8b014fdb094b5113fc2b4195ccff481b01f48678bf12cde1ac5`).
+The apex directory denial did not recur. `/apex`
+(`tmpfs/71467.4`) is host 0755 with `dev.aim.guest-inode` uid 0 gid 0
+mode 0755. The conscrypt mountpoints are host 0755 with guest uid 0
+gid 1000 mode 0755. The payload
+`apex-mounts/71497-3/bin/boringssl_self_test64` stays host 0755, DARI
+v1 uid 0 gid 2000 mode 0100755. `boringssl_self_test64_vendor` (pid
+71476, uid 0) and `/system/bin/boringssl_self_test64` (pid 71483, uid
+9999) exited 0. `boringssl_self_test_apex64` and
+`reboot,boringssl-self-check-failed` did not occur. The self-test is
+still in the image; this run did not reach it. linker64 still
+resolved (bootstrap `apex-mounts/71472-1`, formal `71497-16`).
+`mremap` grow flags=0x1 succeeded 11 times in place (4K to 8K five,
+8K to 16K three, 16K to 32K three) and did not realloc. Same-size
+flags=0x3 succeeded 2031 times, each returning the address the call
+specified. No linker_cfi, ShadowWrite, or `MAP_FAILED`.
+`boringssl_self_test64_vendor` and `/system/bin/boringssl_self_test64`
+exiting 0 is not acceptance of this run. The apex self-test was not
+reached.
+The activation failure on that run is the ext4 identity file.
+`newfstatat` of
+`/apex/com.android.apex.cts.shim@1/.aim-ext4-stamp` returned 0 (pid
+71497). kmsg: failed to activate
+`/system/apex/com.android.apex.cts.shim.apex`
+(`com.android.apex.cts.shim`) because that path is an unexpected file
+inside the shim apex, then failed to activate packages (1 APEX).
+OnStart still finished with `Activated 0 packages`. That file was the
+identity record written inside the mounted directory. The same bytes
+stay on the directory as a host attribute and in the sidecar beside
+it, so the payload directory has no such entry. This has not been
+remeasured on Mac, and it is not a boot.
+The later stop on that run is `reboot,apexd-failed`. Formal apexd
+(pid 71497) had started, mounted conscrypt and ART, and finished
+OnStart (duration 828). servicemanager (pid 71481) then
+aborted, signal 6: `Check failed: gSehandle != nullptr`. That is
+`Access::getSehandle` after
+`selinux_android_service_context_handle()` returns null. The
+exact-match backend returns a null handle when every service-context
+path fails `access(R_OK)`, or when a path that passes then fails
+`fopen`, is not a regular file, fails to parse, or repeats a key
+with a different context. An empty file does not abort, and context
+validation is off. The constructor checks (`selinux_status_open`,
+`getcon`) had already passed, so this is a service lookup, not
+process start. `getcon` searches `/`, and uid 9999 had already
+executed `/system/bin/boringssl_self_test64`, so `/` was searchable
+at those earlier points. Image `fs_config` gives `/`, `/system/etc`,
+`/system/etc/selinux` mode 0755 root:root and
+`plat_service_contexts` mode 0644 root:root. uid 1000 can read that.
+A recorded image inode of those modes is what the walk uses; a
+directory with no record that is really 0700 root:root stays
+`EACCES`. The handle is not invented. init then sent signal 9 to
+servicemanager and, from `servicemanager.rc`'s `onrestart restart
+--only-if-running apexd`, signal 9 to apexd. apexd is oneshot with
+`reboot_on_failure reboot,apexd-failed`. A signal death is not a zero
+exit, so original init shuts down. That option stays. A killed
+oneshot is not reported as success. `service 'servicemanager'
+requested start, but it is already running` is `Service::Start`
+seeing the process still running. After apexd was already dead, some
+execs logged `guest-search path="/" errno=13 st_mode=0o40700`. That
+view is later than the abort. On the 07e217e remasure the logged host
+path is the image directory. After the run its Darwin mode is 0700
+and it has a mode-only `dev.aim.guest-inode` (presence 4, mode 0700).
+`dev.aim.android-inode` is absent on that directory and on `/system`,
+so the walk uses the host mode. The guest-inode is the record a chmod
+writes. A mount whose host is the image directory classified `/` as
+writable, so the chmod cleared search for uid 9999 and wrote that
+attribute. chmod of the image directory's inode is EROFS: it does not
+change the host mode and does not write a guest-inode. A guest-inode
+already on that inode does not hide an android-inode. uid 9999 had
+searched `/` while the published mode still granted search. A denial
+logs the host path. `/system/bin/logd` is mode 0550, uid 1036, gid
+1036. The extract keeps that mode and drops the owner, and logd's
+caps are `SYSLOG|AUDIT_CONTROL`, so the guest stat (root, other with
+no execute) was `guest-exec=deny`. The image `fs_config` record is
+that owner when android-inode is absent; the host mode is not
+changed. The file is on the image directory, so the exec probe has
+no mount superblock. `crash_dump64` `ENOENT`, missing libraries,
+keystore2 and netd `SIGABRT`, and zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
+`.apex` files and no `.capex`: 34 under `system/apex`, and
+`com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
+two partitions, and none of the zips is a compressed container (each has
+`apex_payload.img`). Every payload is ext4, magic `0xEF53`, 4096-byte
+blocks, compat `0x28` (`EXT_ATTR|DIR_INDEX`), incompat `0x42`
+(`FILETYPE|EXTENTS`), ro_compat `0x407b`
+(`SPARSE_SUPER|LARGE_FILE|HUGE_FILE|GDT_CSUM|DIR_NLINK|EXTRA_ISIZE|SHARED_BLOCKS`).
+`FLEX_BG`, `METADATA_CSUM` and `INLINE_DATA` are unset on all 35.
+`DIR_INDEX` is set, so a directory may be an htree. Apexd's
+`Need to pre-allocate 39 loop devices` is those 35 files plus one extra
+loop device for each bootstrap package it logged (`runtime`, `i18n`,
+`virt`, `tzdata`). There is no 36th apex file in the image, so the three
+names that would turn 35 into 38 are not a `.capex`, not the same package
+on another partition, and not present to name.
+The trace logs a bounded
+`/proc/sys` read or write payload, including a failed write, and a
+`readlinkat` result on failure. `write` of
+fd 3 for 61 bytes returned 61
+on the earlier `11bbedf` run; the raw guest buffer was not captured, and
+the 2200-byte diagnostic marker does not contain that text. Property,
+integrated 2/2, and independent android/libbinder passed on `11bbedf`;
+that is not original property-service or ART boot. `MADV_DONTNEED` and
+`MADV_REMOVE` stay on the 4 KiB guest page. The `DONTNEED` unit and the
+socket-path `O_PATH` unit were both `NOT_RUN` (offline, missing autocfg
+1.5.1). No guest ABI header was captured. `/linkerconfig` stays, with
+`ld.config.txt`. The contexts are the layer's files. No property area is
+seeded (2026-11-25).
+
+`/proc/mounts` and `/proc/<pid>/mountinfo` stay regular files. `epoll_ctl`
+ADD and MOD poll them as `ep_insert` does: a mount change between open
+and the ctl is consumed, and `EPOLLIN` is current state (once for
+`EPOLLET`, every wait when level-triggered). dup shares the cursor. fork
+copies that cursor and the namespace generation. exec keeps a
+non-`CLOEXEC` mount fd's cursor. A blocking wait whose wake pipe cannot
+be created returns that errno and does not invent an edge. Another
+regular file stays `EPERM`. The `9eacf04` macmini run measured ADD
+returning 0 (call 6091) and a later `epoll_pwait` reporting mask `0xa`
+(call 6228). The insert, fork, and wake behavior is not measured beyond
+that one wait.
+
 The rebuilt libart compiles ART's original `metrics/statsd.cc` and the Android
 `libodrstatslog` with `statslog_art`/`statslog_odrefresh`, generated by the
 original stats-log-api-gen built for the host (#162), so it reports ART atoms
@@ -100,6 +834,28 @@ epoll_ctl accepts a bpf map fd (#3054): a ring buffer reports EPOLLIN while
 its producer position is ahead of its consumer's, another map EPOLLERR, read on
 each wait as no knote fires for them; a program fd stays EPERM. Poll and select
 still report a map file's host readiness.
+`/proc/mounts` and mountinfo poll as `mounts_poll`: `POLLIN|POLLRDNORM`, and
+`POLLERR|POLLPRI` once when this process's mount table changes. epoll ADD
+polls the file, so a change already pending is consumed there. fork and
+exec keep the cursor with the generation. A blocking wait without a wake
+pipe returns the pipe errno. Another regular file stays EPERM. The
+`9eacf04` macmini run measured ADD returning 0 (call 6091) and one
+`epoll_pwait` of mask `0xa` (call 6228). `/proc/self/ns/mnt`
+is the thread-group leader's mount namespace; `/proc/thread-self/ns/mnt`
+is that task's. Path `readlink` is computed then (`mnt:[inode]`). An open
+ns fd keeps the namespace it named at open, so its `readlink` keeps that
+inode across a later `unshare`. `setns` of that fd with `CLONE_NEWNS` or
+0 switches only the caller and sets its cwd to `/`. It returns `EINVAL`
+when the caller's `fs_struct` is shared (`users != 1`), and also when the
+fd is not a mount-namespace fd. A guest fork is a new process, so the
+image carries each namespace and rebinds inherited ns fds; the child gets
+its own `fs_struct` (`users == 1`) and the parent's current namespace
+inode. `unshare(CLONE_NEWNS)` unshares `fs` first and leaves other threads
+in the previous namespace.
+A bad fd is `EBADF`, another kind of fd or `nstype` is `EINVAL`, and the
+caller needs `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT`. An open `/proc/mounts`
+follows the namespace it named at open. The parent sequence is measured
+on `9eacf04`; the forked child is not.
 A pidfd's state is its open file's (the fd table's), so a dup, dup3 or
 F_DUPFD copy, and a fork child's copy of either, is the same pidfd for
 pidfd_send_signal, waitid(P_PIDFD) and poll/epoll, sharing one reap watch
