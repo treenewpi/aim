@@ -57,6 +57,7 @@ mod fileattr;
 mod fork;
 mod fown;
 mod fs;
+mod fs_config;
 pub(crate) mod fscrypt;
 mod fsops;
 mod fsverity_ioctl;

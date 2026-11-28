@@ -330,8 +330,10 @@ its host path. The table is small and written almost only by init at boot.
 fields: uid 0, gid 0, the host permission bits); without one, the table's
 fields, then an image file's original owner and mode
 (`dev.aim.android-inode`, or `user.aim.android-inode` where the host
-rejects the first name), then uid 0 and gid 0 with the host permission
-bits. Reading an attribute costs about 15 µs on the development Mac, so
+rejects the first name), then that file's `fs_config` uid and gid
+(the host permission bits stay; the record's mode is not applied),
+then uid 0 and gid 0 with the host permission bits. Reading an
+attribute costs about 15 µs on the development Mac, so
 each process keeps what it read by (dev, ino) while the inode's ctime,
 which every attribute change updates, stays the same. Two known
 requirements:

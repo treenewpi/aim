@@ -691,9 +691,14 @@ attribute. chmod of the image directory's inode is EROFS: it does not
 change the host mode and does not write a guest-inode. A guest-inode
 already on that inode does not hide an android-inode. uid 9999 had
 searched `/` while the published mode still granted search. A denial
-logs the host path. logd `EACCES`, `crash_dump64`
-`ENOENT`, missing libraries, keystore2 and netd `SIGABRT`, and
-zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
+logs the host path. `/system/bin/logd` is mode 0550, uid 1036, gid
+1036. The extract keeps that mode and drops the owner, and logd's
+caps are `SYSLOG|AUDIT_CONTROL`, so the guest stat (root, other with
+no execute) was `guest-exec=deny`. The image `fs_config` record is
+that owner when android-inode is absent; the host mode is not
+changed. The file is on the image directory, so the exec probe has
+no mount superblock. `crash_dump64` `ENOENT`, missing libraries,
+keystore2 and netd `SIGABRT`, and zygote `SIGKILL` stay as they were. This is not a boot. The pinned layer has 35
 `.apex` files and no `.capex`: 34 under `system/apex`, and
 `com.android.hardware.cas.apex` alone under `vendor/apex`. No name is on
 two partitions, and none of the zips is a compressed container (each has

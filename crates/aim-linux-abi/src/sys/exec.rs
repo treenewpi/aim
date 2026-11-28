@@ -1391,4 +1391,156 @@ mod tests {
         super::super::cred::init(saved, None);
         unsafe { libc::umask(previous) };
     }
+
+    /// `/system/bin/logd` is mode 0550, uid 1036, gid 1036. The extract
+    /// keeps the mode and drops the owner, so a guest stat was root and
+    /// uid 1036 (no `CAP_DAC_OVERRIDE`) was other. The fs_config record
+    /// supplies the owner. The host mode is not changed, a wider mode in
+    /// the record is not applied, and a non-ELF is still `ENOEXEC`.
+    #[test]
+    fn logd_executes_when_its_published_owner_is_restored() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, _root) = crate::vfs::test_view();
+        let image = crate::vfs::root();
+        let logd = image.join("system/bin/logd");
+        let other = image.join("system/bin/not-logd");
+        let config = image.join("system/etc/fs_config_files");
+        std::fs::create_dir_all(logd.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        for dir in [
+            image.join("system"),
+            image.join("system/bin"),
+            config.parent().unwrap().to_path_buf(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(&logd, b"not an elf").unwrap();
+        std::fs::write(&other, b"not an elf").unwrap();
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o550)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let host_mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let saved = super::super::cred::current();
+        struct Restore(
+            super::super::cred::Identity,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.1, std::fs::Permissions::from_mode(0o644));
+                let path = CString::new(self.1.as_os_str().as_bytes()).unwrap();
+                let name = CString::new("user.aim.android-inode").unwrap();
+                unsafe {
+                    aim_storage::host::removexattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        aim_storage::host::XATTR_NOFOLLOW,
+                    );
+                }
+                let _ = std::fs::remove_file(&self.2);
+                super::super::fs_config::reload();
+                super::super::cred::init(self.0.clone(), None);
+            }
+        }
+        let _restore = Restore(saved, logd.clone(), config.clone());
+        let as_user = |uid: u32, gid: u32| {
+            let mut id = super::super::cred::Identity::default();
+            id.uid = [uid; 4];
+            id.gid = [gid; 4];
+            id.groups.clear();
+            id.cap_eff = 0;
+            id.cap_perm = 0;
+            id.cap_inh = 0;
+            id.cap_amb = 0;
+            id.cap_bset = 0;
+            super::super::cred::init(id, None);
+        };
+        let class = |guest: &[u8]| {
+            let found = vfs::resolve(LINUX_AT_FDCWD, guest, true).unwrap();
+            match classify(&found.guest, &found.host) {
+                Ok(_) => 0,
+                Err(error) => error,
+            }
+        };
+        super::super::fs_config::reload();
+        as_user(1036, 1036);
+        let st = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(st.st_uid, 1036);
+        assert_eq!(st.st_gid, 1036);
+        assert_eq!(st.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        as_user(9999, 9999);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(1036, 1036);
+        let plain = super::super::attrs::path_stat("/system/bin/not-logd").unwrap();
+        assert_eq!(plain.st_uid, 0);
+        assert_eq!(plain.st_gid, 2000);
+        assert_eq!(plain.st_mode & 0o7777, 0o644);
+        assert_eq!(class(b"/system/bin/not-logd"), -(EACCES as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+        assert_eq!(host_mode(&other), 0o644);
+        assert!(crate::vfs::mounted_backend("/system/bin/logd").is_none());
+        // The image file wins over the compiled rule, and its mode is not
+        // copied onto the inode.
+        std::fs::write(&config, fs_record("system/bin/logd", 0o755, 1111, 2222)).unwrap();
+        super::super::fs_config::reload();
+        let overridden = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(overridden.st_uid, 1111);
+        assert_eq!(overridden.st_gid, 2222);
+        assert_eq!(overridden.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(1111, 2222);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+        // android-inode is the extract's owner and hides the fs_config one.
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut dari = b"DARI\x01\0\0\0".to_vec();
+        dari.extend_from_slice(&7u32.to_le_bytes());
+        dari.extend_from_slice(&8u32.to_le_bytes());
+        dari.extend_from_slice(&0o550u32.to_le_bytes());
+        let path = CString::new(logd.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.aim.android-inode").unwrap();
+        let set = unsafe {
+            aim_storage::host::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                dari.as_ptr().cast(),
+                dari.len(),
+                0,
+                aim_storage::host::XATTR_NOFOLLOW,
+            )
+        };
+        assert_eq!(set, 0, "android-inode: {}", std::io::Error::last_os_error());
+        std::fs::set_permissions(&logd, std::fs::Permissions::from_mode(0o550)).unwrap();
+        super::super::attrs::forget_inodes();
+        let recorded = super::super::attrs::path_stat("/system/bin/logd").unwrap();
+        assert_eq!(recorded.st_uid, 7);
+        assert_eq!(recorded.st_gid, 8);
+        assert_eq!(recorded.st_mode & 0o7777, 0o550);
+        assert_eq!(class(b"/system/bin/logd"), -(EACCES as i64));
+        as_user(7, 8);
+        assert_eq!(class(b"/system/bin/logd"), -(ENOEXEC as i64));
+        assert_eq!(host_mode(&logd), 0o550);
+    }
+
+    fn fs_record(prefix: &str, mode: u16, uid: u16, gid: u16) -> Vec<u8> {
+        let text = prefix.as_bytes();
+        let len = (16 + text.len() + 1) as u16;
+        let mut out = Vec::new();
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&mode.to_le_bytes());
+        out.extend_from_slice(&uid.to_le_bytes());
+        out.extend_from_slice(&gid.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(text);
+        out.push(0);
+        out
+    }
 }

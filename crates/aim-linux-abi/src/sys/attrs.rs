@@ -18,8 +18,10 @@
 //! Precedence: the guest attribute (its unrecorded fields are root's and
 //! the host permission bits); without one, the table, then an image file's
 //! original owner and mode (the `dev.aim.android-inode` attribute
-//! android-image-extract writes), then root:root with the host permission
-//! bits. Without a path map nothing is recorded.
+//! android-image-extract writes), then that file's `fs_config` uid and gid
+//! when the extract kept the mode and dropped the attribute, then root:root
+//! with the host permission bits. The `fs_config` record does not replace
+//! the host mode. Without a path map nothing is recorded.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -426,6 +428,14 @@ struct Known {
 /// times a stat, so each process keeps what it read, by (dev, ino), and a
 /// fork child starts with its parent's (an app with what zygote read).
 static INODES: Mutex<Option<HashMap<(libc::dev_t, u64), Known>>> = Mutex::new(None);
+
+/// Drop the process's inode-attribute cache. A test that adds an xattr
+/// in the same timestamp second as the stat that cached its absence
+/// would otherwise keep that absence.
+#[cfg(test)]
+pub(super) fn forget_inodes() {
+    *INODES.lock().unwrap() = None;
+}
 const INODES_MAX: usize = 1 << 16;
 
 /// Fork: the attributes read so far. They stay valid in the child as they
@@ -533,16 +543,28 @@ fn lookup_stat(host: Host, guest: impl FnOnce() -> String, st: &libc::stat) -> A
     if let Some(a) = inode {
         return a;
     }
+    let guest_path = guest();
+    // The extract keeps an image file's mode and drops its owner. The
+    // published uid and gid are the android-inode, or, when that was not
+    // copied, the image's fs_config record. The host mode stays.
+    let base = if let Some(original) = original {
+        Some(original)
+    } else if matches!(host, Host::Image(_)) {
+        let directory = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        super::fs_config::published(&guest_path, directory)
+    } else {
+        None
+    };
     // chown and chmod answer EROFS on the image before recording anything,
     // so its files have their original attributes and no table entry.
     if vfs::on_read_only_root(st.st_dev) {
-        return original.unwrap_or_default();
+        return base.unwrap_or_default();
     }
-    let a = table_lookup(&guest());
+    let a = table_lookup(&guest_path);
     if a.complete() {
         return a;
     }
-    original.map_or(a, |o| a.over(o))
+    base.map_or(a, |o| a.over(o))
 }
 
 /// The recorded owner and mode of `host`.
